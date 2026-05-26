@@ -1,0 +1,29 @@
+# Environment
+.env
+
+# Uploaded files
+backend/uploads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+*.egg-info/
+
+# HuggingFace model cache
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
