@@ -6,7 +6,7 @@ from db import get_all_chunks
 from ingestion import get_embed_model
 from prompts import QA_PROMPT
 import numpy as np
-
+import json
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -100,3 +100,44 @@ def query_document(question: str, document_id: str = None) -> dict:
             for c in chunks
         ]
     }
+
+def extract_fields(document_id: str, schema: dict) -> dict:
+    # Get all chunks for this document
+    all_chunks = get_all_chunks()
+    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+
+    # Use first 10 chunks as context (enough for most docs)
+    context = "\n\n".join([c["content"] for c in doc_chunks[:10]])
+
+    prompt = f"""Extract the following fields from the document below.
+Return ONLY a valid JSON object with these exact keys: {list(schema.keys())}
+If a field is not found, use null for strings or [] for lists.
+Do not include any explanation or markdown, just the JSON.
+
+Document:
+{context}
+
+Fields to extract: {json.dumps(schema, indent=2)}
+
+JSON output:"""
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    # Clean markdown fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+
+    try:
+        extracted = json.loads(raw)
+    except json.JSONDecodeError:
+        extracted = {"error": "Could not parse extraction output", "raw": raw}
+
+    return {"extracted": extracted}
