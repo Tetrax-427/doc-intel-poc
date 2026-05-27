@@ -2,6 +2,9 @@ import streamlit as st
 import requests
 import json
 import mimetypes
+import plotly.express as px
+import plotly.graph_objects as go
+import pandas as pd
 
 API_URL = "http://127.0.0.1:8000"
 
@@ -155,6 +158,7 @@ def load_document(doc_id: str, doc_name: str):
     st.session_state.file_name = doc_name
     st.session_state.history_summary = ""
     st.session_state.api_error = None
+    st.session_state["tables"] = []  # reset tables on doc switch
     try:
         res = requests.get(f"{API_URL}/chats/{doc_id}", timeout=5)
         st.session_state.messages = res.json() if res.status_code == 200 else []
@@ -343,8 +347,7 @@ else:
     """, unsafe_allow_html=True)
     st.stop()
 
-tab1, tab2 = st.tabs(["💬 Chat", "🗂️ Extract"])
-
+tab1, tab2, tab3 = st.tabs(["💬 Chat", "🗂️ Extract", "📊 Charts"])
 # --- Tab 1: Chat ---
 with tab1:
 
@@ -472,21 +475,21 @@ with tab1:
 # --- Tab 2: Extract ---
 with tab2:
     st.markdown("**Define the fields you want to extract from this document.**")
-    st.caption("Edit the JSON schema below — keys are field names, values are types or empty strings.")
+    st.caption("Use the field values as descriptions to guide extraction — be specific about which entity you want (e.g. 'candidate's email, not the company's').")
 
     default_schema = json.dumps({
-        "name": "",
-        "email": "",
-        "phone": "",
-        "skills": [],
-        "experience": ""
+        "candidate_name": "full name of the candidate or main person in the document",
+        "candidate_email": "email address of the candidate, not the company",
+        "candidate_phone": "phone number of the candidate",
+        "skills": "list of technical or professional skills of the candidate",
+        "experience": "total years of experience of the candidate"
     }, indent=2)
 
     schema_input = st.text_area(
         "Extraction schema (JSON)",
         value=default_schema,
-        height=220,
-        help="Define field names as keys. Use [] for lists, '' for text fields."
+        height=250,
+        help="Keys = field names. Values = descriptions to guide extraction. Be specific."
     )
 
     col1, col2 = st.columns([1, 3])
@@ -524,3 +527,110 @@ with tab2:
                 st.markdown('<div class="error-box">⏱️ Extraction timed out. Try a simpler schema.</div>', unsafe_allow_html=True)
             except Exception as e:
                 st.markdown(f'<div class="error-box">⚠️ Error: {str(e)}</div>', unsafe_allow_html=True)
+
+                
+# --- Tab 3: Charts ---
+with tab3:
+    st.markdown("**Tables & Charts extracted from your document**")
+    st.caption("DocIntel automatically detects tables and visualizes them.")
+
+    if st.button("🔍 Extract Tables & Charts", type="primary"):
+        with st.spinner("Scanning document for tables..."):
+            try:
+                res = requests.get(
+                    f"{API_URL}/tables/{st.session_state.document_id}",
+                    timeout=30
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    st.session_state["tables"] = data.get("tables", [])
+                else:
+                    st.error("Failed to extract tables.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    tables = st.session_state.get("tables", [])
+
+    if not tables:
+        st.markdown("""
+        <div style="text-align:center;padding:40px 20px;color:#9ca3af">
+            <div style="font-size:36px;margin-bottom:10px">📊</div>
+            <div style="font-size:15px;font-weight:600;color:#374151;margin-bottom:6px">No tables extracted yet</div>
+            <div style="font-size:13px;color:#6b7280">Click the button above to scan your document for tables and charts.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.success(f"✅ Found {len(tables)} table(s)")
+
+        for i, table in enumerate(tables):
+            st.divider()
+            st.subheader(f"📋 {table.get('title', f'Table {i+1}')}")
+
+            headers = table.get("headers", [])
+            rows = table.get("rows", [])
+            chart_type = table.get("chart_type", "bar")
+
+            if not headers or not rows:
+                st.caption("Could not parse this table.")
+                continue
+
+            # Show raw table
+            try:
+                df = pd.DataFrame(rows, columns=headers)
+                st.dataframe(df, use_container_width=True)
+            except Exception:
+                st.caption("Could not render table.")
+                continue
+
+            # Chart controls
+            col1, col2, col3 = st.columns([2, 2, 2])
+            with col1:
+                chart_choice = st.selectbox(
+                    "Chart type",
+                    ["bar", "line", "pie"],
+                    index=["bar", "line", "pie"].index(chart_type) if chart_type in ["bar", "line", "pie"] else 0,
+                    key=f"chart_type_{i}"
+                )
+            with col2:
+                numeric_cols = [h for h in headers if any(
+                    str(r[headers.index(h)]).replace('.','').replace('-','').replace(',','').isdigit()
+                    for r in rows if len(r) > headers.index(h)
+                )]
+                text_cols = [h for h in headers if h not in numeric_cols]
+
+                x_col = st.selectbox("X axis", headers, index=0, key=f"x_{i}")
+            with col3:
+                y_options = numeric_cols if numeric_cols else headers
+                y_col = st.selectbox("Y axis", y_options, index=0, key=f"y_{i}")
+
+            # Render chart
+            try:
+                df[y_col] = pd.to_numeric(df[y_col].astype(str).str.replace(',', ''), errors='coerce')
+                df = df.dropna(subset=[y_col])
+
+                if chart_choice == "bar":
+                    fig = px.bar(df, x=x_col, y=y_col, title=table.get("title", ""), color_discrete_sequence=["#2563eb"])
+                elif chart_choice == "line":
+                    fig = px.line(df, x=x_col, y=y_col, title=table.get("title", ""), markers=True, color_discrete_sequence=["#2563eb"])
+                elif chart_choice == "pie":
+                    fig = px.pie(df, names=x_col, values=y_col, title=table.get("title", ""))
+
+                fig.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font_color="#374151",
+                    margin=dict(t=40, b=20, l=20, r=20)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Download button for the data
+                csv_data = df.to_csv(index=False)
+                st.download_button(
+                    label="⬇️ Download CSV",
+                    data=csv_data,
+                    file_name=f"{table.get('title', f'table_{i+1}')}.csv",
+                    mime="text/csv",
+                    key=f"dl_{i}"
+                )
+            except Exception as e:
+                st.caption(f"Could not render chart: {e}")

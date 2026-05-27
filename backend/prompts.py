@@ -76,3 +76,22 @@ Return ONLY the rewritten question, nothing else.
 Original question: {question}
 
 Rewritten question:"""
+
+EXTRACTION_PROMPT = """You are a precise data extraction assistant.
+Extract the following fields from the document below.
+
+Rules:
+- Extract ONLY what is explicitly stated in the document
+- For each field, use the field name and its description as a guide for WHICH entity's info to extract
+- If a field is not found, use null for strings or [] for lists
+- Do NOT guess or infer — only extract what is clearly present
+- Do NOT mix up entities (e.g. don't return company email when asked for candidate email)
+- Return ONLY a valid JSON object, no explanation, no markdown fences
+
+Fields to extract (name: description):
+{fields_with_descriptions}
+
+Document:
+{context}
+
+JSON output:"""

@@ -14,6 +14,47 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 import cohere
 co = cohere.Client(os.getenv("COHERE_API_KEY"))
 
+def extract_tables(document_id: str) -> list[dict]:
+    """Find and extract all tables from a document as structured data"""
+    all_chunks = get_all_chunks()
+    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+
+    if not doc_chunks:
+        return []
+
+    context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": f"""Extract ALL tables from the document below.
+For each table return a JSON object with:
+- "title": descriptive title for the table
+- "headers": list of column names
+- "rows": list of rows, each row is a list of values
+- "chart_type": suggest "bar", "line", or "pie" based on the data
+
+Return ONLY a JSON array of tables. No explanation, no markdown fences.
+If no tables found, return [].
+
+Document:
+{context}
+
+JSON array:"""}],
+        temperature=0.0
+    )
+
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+
+    try:
+        tables = json.loads(raw.strip())
+        return tables if isinstance(tables, list) else []
+    except Exception:
+        return []
+
 def classify_question(question: str, has_document: bool = True) -> str:
     """Returns 'document' or 'general'"""
     if not has_document:
@@ -333,3 +374,42 @@ def query_document_stream(question: str, document_id: str = None, document_ids: 
         delta = chunk.choices[0].delta.content
         if delta:
             yield delta
+
+def extract_fields(document_id: str, fields: dict) -> dict:
+    all_chunks = get_all_chunks()
+    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+    context = "\n\n".join([c["content"] for c in doc_chunks[:10]])
+
+    # Build fields with descriptions string
+    # fields can be either:
+    # {"name": ""} — simple, no description
+    # {"name": "candidate's full name, not the company"} — with description
+    fields_with_desc = "\n".join([
+        f"- {key}: {value if value and isinstance(value, str) else 'extract from document'}"
+        for key, value in fields.items()
+    ])
+
+    from prompts import EXTRACTION_PROMPT
+    prompt = EXTRACTION_PROMPT.format(
+        fields_with_descriptions=fields_with_desc,
+        context=context
+    )
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0
+    )
+
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+
+    try:
+        extracted = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        extracted = {"error": "Could not parse extraction output", "raw": raw}
+
+    return {"extracted": extracted}

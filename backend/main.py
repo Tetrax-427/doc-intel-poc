@@ -85,7 +85,11 @@ def save_chat(document_id: str, body: dict):
     save_message(document_id, body["role"], body["content"], body.get("sources", []))
     return {"status": "saved"}
 
-
+@app.get("/tables/{document_id}")
+def get_tables(document_id: str):
+    from retrieval import extract_tables
+    tables = extract_tables(document_id)
+    return {"tables": tables}
 
 import base64
 
