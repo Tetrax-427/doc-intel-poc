@@ -4,7 +4,7 @@ from groq import Groq
 from rank_bm25 import BM25Okapi
 from db import get_all_chunks
 from ingestion import get_embed_model
-from prompts import QA_PROMPT
+from prompts import QA_PROMPT, QA_PROMPT_MULTI
 import numpy as np
 import json
 load_dotenv()
@@ -15,13 +15,13 @@ def cosine_similarity(a, b):
     a, b = np.array(a), np.array(b)
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def hybrid_search(question: str, document_id: str = None, top_k: int = 5) -> list[dict]:
+def hybrid_search(question: str, document_ids: list[str] = None, top_k: int = 5) -> list[dict]:
     embed_model = get_embed_model()
     all_chunks = get_all_chunks()
 
-    # Filter by document if specified
-    if document_id:
-        all_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+    # Filter by documents if specified
+    if document_ids:
+        all_chunks = [c for c in all_chunks if c["document_id"] in document_ids]
 
     if not all_chunks:
         return []
@@ -29,10 +29,9 @@ def hybrid_search(question: str, document_id: str = None, top_k: int = 5) -> lis
     texts = [c["content"] for c in all_chunks]
     question_embedding = embed_model.get_text_embedding(question)
 
-    # --- Dense search (vector similarity) ---
+    # Dense search
     dense_scores = []
     for chunk in all_chunks:
-        # Convert embedding from string to list of floats if needed
         raw_emb = chunk["embedding"]
         if isinstance(raw_emb, str):
             import json
@@ -40,12 +39,12 @@ def hybrid_search(question: str, document_id: str = None, top_k: int = 5) -> lis
         score = cosine_similarity(question_embedding, raw_emb)
         dense_scores.append(score)
 
-    # --- Sparse search (BM25 keyword) ---
+    # BM25
     tokenized = [t.lower().split() for t in texts]
     bm25 = BM25Okapi(tokenized)
     bm25_scores = bm25.get_scores(question.lower().split())
 
-    # --- Reciprocal Rank Fusion ---
+    # RRF
     def rrf_score(rank, k=60):
         return 1 / (k + rank + 1)
 
@@ -65,41 +64,12 @@ def hybrid_search(question: str, document_id: str = None, top_k: int = 5) -> lis
             "chunk_num": i + 1,
             "content": all_chunks[idx]["content"],
             "page": all_chunks[idx]["metadata"].get("page", "?"),
+            "file": all_chunks[idx]["metadata"].get("file", "?"),
             "score": rrf[idx]
         }
         for i, idx in enumerate(top_indices)
     ]
 
-def query_document(question: str, document_id: str = None) -> dict:
-    # Retrieve top chunks
-    chunks = hybrid_search(question, document_id)
-
-    if not chunks:
-        return {"answer": "No document found to query.", "sources": []}
-
-    # Format chunks for prompt
-    chunks_text = "\n\n".join([
-        f"[{c['chunk_num']}] (Page {c['page']}): {c['content']}"
-        for c in chunks
-    ])
-
-    # Call Groq
-    prompt = QA_PROMPT.format(chunks=chunks_text, question=question)
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-
-    answer = response.choices[0].message.content
-
-    return {
-        "answer": answer,
-        "sources": [
-            {"chunk": c["chunk_num"], "page": c["page"], "preview": c["content"][:150]}
-            for c in chunks
-        ]
-    }
 
 def extract_fields(document_id: str, schema: dict) -> dict:
     # Get all chunks for this document
@@ -141,3 +111,92 @@ JSON output:"""
         extracted = {"error": "Could not parse extraction output", "raw": raw}
 
     return {"extracted": extracted}
+
+from typing import Generator
+
+def query_document(question: str, document_id: str = None, document_ids: list[str] = None) -> dict:
+    # Build id list
+    ids = document_ids if document_ids else ([document_id] if document_id else None)
+    is_multi = ids and len(ids) > 1
+
+    chunks = hybrid_search(question, document_ids=ids)
+
+    if not chunks:
+        return {"answer": "No documents found to query.", "sources": []}
+
+    chunks_text = "\n\n".join([
+        f"[{c['chunk_num']}] (Doc: {c['file']}, Page {c['page']}): {c['content']}"
+        for c in chunks
+    ])
+
+    prompt_template = QA_PROMPT_MULTI if is_multi else QA_PROMPT
+    prompt = prompt_template.format(chunks=chunks_text, question=question)
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+
+    return {
+        "answer": response.choices[0].message.content,
+        "sources": [
+            {"chunk": c["chunk_num"], "page": c["page"], "file": c["file"], "preview": c["content"][:150]}
+            for c in chunks
+        ]
+    }
+
+
+def query_document_stream(question: str, document_id: str = None, document_ids: list[str] = None) -> Generator:
+    ids = document_ids if document_ids else ([document_id] if document_id else None)
+    is_multi = ids and len(ids) > 1
+
+    chunks = hybrid_search(question, document_ids=ids)
+
+    if not chunks:
+        yield "No documents found to query."
+        return
+
+    chunks_text = "\n\n".join([
+        f"[{c['chunk_num']}] (Doc: {c['file']}, Page {c['page']}): {c['content']}"
+        for c in chunks
+    ])
+
+    prompt_template = QA_PROMPT_MULTI if is_multi else QA_PROMPT
+    prompt = prompt_template.format(chunks=chunks_text, question=question)
+
+    stream = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        stream=True
+    )
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+    chunks = hybrid_search(question, document_id)
+
+    if not chunks:
+        yield "No document found to query."
+        return
+
+    chunks_text = "\n\n".join([
+        f"[{c['chunk_num']}] (Page {c['page']}): {c['content']}"
+        for c in chunks
+    ])
+
+    prompt = QA_PROMPT.format(chunks=chunks_text, question=question)
+
+    stream = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        stream=True
+    )
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
