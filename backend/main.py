@@ -19,6 +19,14 @@ load_dotenv()
 
 app = FastAPI()
 
+@app.on_event("startup")
+async def warmup():
+    print("Warming up embedding model...")
+    from ingestion import get_embed_model
+    get_embed_model()
+    print("Model ready.")
+
+    
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -75,20 +83,24 @@ def save_chat(document_id: str, body: dict):
 def query(req: QueryRequest):
     return query_document(req.question, req.document_id, req.document_ids)
 
+import base64
+
 @app.post("/query/stream")
 def query_stream(req: QueryRequest):
     def event_stream():
         try:
             for token in query_document_stream(req.question, req.document_id, req.document_ids):
-                yield f"data: {token}\n\n"
+                encoded = base64.b64encode(token.encode()).decode()
+                yield f"data: {encoded}\n\n"
+        except GeneratorExit:
+            pass
+        except Exception as e:
+            print(f"Stream error: {e}")
         finally:
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )

@@ -6,15 +6,22 @@ from llama_index.core import Document
 from db import insert_document, insert_chunks
 
 load_dotenv()
+import threading
 
 embed_model = None
+_model_lock = threading.Lock()
 
 def get_embed_model():
     global embed_model
     if embed_model is None:
-        print("Loading embedding model... (first time only)")
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-        embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        with _model_lock:
+            if embed_model is None:  # double-check inside lock
+                print("Loading embedding model... (first time only)")
+                from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+                embed_model = HuggingFaceEmbedding(
+                    model_name="BAAI/bge-small-en-v1.5",
+                    device="cpu"
+                )
     return embed_model
 
 splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
