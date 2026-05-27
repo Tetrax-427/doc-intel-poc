@@ -10,12 +10,13 @@ class QueryRequest(BaseModel):
     question: str
     document_id: str = None
 
+load_dotenv()
 class QueryRequest(BaseModel):
     question: str
     document_id: str = None
     document_ids: list[str] = None
-
-load_dotenv()
+    history: list[dict] = []
+    history_summary: str = ""
 
 app = FastAPI()
 
@@ -26,7 +27,7 @@ async def warmup():
     get_embed_model()
     print("Model ready.")
 
-    
+
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -39,6 +40,12 @@ async def upload_document(
     file: UploadFile = File(...),
     use_llamaparse: str = Form("True")
 ):
+    allowed = [".pdf", ".docx", ".txt", ".csv", ".xlsx", ".rtf", ".md"]
+    ext = os.path.splitext(file.filename)[1].lower()
+
+    if ext not in allowed:
+        return {"error": f"Unsupported file type: {ext}"}
+
     temp_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -49,12 +56,12 @@ async def upload_document(
 
 class ExtractRequest(BaseModel):
     document_id: str
-    schema: dict
+    fields: dict
 
 @app.post("/extract")
 def extract(req: ExtractRequest):
     from retrieval import extract_fields
-    return extract_fields(req.document_id, req.schema)
+    return extract_fields(req.document_id, req.fields)
 
 @app.get("/documents")
 def list_documents():
@@ -79,17 +86,18 @@ def save_chat(document_id: str, body: dict):
     return {"status": "saved"}
 
 
-@app.post("/query")
-def query(req: QueryRequest):
-    return query_document(req.question, req.document_id, req.document_ids)
 
 import base64
+
+@app.post("/query")
+def query(req: QueryRequest):
+    return query_document(req.question, req.document_id, req.document_ids, req.history, req.history_summary)
 
 @app.post("/query/stream")
 def query_stream(req: QueryRequest):
     def event_stream():
         try:
-            for token in query_document_stream(req.question, req.document_id, req.document_ids):
+            for token in query_document_stream(req.question, req.document_id, req.document_ids, req.history, req.history_summary):
                 encoded = base64.b64encode(token.encode()).decode()
                 yield f"data: {encoded}\n\n"
         except GeneratorExit:
@@ -98,9 +106,13 @@ def query_stream(req: QueryRequest):
             print(f"Stream error: {e}")
         finally:
             yield "data: [DONE]\n\n"
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+class CompressRequest(BaseModel):
+    messages: list[dict]
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    )
+@app.post("/compress")
+def compress(req: CompressRequest):
+    from retrieval import compress_history
+    summary = compress_history(req.messages)
+    return {"summary": summary}

@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import json
+import mimetypes
 
 API_URL = "http://127.0.0.1:8000"
 
@@ -143,6 +144,8 @@ if "selected_doc_ids" not in st.session_state:
     st.session_state.selected_doc_ids = []
 if "multi_mode" not in st.session_state:
     st.session_state.multi_mode = False
+if "history_summary" not in st.session_state:
+    st.session_state.history_summary = ""
 if "api_error" not in st.session_state:
     st.session_state.api_error = None
 
@@ -150,6 +153,7 @@ if "api_error" not in st.session_state:
 def load_document(doc_id: str, doc_name: str):
     st.session_state.document_id = doc_id
     st.session_state.file_name = doc_name
+    st.session_state.history_summary = ""
     st.session_state.api_error = None
     try:
         res = requests.get(f"{API_URL}/chats/{doc_id}", timeout=5)
@@ -157,10 +161,28 @@ def load_document(doc_id: str, doc_name: str):
     except Exception:
         st.session_state.messages = []
 
+COMPRESSION_THRESHOLD = 10  # compress after 10 messages
 
+def maybe_compress_history():
+    """Compress history if it exceeds threshold"""
+    if len(st.session_state.messages) >= COMPRESSION_THRESHOLD:
+        try:
+            res = requests.post(
+                f"{API_URL}/compress",
+                json={"messages": st.session_state.messages[:-4]},  # compress all but last 4
+                timeout=20
+            )
+            if res.status_code == 200:
+                st.session_state.history_summary = res.json()["summary"]
+                # Keep only last 4 messages in memory
+                st.session_state.messages = st.session_state.messages[-4:]
+        except Exception:
+            pass  # fail silently, full history still works
+
+@st.cache_data(ttl=10)
 def check_api():
     try:
-        res = requests.get(f"{API_URL}/", timeout=3)
+        res = requests.get(f"{API_URL}/", timeout=5)
         return res.status_code == 200
     except Exception:
         return False
@@ -188,15 +210,26 @@ with st.sidebar:
 
     # Upload
     st.markdown("**Upload Document**")
-    uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"], label_visibility="collapsed")
+    
+    uploaded_file = st.file_uploader(
+        "Choose a file",
+        type=["pdf", "docx", "txt", "csv", "xlsx", "rtf", "md"],
+        label_visibility="collapsed"
+    )
+
     if uploaded_file:
-        use_llamaparse = st.toggle("LlamaParse (better for tables/scans)", value=True)
+        is_pdf = uploaded_file.name.lower().endswith(".pdf")
+        use_llamaparse = False
+        if is_pdf:
+            use_llamaparse = st.toggle("LlamaParse (better for tables/scans)", value=True)
         if st.button("⬆️ Process Document", type="primary", use_container_width=True, disabled=not api_ok):
             with st.spinner(f"Processing {uploaded_file.name}..."):
                 try:
+                    mime_type = mimetypes.guess_type(uploaded_file.name)[0] or "application/octet-stream"
+
                     response = requests.post(
                         f"{API_URL}/upload",
-                        files={"file": (uploaded_file.name, uploaded_file, "application/pdf")},
+                        files={"file": (uploaded_file.name, uploaded_file, mime_type)},
                         data={"use_llamaparse": str(use_llamaparse)},
                         timeout=120
                     )
@@ -314,6 +347,15 @@ tab1, tab2 = st.tabs(["💬 Chat", "🗂️ Extract"])
 
 # --- Tab 1: Chat ---
 with tab1:
+
+    col1, col2 = st.columns([6, 1])
+    with col2:
+        if st.button("🗑️ Clear", help="Clear chat history"):
+            st.session_state.messages = []
+            st.session_state.history_summary = ""
+            st.rerun()
+
+
     if not st.session_state.messages:
         st.markdown("""
         <div style="text-align:center;padding:40px 20px;color:#9ca3af">
@@ -339,10 +381,19 @@ with tab1:
 
     if question:
         if is_multi:
-            query_payload = {"question": question, "document_ids": st.session_state.selected_doc_ids}
+            query_payload = {
+                "question": question,
+                "document_ids": st.session_state.selected_doc_ids,
+                "history": st.session_state.messages[-4:],
+                "history_summary": st.session_state.history_summary
+            }
         else:
-            query_payload = {"question": question, "document_id": st.session_state.document_id}
-
+            query_payload = {
+                "question": question,
+                "document_id": st.session_state.document_id,
+                "history": st.session_state.messages[-4:],
+                "history_summary": st.session_state.history_summary
+            }
         save_doc_id = st.session_state.selected_doc_ids[0] if is_multi else st.session_state.document_id
 
         requests.post(f"{API_URL}/chats/{save_doc_id}", json={"role": "user", "content": question})
@@ -388,8 +439,13 @@ with tab1:
             try:
                 sources_res = requests.post(f"{API_URL}/query", json=query_payload, timeout=30)
                 if sources_res.status_code == 200:
-                    sources = sources_res.json().get("sources", [])
-                    if sources:
+                    data = sources_res.json()
+                    sources = data.get("sources", [])
+                    answer_type = data.get("type", "document")
+
+                    if answer_type == "general":
+                        st.caption("💬 General answer — not from documents")
+                    elif sources:
                         with st.expander("📎 Sources"):
                             for s in sources:
                                 file_info = f" · {s['file']}" if s.get("file") else ""
@@ -399,6 +455,7 @@ with tab1:
                 pass
 
             if full_response:
+                # Save assistant message
                 requests.post(
                     f"{API_URL}/chats/{save_doc_id}",
                     json={"role": "assistant", "content": full_response, "sources": sources}
@@ -408,6 +465,9 @@ with tab1:
                     "content": full_response,
                     "sources": sources
                 })
+
+                # Compress if history is getting long
+                maybe_compress_history()
 
 # --- Tab 2: Extract ---
 with tab2:
@@ -444,7 +504,7 @@ with tab2:
             try:
                 response = requests.post(
                     f"{API_URL}/extract",
-                    json={"document_id": st.session_state.document_id, "schema": schema},
+                    json={"document_id": st.session_state.document_id, "fields": schema},
                     timeout=30
                 )
                 if response.status_code == 200:
