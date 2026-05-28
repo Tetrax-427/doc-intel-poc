@@ -413,3 +413,50 @@ def extract_fields(document_id: str, fields: dict) -> dict:
         extracted = {"error": "Could not parse extraction output", "raw": raw}
 
     return {"extracted": extracted}
+
+def generate_summary(document_id: str) -> dict:
+    """Generate a structured summary of a document"""
+    all_chunks = get_all_chunks()
+    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+
+    if not doc_chunks:
+        return {"summary": "", "summary_short": ""}
+
+    # Use first 15 chunks for summary context
+    context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": f"""Analyze the document below and return a JSON object with exactly these keys:
+
+- "short": one sentence (max 20 words) describing what this document is
+- "overview": 2-3 sentence overview of the document
+- "key_topics": list of 3-5 main topics covered
+- "entities": list of important names, companies, or organizations mentioned
+- "dates": list of important dates mentioned (empty list if none)
+- "amounts": list of important numbers, amounts, or figures mentioned (empty list if none)
+- "document_type": type of document (e.g. "Resume", "Invoice", "Contract", "Report", "Article")
+
+Return ONLY valid JSON, no explanation, no markdown fences.
+
+Document:
+{context}
+
+JSON:"""}],
+        temperature=0.0
+    )
+
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+
+    try:
+        parsed = json.loads(raw.strip())
+        return {
+            "summary": json.dumps(parsed),
+            "summary_short": parsed.get("short", "")
+        }
+    except Exception:
+        return {"summary": "", "summary_short": ""}

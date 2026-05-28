@@ -22,7 +22,7 @@ def get_all_chunks() -> list[dict]:
     return result.data
 
 def get_all_documents() -> list[dict]:
-    result = supabase.table("documents").select("*").order("created_at", desc=True).execute()
+    result = supabase.table("documents").select("id, name, summary_short, created_at").order("created_at", desc=True).execute()
     return result.data
 
 def delete_document_by_id(document_id: str):
@@ -40,3 +40,16 @@ def save_message(document_id: str, role: str, content: str, sources: list = None
 def get_chat_history(document_id: str) -> list[dict]:
     result = supabase.table("chats").select("*").eq("document_id", document_id).order("created_at").execute()
     return result.data
+
+
+def save_summary(document_id: str, summary: str, summary_short: str):
+    supabase.table("documents").update({
+        "summary": summary,
+        "summary_short": summary_short
+    }).eq("id", document_id).execute()
+
+def get_summary(document_id: str) -> dict:
+    result = supabase.table("documents").select("summary, summary_short").eq("id", document_id).execute()
+    if result.data:
+        return result.data[0]
+    return {"summary": None, "summary_short": None}

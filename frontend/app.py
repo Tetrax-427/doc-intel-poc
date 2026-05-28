@@ -149,6 +149,8 @@ if "multi_mode" not in st.session_state:
     st.session_state.multi_mode = False
 if "history_summary" not in st.session_state:
     st.session_state.history_summary = ""
+if "doc_summary" not in st.session_state:
+    st.session_state.doc_summary = None
 if "api_error" not in st.session_state:
     st.session_state.api_error = None
 
@@ -158,12 +160,21 @@ def load_document(doc_id: str, doc_name: str):
     st.session_state.file_name = doc_name
     st.session_state.history_summary = ""
     st.session_state.api_error = None
-    st.session_state["tables"] = []  # reset tables on doc switch
+    st.session_state["tables"] = []
+    st.session_state.doc_summary = None
     try:
         res = requests.get(f"{API_URL}/chats/{doc_id}", timeout=5)
         st.session_state.messages = res.json() if res.status_code == 200 else []
     except Exception:
         st.session_state.messages = []
+
+    # Fetch summary
+    try:
+        res = requests.get(f"{API_URL}/summary/{doc_id}", timeout=15)
+        if res.status_code == 200:
+            st.session_state.doc_summary = res.json()
+    except Exception:
+        pass
 
 COMPRESSION_THRESHOLD = 10  # compress after 10 messages
 
@@ -214,7 +225,7 @@ with st.sidebar:
 
     # Upload
     st.markdown("**Upload Document**")
-    
+
     uploaded_file = st.file_uploader(
         "Choose a file",
         type=["pdf", "docx", "txt", "csv", "xlsx", "rtf", "md"],
@@ -230,7 +241,6 @@ with st.sidebar:
             with st.spinner(f"Processing {uploaded_file.name}..."):
                 try:
                     mime_type = mimetypes.guess_type(uploaded_file.name)[0] or "application/octet-stream"
-
                     response = requests.post(
                         f"{API_URL}/upload",
                         files={"file": (uploaded_file.name, uploaded_file, mime_type)},
@@ -254,6 +264,34 @@ with st.sidebar:
 
     st.divider()
 
+    # URL Ingestion
+    st.markdown("**Or ingest from URL**")
+    url_input = st.text_input("Paste a URL", placeholder="https://example.com/article", label_visibility="collapsed")
+    if url_input:
+        if st.button("🔗 Ingest URL", use_container_width=True, disabled=not api_ok):
+            with st.spinner("Fetching and indexing URL..."):
+                try:
+                    response = requests.post(
+                        f"{API_URL}/ingest-url",
+                        json={"url": url_input},
+                        timeout=60
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        if "error" in data:
+                            st.error(f"⚠️ {data['error']}")
+                        else:
+                            load_document(data["document_id"], data["file"])
+                            st.success(f"✅ {data['chunks_stored']} chunks from URL")
+                            st.rerun()
+                    else:
+                        st.error("Failed to ingest URL.")
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ URL fetch timed out.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    st.divider()
     # Documents list
     col1, col2 = st.columns([3, 2])
     with col1:
@@ -282,11 +320,14 @@ with st.sidebar:
                             elif not checked and doc["id"] in st.session_state.selected_doc_ids:
                                 st.session_state.selected_doc_ids.remove(doc["id"])
                         else:
+                            short = doc.get("summary_short", "")
                             label = f"{'🟢 ' if is_active else '📄 '}{doc['name']}"
                             if st.button(label, key=f"load_{doc['id']}", use_container_width=True):
                                 load_document(doc["id"], doc["name"])
                                 st.session_state.selected_doc_ids = [doc["id"]]
                                 st.rerun()
+                            if doc.get("summary_short"):
+                                st.caption(doc["summary_short"])
                     with cols[1]:
                         if st.button("🗑️", key=f"del_{doc['id']}", help="Delete document"):
                             with st.spinner("Deleting..."):
@@ -347,13 +388,89 @@ else:
     """, unsafe_allow_html=True)
     st.stop()
 
+# --- Document Summary ---
+if st.session_state.doc_summary:
+    summary = st.session_state.doc_summary
+    details = summary.get("details", {})
+
+    with st.expander(f"📋 Document Summary — {details.get('document_type', 'Document')}", expanded=True):
+        col1, col2 = st.columns([3, 2])
+        with col1:
+            if details.get("overview"):
+                st.markdown(f"**Overview**\n\n{details['overview']}")
+            if details.get("key_topics"):
+                st.markdown("**Key Topics**")
+                for topic in details["key_topics"]:
+                    st.markdown(f"- {topic}")
+        with col2:
+            if details.get("entities"):
+                st.markdown("**People & Organizations**")
+                st.markdown(", ".join(details["entities"]))
+            if details.get("dates"):
+                st.markdown("**Key Dates**")
+                st.markdown(", ".join(details["dates"]))
+            if details.get("amounts"):
+                st.markdown("**Key Amounts**")
+                st.markdown(", ".join([str(a) for a in details["amounts"]]))
+
+        if not any([details.get("overview"), details.get("key_topics")]):
+            st.caption(summary.get("summary_short", "No summary available."))
+
 tab1, tab2, tab3 = st.tabs(["💬 Chat", "🗂️ Extract", "📊 Charts"])
 # --- Tab 1: Chat ---
 with tab1:
 
-    col1, col2 = st.columns([6, 1])
+    col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
     with col2:
-        if st.button("🗑️ Clear", help="Clear chat history"):
+        if st.button("📄 PDF", help="Export chat as PDF", use_container_width=True):
+            with st.spinner("Generating PDF..."):
+                try:
+                    res = requests.post(
+                        f"{API_URL}/export/pdf",
+                        json={
+                            "document_id": st.session_state.document_id,
+                            "file_name": st.session_state.file_name,
+                            "messages": st.session_state.messages,
+                            "summary": st.session_state.doc_summary or {}
+                        },
+                        timeout=30
+                    )
+                    if res.status_code == 200:
+                        st.download_button(
+                            label="⬇️ Download PDF",
+                            data=res.content,
+                            file_name=f"DocIntel_{st.session_state.file_name}.pdf",
+                            mime="application/pdf",
+                            key="pdf_dl"
+                        )
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+    with col3:
+        if st.button("📝 Word", help="Export chat as Word doc", use_container_width=True):
+            with st.spinner("Generating Word doc..."):
+                try:
+                    res = requests.post(
+                        f"{API_URL}/export/docx",
+                        json={
+                            "document_id": st.session_state.document_id,
+                            "file_name": st.session_state.file_name,
+                            "messages": st.session_state.messages,
+                            "summary": st.session_state.doc_summary or {}
+                        },
+                        timeout=30
+                    )
+                    if res.status_code == 200:
+                        st.download_button(
+                            label="⬇️ Download Word",
+                            data=res.content,
+                            file_name=f"DocIntel_{st.session_state.file_name}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key="docx_dl"
+                        )
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+    with col4:
+        if st.button("🗑️ Clear", help="Clear chat history", use_container_width=True):
             st.session_state.messages = []
             st.session_state.history_summary = ""
             st.rerun()
@@ -528,7 +645,7 @@ with tab2:
             except Exception as e:
                 st.markdown(f'<div class="error-box">⚠️ Error: {str(e)}</div>', unsafe_allow_html=True)
 
-                
+
 # --- Tab 3: Charts ---
 with tab3:
     st.markdown("**Tables & Charts extracted from your document**")

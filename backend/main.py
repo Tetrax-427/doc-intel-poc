@@ -52,6 +52,18 @@ async def upload_document(
 
     use_lp = use_llamaparse.lower() == "true"
     result = ingest_file(temp_path, use_llamaparse=use_lp)
+
+    if "error" not in result:
+        # Generate and save summary in background
+        try:
+            from retrieval import generate_summary
+            from db import save_summary
+            summary_data = generate_summary(result["document_id"])
+            save_summary(result["document_id"], summary_data["summary"], summary_data["summary_short"])
+            result["summary_short"] = summary_data["summary_short"]
+        except Exception as e:
+            print(f"Summary generation failed: {e}")
+
     return result
 
 class ExtractRequest(BaseModel):
@@ -120,3 +132,76 @@ def compress(req: CompressRequest):
     from retrieval import compress_history
     summary = compress_history(req.messages)
     return {"summary": summary}
+
+@app.get("/summary/{document_id}")
+def get_doc_summary(document_id: str):
+    from db import get_summary
+    from retrieval import generate_summary
+    import json
+
+    data = get_summary(document_id)
+
+    # If no summary yet, generate it now
+    if not data.get("summary"):
+        summary_data = generate_summary(document_id)
+        from db import save_summary
+        save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
+        data = summary_data
+
+    try:
+        parsed = json.loads(data.get("summary", "{}"))
+    except Exception:
+        parsed = {}
+
+    return {
+        "summary_short": data.get("summary_short", ""),
+        "details": parsed
+    }
+
+class URLRequest(BaseModel):
+    url: str
+
+@app.post("/ingest-url")
+async def ingest_from_url(req: URLRequest):
+    from ingestion import ingest_url
+    result = ingest_url(req.url)
+
+    if "error" not in result:
+        try:
+            from retrieval import generate_summary
+            from db import save_summary
+            summary_data = generate_summary(result["document_id"])
+            save_summary(result["document_id"], summary_data["summary"], summary_data["summary_short"])
+            result["summary_short"] = summary_data["summary_short"]
+        except Exception as e:
+            print(f"Summary generation failed: {e}")
+
+    return result 
+
+from fastapi.responses import Response
+
+class ExportRequest(BaseModel):
+    document_id: str
+    file_name: str
+    messages: list[dict]
+    summary: dict = {}
+
+@app.post("/export/pdf")
+def export_pdf(req: ExportRequest):
+    from export import export_chat_pdf
+    pdf_bytes = export_chat_pdf(req.file_name, req.messages, req.summary)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=DocIntel_{req.file_name}.pdf"}
+    )
+
+@app.post("/export/docx")
+def export_docx(req: ExportRequest):
+    from export import export_chat_docx
+    docx_bytes = export_chat_docx(req.file_name, req.messages, req.summary)
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename=DocIntel_{req.file_name}.docx"}
+    )
