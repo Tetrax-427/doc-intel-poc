@@ -205,3 +205,22 @@ def export_docx(req: ExportRequest):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f"attachment; filename=DocIntel_{req.file_name}.docx"}
     )
+
+
+@app.get("/usage")
+def get_usage():
+    from llm.usage import get_usage_summary
+    return get_usage_summary()
+
+@app.get("/templates")
+def get_templates():
+    from schemas.templates import list_templates
+    return list_templates()
+
+@app.get("/templates/{template_id}")
+def get_template(template_id: str):
+    from schemas.templates import get_template
+    template = get_template(template_id)
+    if not template:
+        return {"error": f"Template '{template_id}' not found"}
+    return template

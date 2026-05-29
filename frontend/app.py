@@ -351,10 +351,25 @@ with st.sidebar:
     except Exception:
         st.warning("⚠️ Could not load documents. Is the API running?")
 
+    # Usage stats
+    try:
+        usage_res = requests.get(f"{API_URL}/usage", timeout=3)
+        if usage_res.status_code == 200:
+            usage = usage_res.json()
+            if usage["total_calls"] > 0:
+                st.divider()
+                st.markdown("**Session Usage**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("LLM Calls", usage["total_calls"])
+                with col2:
+                    st.metric("~Tokens", f"{usage['total_tokens']:,}")
+    except Exception:
+        pass
+
     # Footer
     st.divider()
     st.markdown('<div style="font-size:11px;color:#9ca3af;text-align:center">DocIntel POC · v0.1</div>', unsafe_allow_html=True)
-
 
 # --- Main area ---
 is_multi = st.session_state.multi_mode and len(st.session_state.selected_doc_ids) > 1
@@ -591,60 +606,58 @@ with tab1:
 
 # --- Tab 2: Extract ---
 with tab2:
-    st.markdown("**Define the fields you want to extract from this document.**")
-    st.caption("Use the field values as descriptions to guide extraction — be specific about which entity you want (e.g. 'candidate's email, not the company's').")
+    st.markdown("**Extract structured fields from this document.**")
 
-    default_schema = json.dumps({
-        "candidate_name": "full name of the candidate or main person in the document",
-        "candidate_email": "email address of the candidate, not the company",
-        "candidate_phone": "phone number of the candidate",
-        "skills": "list of technical or professional skills of the candidate",
-        "experience": "total years of experience of the candidate"
-    }, indent=2)
+    # Template picker
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        st.markdown("**Choose a template or define custom fields**")
+    with col2:
+        try:
+            templates_res = requests.get(f"{API_URL}/templates", timeout=5)
+            templates = templates_res.json() if templates_res.status_code == 200 else []
+        except Exception:
+            templates = []
+
+        template_options = {"custom": "✏️ Custom schema"} 
+        template_options.update({t["id"]: t["label"] for t in templates})
+
+        selected_template = st.selectbox(
+            "Template",
+            options=list(template_options.keys()),
+            format_func=lambda x: template_options[x],
+            label_visibility="collapsed"
+        )
+
+    # Load template schema
+    if selected_template != "custom":
+        try:
+            tmpl_res = requests.get(f"{API_URL}/templates/{selected_template}", timeout=5)
+            if tmpl_res.status_code == 200:
+                tmpl_data = tmpl_res.json()
+                template_schema = json.dumps(tmpl_data.get("schema", {}), indent=2)
+                st.caption(tmpl_data.get("description", ""))
+            else:
+                template_schema = "{}"
+        except Exception:
+            template_schema = "{}"
+    else:
+        template_schema = json.dumps({
+            "field_name": "description of what to extract",
+            "another_field": "description of this field"
+        }, indent=2)
 
     schema_input = st.text_area(
         "Extraction schema (JSON)",
-        value=default_schema,
-        height=250,
-        help="Keys = field names. Values = descriptions to guide extraction. Be specific."
+        value=template_schema,
+        height=220,
+        help="Keys = field names. Values = descriptions to guide extraction. Edit freely.",
+        key=f"schema_{selected_template}"
     )
 
     col1, col2 = st.columns([1, 3])
     with col1:
         extract_btn = st.button("🗂️ Extract Fields", type="primary", use_container_width=True)
-
-    if extract_btn:
-        try:
-            schema = json.loads(schema_input)
-        except json.JSONDecodeError:
-            st.markdown('<div class="error-box">⚠️ Invalid JSON — check your schema format.</div>', unsafe_allow_html=True)
-            st.stop()
-
-        with st.spinner("Extracting fields..."):
-            try:
-                response = requests.post(
-                    f"{API_URL}/extract",
-                    json={"document_id": st.session_state.document_id, "fields": schema},
-                    timeout=30
-                )
-                if response.status_code == 200:
-                    result = response.json()
-                    st.markdown('<div class="success-box">✅ Extraction complete</div>', unsafe_allow_html=True)
-                    st.json(result["extracted"])
-                    download_data = json.dumps(result["extracted"], indent=2)
-                    st.download_button(
-                        label="⬇️ Download JSON",
-                        data=download_data,
-                        file_name="extracted.json",
-                        mime="application/json"
-                    )
-                else:
-                    st.markdown(f'<div class="error-box">⚠️ Extraction failed (HTTP {response.status_code})</div>', unsafe_allow_html=True)
-            except requests.exceptions.Timeout:
-                st.markdown('<div class="error-box">⏱️ Extraction timed out. Try a simpler schema.</div>', unsafe_allow_html=True)
-            except Exception as e:
-                st.markdown(f'<div class="error-box">⚠️ Error: {str(e)}</div>', unsafe_allow_html=True)
-
 
 # --- Tab 3: Charts ---
 with tab3:

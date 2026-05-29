@@ -1,101 +1,92 @@
 import os
+import json
+import numpy as np
+from typing import Generator
 from dotenv import load_dotenv
-from groq import Groq
 from rank_bm25 import BM25Okapi
 from db import get_all_chunks
 from ingestion import get_embed_model
-from prompts import QA_PROMPT, QA_PROMPT_MULTI, GENERAL_PROMPT, CLASSIFIER_PROMPT, QUERY_EXPANSION_PROMPT
-import numpy as np
-import json
-load_dotenv()
+from prompts import (
+    QA_PROMPT, QA_PROMPT_MULTI, GENERAL_PROMPT,
+    CLASSIFIER_PROMPT, QUERY_EXPANSION_PROMPT, EXTRACTION_PROMPT
+)
+from llm.engine import call_llm, call_llm_stream
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+load_dotenv()
 
 import cohere
 co = cohere.Client(os.getenv("COHERE_API_KEY"))
 
-def extract_tables(document_id: str) -> list[dict]:
-    """Find and extract all tables from a document as structured data"""
-    all_chunks = get_all_chunks()
-    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
 
-    if not doc_chunks:
-        return []
+# --- Helpers ---
 
-    context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
+def cosine_similarity(a, b):
+    a, b = np.array(a), np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": f"""Extract ALL tables from the document below.
-For each table return a JSON object with:
-- "title": descriptive title for the table
-- "headers": list of column names
-- "rows": list of rows, each row is a list of values
-- "chart_type": suggest "bar", "line", or "pie" based on the data
 
-Return ONLY a JSON array of tables. No explanation, no markdown fences.
-If no tables found, return [].
+def format_history(messages: list[dict], summary: str = "") -> str:
+    return get_history_context(messages, summary)
 
-Document:
-{context}
 
-JSON array:"""}],
-        temperature=0.0
-    )
+def get_history_context(messages: list[dict], summary: str = "", window: int = 4) -> str:
+    parts = []
+    if summary:
+        parts.append(f"[Earlier conversation summary]: {summary}")
+    recent = messages[-window:] if len(messages) > window else messages
+    if recent:
+        recent_text = "\n".join([
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:300]}"
+            for m in recent
+        ])
+        parts.append(f"[Recent messages]:\n{recent_text}")
+    return "\n\n".join(parts) if parts else "None"
 
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
 
-    try:
-        tables = json.loads(raw.strip())
-        return tables if isinstance(tables, list) else []
-    except Exception:
-        return []
+# --- Classification ---
 
 def classify_question(question: str, has_document: bool = True) -> str:
     """Returns 'document' or 'general'"""
     if not has_document:
         return "general"
 
-    # Keywords that strongly suggest document intent
     doc_keywords = [
         "this", "the document", "the file", "the letter", "the contract",
         "the invoice", "the report", "the resume", "the agreement", "it says",
         "mentioned", "above", "here", "uploaded", "about"
     ]
-    q_lower = question.lower()
-    if any(kw in q_lower for kw in doc_keywords):
+    if any(kw in question.lower() for kw in doc_keywords):
         return "document"
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": CLASSIFIER_PROMPT.format(question=question)}],
+        result = call_llm(
+            CLASSIFIER_PROMPT.format(question=question),
             temperature=0.0,
-            max_tokens=10
+            max_tokens=10,
+            call_type="classify"
         )
-        result = response.choices[0].message.content.strip().lower()
-        return "document" if "document" in result else "general"
+        return "document" if "document" in result.strip().lower() else "general"
     except Exception:
         return "document"
+
+
+# --- Query expansion ---
 
 def expand_query(question: str) -> str:
     """Rewrite vague questions to improve retrieval"""
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": QUERY_EXPANSION_PROMPT.format(question=question)}],
+        expanded = call_llm(
+            QUERY_EXPANSION_PROMPT.format(question=question),
             temperature=0.0,
-            max_tokens=100
+            max_tokens=100,
+            call_type="expand"
         )
-        expanded = response.choices[0].message.content.strip()
-        return expanded if expanded else question
+        return expanded.strip() if expanded.strip() else question
     except Exception:
         return question
 
+
+# --- Reranking ---
 
 def rerank_chunks(question: str, chunks: list[dict], top_k: int = 5) -> list[dict]:
     """Use Cohere to rerank retrieved chunks"""
@@ -113,7 +104,6 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = 5) -> list[dic
             chunk = chunks[r.index].copy()
             chunk["score"] = r.relevance_score
             reranked.append(chunk)
-        # Re-number chunks after reranking
         for i, c in enumerate(reranked):
             c["chunk_num"] = i + 1
         return reranked
@@ -122,71 +112,7 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = 5) -> list[dic
         return chunks[:top_k]
 
 
-def answer_general(question: str, history: list[dict] = None, history_summary: str = "") -> str:
-    """Answer a general question from Groq's knowledge"""
-    history_text = format_history(history or [], history_summary)
-    prompt = GENERAL_PROMPT.format(history=history_text, question=question)
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5
-    )
-    return response.choices[0].message.content
-
-def compress_history(messages: list[dict]) -> str:
-    """Summarize a long conversation into a compact context string"""
-    if not messages:
-        return ""
-
-    conversation = "\n".join([
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:500]}"
-        for m in messages
-    ])
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{
-            "role": "user",
-            "content": f"""Summarize the following conversation in 3-5 sentences. 
-Focus on key facts, questions asked, and answers given. 
-Be concise — this will be used as context for future questions.
-
-Conversation:
-{conversation}
-
-Summary:"""
-        }],
-        temperature=0.0,
-        max_tokens=300
-    )
-
-    return response.choices[0].message.content.strip()
-
-
-def get_history_context(messages: list[dict], summary: str = "", window: int = 4) -> str:
-    """Build history context from summary + recent messages"""
-    parts = []
-
-    if summary:
-        parts.append(f"[Earlier conversation summary]: {summary}")
-
-    recent = messages[-window:] if len(messages) > window else messages
-    if recent:
-        recent_text = "\n".join([
-            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:300]}"
-            for m in recent
-        ])
-        parts.append(f"[Recent messages]:\n{recent_text}")
-
-    return "\n\n".join(parts) if parts else "None"
-
-
-def format_history(messages: list[dict], summary: str = "") -> str:
-    return get_history_context(messages, summary)
-
-def cosine_similarity(a, b):
-    a, b = np.array(a), np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+# --- Hybrid search ---
 
 def hybrid_search(question: str, document_ids: list[str] = None, top_k: int = 10) -> list[dict]:
     embed_model = get_embed_model()
@@ -198,12 +124,11 @@ def hybrid_search(question: str, document_ids: list[str] = None, top_k: int = 10
     if not all_chunks:
         return []
 
-    # Expand query before retrieval
     expanded_question = expand_query(question)
     print(f"Expanded query: {expanded_question}")
 
-    texts = [c["content"] for c in all_chunks]
     question_embedding = embed_model.get_text_embedding(expanded_question)
+    texts = [c["content"] for c in all_chunks]
 
     # Dense search
     dense_scores = []
@@ -211,8 +136,7 @@ def hybrid_search(question: str, document_ids: list[str] = None, top_k: int = 10
         raw_emb = chunk["embedding"]
         if isinstance(raw_emb, str):
             raw_emb = json.loads(raw_emb)
-        score = cosine_similarity(question_embedding, raw_emb)
-        dense_scores.append(score)
+        dense_scores.append(cosine_similarity(question_embedding, raw_emb))
 
     # BM25
     tokenized = [t.lower().split() for t in texts]
@@ -245,55 +169,53 @@ def hybrid_search(question: str, document_ids: list[str] = None, top_k: int = 10
         for i, idx in enumerate(top_indices)
     ]
 
-    # Rerank with Cohere
     return rerank_chunks(question, candidates, top_k=5)
 
-def extract_fields(document_id: str, schema: dict) -> dict:
-    # Get all chunks for this document
-    all_chunks = get_all_chunks()
-    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
 
-    # Use first 10 chunks as context (enough for most docs)
-    context = "\n\n".join([c["content"] for c in doc_chunks[:10]])
+# --- General answer ---
 
-    prompt = f"""Extract the following fields from the document below.
-Return ONLY a valid JSON object with these exact keys: {list(schema.keys())}
-If a field is not found, use null for strings or [] for lists.
-Do not include any explanation or markdown, just the JSON.
-
-Document:
-{context}
-
-Fields to extract: {json.dumps(schema, indent=2)}
-
-JSON output:"""
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0
+def answer_general(question: str, history: list[dict] = None, history_summary: str = "") -> str:
+    history_text = format_history(history or [], history_summary)
+    return call_llm(
+        GENERAL_PROMPT.format(history=history_text, question=question),
+        temperature=0.5,
+        call_type="general"
     )
 
-    raw = response.choices[0].message.content.strip()
 
-    # Clean markdown fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+# --- History compression ---
 
-    try:
-        extracted = json.loads(raw)
-    except json.JSONDecodeError:
-        extracted = {"error": "Could not parse extraction output", "raw": raw}
+def compress_history(messages: list[dict]) -> str:
+    if not messages:
+        return ""
+    conversation = "\n".join([
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:500]}"
+        for m in messages
+    ])
+    return call_llm(
+        f"""Summarize the following conversation in 3-5 sentences.
+Focus on key facts, questions asked, and answers given.
+Be concise — this will be used as context for future questions.
 
-    return {"extracted": extracted}
+Conversation:
+{conversation}
 
-from typing import Generator
+Summary:""",
+        temperature=0.0,
+        max_tokens=300,
+        call_type="compress"
+    )
 
-def query_document(question: str, document_id: str = None, document_ids: list[str] = None, history: list[dict] = None, history_summary: str = "") -> dict:
-    # Classify question
-    
+
+# --- Document query ---
+
+def query_document(
+    question: str,
+    document_id: str = None,
+    document_ids: list[str] = None,
+    history: list[dict] = None,
+    history_summary: str = ""
+) -> dict:
     has_doc = bool(document_ids or document_id)
     q_type = classify_question(question, has_document=has_doc)
 
@@ -303,11 +225,9 @@ def query_document(question: str, document_id: str = None, document_ids: list[st
 
     ids = document_ids if document_ids else ([document_id] if document_id else None)
     is_multi = ids and len(ids) > 1
-
     chunks = hybrid_search(question, document_ids=ids)
 
     if not chunks:
-        # Fallback to general if no chunks found
         answer = answer_general(question, history, history_summary)
         return {"answer": answer, "sources": [], "type": "general"}
 
@@ -315,19 +235,17 @@ def query_document(question: str, document_id: str = None, document_ids: list[st
         f"[{c['chunk_num']}] (Doc: {c['file']}, Page {c['page']}): {c['content']}"
         for c in chunks
     ])
-
     history_text = format_history(history or [], history_summary)
-    prompt_template = QA_PROMPT_MULTI if is_multi else QA_PROMPT
-    prompt = prompt_template.format(chunks=chunks_text, history=history_text, question=question)
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
+    prompt = (QA_PROMPT_MULTI if is_multi else QA_PROMPT).format(
+        chunks=chunks_text,
+        history=history_text,
+        question=question
     )
 
+    answer = call_llm(prompt, temperature=0.2, call_type="query")
+
     return {
-        "answer": response.choices[0].message.content,
+        "answer": answer,
         "sources": [
             {"chunk": c["chunk_num"], "page": c["page"], "file": c["file"], "preview": c["content"][:150]}
             for c in chunks
@@ -335,100 +253,131 @@ def query_document(question: str, document_id: str = None, document_ids: list[st
         "type": "document"
     }
 
-def query_document_stream(question: str, document_id: str = None, document_ids: list[str] = None, history: list[dict] = None, history_summary: str = "") -> Generator:
-    # Classify question
+
+# --- Streaming query ---
+
+def query_document_stream(
+    question: str,
+    document_id: str = None,
+    document_ids: list[str] = None,
+    history: list[dict] = None,
+    history_summary: str = ""
+) -> Generator:
     has_doc = bool(document_ids or document_id)
     q_type = classify_question(question, has_document=has_doc)
+
     if q_type == "general":
-        answer = answer_general(question, history, history_summary)
-        yield answer
+        yield answer_general(question, history, history_summary)
         return
 
     ids = document_ids if document_ids else ([document_id] if document_id else None)
     is_multi = ids and len(ids) > 1
-
     chunks = hybrid_search(question, document_ids=ids)
 
     if not chunks:
-        answer = answer_general(question, history, history_summary)
-        yield answer
+        yield answer_general(question, history, history_summary)
         return
 
     chunks_text = "\n\n".join([
         f"[{c['chunk_num']}] (Doc: {c['file']}, Page {c['page']}): {c['content']}"
         for c in chunks
     ])
-
     history_text = format_history(history or [], history_summary)
-    prompt_template = QA_PROMPT_MULTI if is_multi else QA_PROMPT
-    prompt = prompt_template.format(chunks=chunks_text, history=history_text, question=question)
-
-    stream = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        stream=True
+    prompt = (QA_PROMPT_MULTI if is_multi else QA_PROMPT).format(
+        chunks=chunks_text,
+        history=history_text,
+        question=question
     )
 
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
+    stream_gen = call_llm_stream(prompt, call_type="query_stream")
+    for token in stream_gen:
+        yield token
 
+
+# --- Extraction ---
 def extract_fields(document_id: str, fields: dict) -> dict:
+    from schemas.validator import validate_extraction
+
     all_chunks = get_all_chunks()
     doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
     context = "\n\n".join([c["content"] for c in doc_chunks[:10]])
 
-    # Build fields with descriptions string
-    # fields can be either:
-    # {"name": ""} — simple, no description
-    # {"name": "candidate's full name, not the company"} — with description
     fields_with_desc = "\n".join([
         f"- {key}: {value if value and isinstance(value, str) else 'extract from document'}"
         for key, value in fields.items()
     ])
 
-    from prompts import EXTRACTION_PROMPT
     prompt = EXTRACTION_PROMPT.format(
         fields_with_descriptions=fields_with_desc,
         context=context
     )
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0
+    extracted = call_llm(
+        prompt,
+        temperature=0.0,
+        json_mode=True,
+        call_type="extract"
     )
 
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+    if "error" in extracted:
+        return {"extracted": extracted, "validation": None}
 
-    try:
-        extracted = json.loads(raw.strip())
-    except json.JSONDecodeError:
-        extracted = {"error": "Could not parse extraction output", "raw": raw}
+    validation = validate_extraction(extracted, fields)
 
-    return {"extracted": extracted}
+    return {
+        "extracted": extracted,
+        "validation": validation
+    }
 
-def generate_summary(document_id: str) -> dict:
-    """Generate a structured summary of a document"""
+# --- Table extraction ---
+
+def extract_tables(document_id: str) -> list[dict]:
     all_chunks = get_all_chunks()
     doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+    if not doc_chunks:
+        return []
 
+    context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
+
+    result = call_llm(
+        f"""Extract ALL tables from the document below.
+For each table return a JSON object with:
+- "title": descriptive title for the table
+- "headers": list of column names
+- "rows": list of rows, each row is a list of values
+- "chart_type": suggest "bar", "line", or "pie" based on the data
+
+Return ONLY a JSON array of tables. No explanation, no markdown fences.
+If no tables found, return [].
+
+Document:
+{context}
+
+JSON array:""",
+        temperature=0.0,
+        json_mode=True,
+        call_type="extract_tables"
+    )
+
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict) and "error" in result:
+        return []
+    return []
+
+
+# --- Summary generation ---
+
+def generate_summary(document_id: str) -> dict:
+    all_chunks = get_all_chunks()
+    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
     if not doc_chunks:
         return {"summary": "", "summary_short": ""}
 
-    # Use first 15 chunks for summary context
     context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": f"""Analyze the document below and return a JSON object with exactly these keys:
-
+    parsed = call_llm(
+        f"""Analyze the document below and return a JSON object with exactly these keys:
 - "short": one sentence (max 20 words) describing what this document is
 - "overview": 2-3 sentence overview of the document
 - "key_topics": list of 3-5 main topics covered
@@ -442,21 +391,15 @@ Return ONLY valid JSON, no explanation, no markdown fences.
 Document:
 {context}
 
-JSON:"""}],
-        temperature=0.0
+JSON:""",
+        temperature=0.0,
+        json_mode=True,
+        call_type="summarize"
     )
 
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-
-    try:
-        parsed = json.loads(raw.strip())
+    if isinstance(parsed, dict) and "error" not in parsed:
         return {
             "summary": json.dumps(parsed),
             "summary_short": parsed.get("short", "")
         }
-    except Exception:
-        return {"summary": "", "summary_short": ""}
+    return {"summary": "", "summary_short": ""}
