@@ -231,15 +231,28 @@ with st.sidebar:
 
     uploaded_file = st.file_uploader(
         "Choose a file",
-        type=["pdf", "docx", "txt", "csv", "xlsx", "rtf", "md"],
+        type=["pdf", "docx", "txt", "csv", "xlsx", "rtf", "md", "png", "jpg", "jpeg", "webp", "tiff"],
         label_visibility="collapsed"
     )
 
     if uploaded_file:
-        is_pdf = uploaded_file.name.lower().endswith(".pdf")
+        ext = uploaded_file.name.lower().split(".")[-1]
+        is_llamaparse_type = ext in ["pdf", "png", "jpg", "jpeg", "webp", "tiff"]
         use_llamaparse = False
-        if is_pdf:
-            use_llamaparse = st.toggle("LlamaParse (better for tables/scans)", value=True)
+        vision_template = "general"
+
+        if is_llamaparse_type:
+            use_llamaparse = st.toggle("LlamaParse (better for tables/scans/images)", value=True)
+
+        if ext in ["png", "jpg", "jpeg", "webp", "tiff"] or use_llamaparse:
+            vision_template = st.selectbox(
+                "Vision context",
+                ["general", "cv_resume", "invoice", "construction_loan",
+                "gst_return", "id_document", "bank_statement"],
+                help="Select context so image descriptions are more accurate",
+                key="vision_template_select"
+            )
+
         if st.button("⬆️ Process Document", type="primary", use_container_width=True, disabled=not api_ok):
             with st.spinner(f"Processing {uploaded_file.name}..."):
                 try:
@@ -247,7 +260,10 @@ with st.sidebar:
                     response = requests.post(
                         f"{API_URL}/upload",
                         files={"file": (uploaded_file.name, uploaded_file, mime_type)},
-                        data={"use_llamaparse": str(use_llamaparse)},
+                        data={
+                            "use_llamaparse": str(use_llamaparse),
+                            "vision_template": vision_template
+                        },
                         timeout=120
                     )
                     if response.status_code == 200:
@@ -255,13 +271,17 @@ with st.sidebar:
                         if "error" in data:
                             st.error(f"⚠️ {data['error']}")
                         else:
+                            vision_note = " · 🖼️ vision descriptions generated" if data.get("vision_used") else ""
+                            st.success(
+                                f"✅ {data['chunks_stored']} chunks · "
+                                f"{data.get('parser', 'pypdf')}{vision_note}"
+                            )
                             load_document(data["document_id"], data["file"])
-                            st.success(f"✅ {data['chunks_stored']} chunks · {data.get('parser', 'pypdf')}")
                             st.rerun()
                     else:
                         st.error(f"Upload failed (HTTP {response.status_code})")
                 except requests.exceptions.Timeout:
-                    st.error("⏱️ Upload timed out. Try a smaller file.")
+                    st.error("⏱️ Upload timed out.")
                 except Exception as e:
                     st.error(f"Upload error: {str(e)}")
 
@@ -434,8 +454,7 @@ if st.session_state.doc_summary:
         if not any([details.get("overview"), details.get("key_topics")]):
             st.caption(summary.get("summary_short", "No summary available."))
 
-tab1, tab2, tab3, tab4 = st.tabs(["💬 Chat", "🗂️ Extract", "🤖 Smart Extract", "📊 Charts"])
-# --- Tab 1: Chat ---
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["💬 Chat", "🗂️ Extract", "🤖 Smart Extract", "📊 Charts", "⚙️ Settings"])
 with tab1:
 
     col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
@@ -511,9 +530,19 @@ with tab1:
             if msg["role"] == "assistant" and msg.get("sources"):
                 with st.expander("📎 Sources"):
                     for s in msg["sources"]:
+                        chunk_type = s.get("chunk_type", "text")
+                        image_ref = s.get("image_ref")
                         file_info = f" · {s['file']}" if s.get("file") else ""
-                        st.caption(f"Chunk {s['chunk']} · Page {s['page']}{file_info}")
+                        if chunk_type == "description":
+                            type_icon = "🖼️ Image description"
+                        elif chunk_type == "table":
+                            type_icon = "📊 Table"
+                        else:
+                            type_icon = "📄 Text"
+                        st.caption(f"{type_icon} · Page {s['page']}{file_info}" + (f" · ref: {image_ref}" if image_ref else ""))
                         st.text(s["preview"])
+                        if chunk_type == "description" and image_ref:
+                            st.info(f"💡 This answer references an image — see {image_ref} in the original document.")
 
     question = st.chat_input("Ask anything about the document...")
 
@@ -586,9 +615,19 @@ with tab1:
                     elif sources:
                         with st.expander("📎 Sources"):
                             for s in sources:
+                                chunk_type = s.get("chunk_type", "text")
+                                image_ref = s.get("image_ref")
                                 file_info = f" · {s['file']}" if s.get("file") else ""
-                                st.caption(f"Chunk {s['chunk']} · Page {s['page']}{file_info}")
+                                if chunk_type == "description":
+                                    type_icon = "🖼️ Image description"
+                                elif chunk_type == "table":
+                                    type_icon = "📊 Table"
+                                else:
+                                    type_icon = "📄 Text"
+                                st.caption(f"{type_icon} · Page {s['page']}{file_info}" + (f" · ref: {image_ref}" if image_ref else ""))
                                 st.text(s["preview"])
+                                if chunk_type == "description" and image_ref:
+                                    st.info(f"💡 This answer references an image — see {image_ref} in the original document.")
             except Exception:
                 pass
 
@@ -931,3 +970,185 @@ with tab4:
                 )
             except Exception as e:
                 st.caption(f"Could not render chart: {e}")
+
+# --- Tab 5: Settings ---
+with tab5:
+    st.markdown("## ⚙️ Settings")
+
+    # --- API Keys ---
+    st.markdown("### 🔑 API Keys")
+    st.caption("Generate keys to call DocIntel API from external systems.")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        key_name = st.text_input("Key name", placeholder="e.g. Production, Zapier, Client A")
+    with col2:
+        rate_limit = st.number_input("Calls/day", value=100, min_value=1, max_value=10000)
+
+    if st.button("➕ Generate API Key", type="primary"):
+        if key_name:
+            try:
+                res = requests.post(
+                    f"{API_URL}/api-keys",
+                    json={"name": key_name, "rate_limit": rate_limit},
+                    timeout=10
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    st.success("✅ API key created — copy it now, it won't be shown again!")
+                    st.code(data["key"], language=None)
+                    st.caption(f"Prefix: `{data['prefix']}` · Rate limit: {data['rate_limit']} calls/day")
+            except Exception as e:
+                st.error(f"Error: {e}")
+        else:
+            st.warning("Enter a key name first.")
+
+    # List existing keys
+    try:
+        keys_res = requests.get(f"{API_URL}/api-keys", timeout=5)
+        if keys_res.status_code == 200:
+            keys = keys_res.json()
+            if keys:
+                st.divider()
+                st.markdown("**Existing Keys**")
+                for k in keys:
+                    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                    with col1:
+                        st.markdown(f"**{k['name']}**")
+                        st.caption(f"Prefix: `{k['key_prefix']}`")
+                    with col2:
+                        st.caption(f"{'🟢 Active' if k['is_active'] else '🔴 Revoked'}")
+                    with col3:
+                        st.caption(f"{k['calls_today']}/{k['rate_limit']} calls today")
+                    with col4:
+                        if st.button("🗑️", key=f"revoke_{k['id']}", help="Revoke key"):
+                            requests.delete(f"{API_URL}/api-keys/{k['id']}", timeout=5)
+                            st.rerun()
+    except Exception:
+        pass
+
+    st.divider()
+
+    # --- Webhooks ---
+    st.markdown("### 🔗 Webhooks")
+    st.caption("Send extraction results automatically to any URL after processing.")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        wh_name = st.text_input("Webhook name", placeholder="e.g. Zapier, CRM, Slack")
+        wh_url = st.text_input("Endpoint URL", placeholder="https://your-endpoint.com/webhook")
+    with col2:
+        wh_secret = st.text_input("Secret (optional)", placeholder="for signature verification", type="password")
+        wh_events = st.multiselect(
+            "Events",
+            ["extraction.complete", "test.ping"],
+            default=["extraction.complete"]
+        )
+
+    if st.button("➕ Add Webhook", type="primary"):
+        if wh_name and wh_url:
+            try:
+                res = requests.post(
+                    f"{API_URL}/webhooks",
+                    json={
+                        "name": wh_name,
+                        "url": wh_url,
+                        "events": wh_events,
+                        "secret": wh_secret or None
+                    },
+                    timeout=10
+                )
+                if res.status_code == 200:
+                    st.success("✅ Webhook added!")
+                    st.rerun()
+                else:
+                    st.error("Failed to add webhook.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+        else:
+            st.warning("Enter webhook name and URL.")
+
+    # List existing webhooks
+    try:
+        wh_res = requests.get(f"{API_URL}/webhooks", timeout=5)
+        if wh_res.status_code == 200:
+            webhooks = wh_res.json()
+            if webhooks:
+                st.divider()
+                st.markdown("**Active Webhooks**")
+                for wh in webhooks:
+                    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                    with col1:
+                        st.markdown(f"**{wh['name']}**")
+                        st.caption(wh['url'][:40] + "..." if len(wh['url']) > 40 else wh['url'])
+                    with col2:
+                        st.caption(f"{'🟢 Active' if wh['is_active'] else '🔴 Inactive'}")
+                        if wh.get("last_triggered"):
+                            st.caption(f"Last: {wh['last_triggered'][:10]}")
+                    with col3:
+                        st.caption(f"Fails: {wh.get('fail_count', 0)}")
+                        st.caption(f"Events: {', '.join(wh.get('events', []))}")
+                    with col4:
+                        if st.button("🧪", key=f"test_{wh['id']}", help="Test webhook"):
+                            test_res = requests.post(f"{API_URL}/webhooks/{wh['id']}/test", timeout=15)
+                            if test_res.status_code == 200 and test_res.json().get("success"):
+                                st.success("✅ Test sent!")
+                            else:
+                                st.error("Test failed.")
+                        if st.button("🗑️", key=f"del_wh_{wh['id']}", help="Delete webhook"):
+                            requests.delete(f"{API_URL}/webhooks/{wh['id']}", timeout=5)
+                            st.rerun()
+
+            # Webhook logs
+            st.divider()
+            st.markdown("**Recent Webhook Logs**")
+            try:
+                logs_res = requests.get(f"{API_URL}/webhooks/logs", timeout=5)
+                if logs_res.status_code == 200:
+                    logs = logs_res.json()
+                    if logs:
+                        for log in logs[:10]:
+                            icon = "✅" if log.get("success") else "❌"
+                            st.caption(
+                                f"{icon} {log.get('event')} · "
+                                f"HTTP {log.get('response_status', '?')} · "
+                                f"{log.get('created_at', '')[:16]}"
+                            )
+                    else:
+                        st.caption("No webhook deliveries yet.")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    st.divider()
+
+    # --- API Reference ---
+    st.markdown("### 📡 API Reference")
+    st.caption("Use these endpoints to integrate DocIntel into your own systems.")
+
+    with st.expander("View API endpoints"):
+        st.markdown(f"""
+**Base URL:** `{API_URL}`
+
+**Authentication:** Add header `X-API-Key: your_key` to any request.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/upload` | Upload a document |
+| POST | `/query` | Query a document |
+| POST | `/extract` | Extract structured fields |
+| POST | `/extract/nl` | Natural language extraction |
+| GET | `/documents` | List all documents |
+| GET | `/summary/{{id}}` | Get document summary |
+| POST | `/compress` | Compress chat history |
+| GET | `/usage` | Get usage stats |
+
+**Example — Extract fields via API:**
+```bash
+curl -X POST {API_URL}/extract/nl \\
+  -H "X-API-Key: your_key" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"document_id": "abc-123", "instruction": "extract name, email and skills"}}'
+```
+        """)

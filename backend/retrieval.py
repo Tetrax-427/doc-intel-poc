@@ -164,6 +164,8 @@ def hybrid_search(question: str, document_ids: list[str] = None, top_k: int = 10
             "content": all_chunks[idx]["content"],
             "page": all_chunks[idx]["metadata"].get("page", "?"),
             "file": all_chunks[idx]["metadata"].get("file", "?"),
+            "chunk_type": all_chunks[idx]["metadata"].get("chunk_type", "text"),
+            "image_ref": all_chunks[idx]["metadata"].get("image_ref"),
             "score": rrf[idx]
         }
         for i, idx in enumerate(top_indices)
@@ -247,7 +249,14 @@ def query_document(
     return {
         "answer": answer,
         "sources": [
-            {"chunk": c["chunk_num"], "page": c["page"], "file": c["file"], "preview": c["content"][:150]}
+            {
+                "chunk": c["chunk_num"],
+                "page": c["page"],
+                "file": c["file"],
+                "preview": c["content"][:150],
+                "chunk_type": c.get("chunk_type", "text"),
+                "image_ref": c.get("image_ref")
+            }
             for c in chunks
         ],
         "type": "document"

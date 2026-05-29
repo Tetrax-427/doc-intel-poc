@@ -6,6 +6,23 @@ from ingestion import ingest_file
 from retrieval import query_document, query_document_stream
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
+
+from fastapi.security import APIKeyHeader
+from fastapi import Security, HTTPException
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    """Dependency — validates API key if provided"""
+    if not api_key:
+        return None  # no key = UI mode, allow through
+    from api_keys import validate_api_key
+    is_valid, reason = validate_api_key(api_key)
+    if not is_valid:
+        raise HTTPException(status_code=401, detail=reason)
+    return api_key
+
+
 class QueryRequest(BaseModel):
     question: str
     document_id: str = None
@@ -38,9 +55,11 @@ def root():
 @app.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    use_llamaparse: str = Form("True")
+    use_llamaparse: str = Form("True"),
+    vision_template: str = Form("general")
 ):
-    allowed = [".pdf", ".docx", ".txt", ".csv", ".xlsx", ".rtf", ".md"]
+    allowed = [".pdf", ".docx", ".txt", ".csv", ".xlsx", ".rtf", ".md",
+               ".png", ".jpg", ".jpeg", ".webp", ".tiff"]
     ext = os.path.splitext(file.filename)[1].lower()
 
     if ext not in allowed:
@@ -51,10 +70,9 @@ async def upload_document(
         shutil.copyfileobj(file.file, f)
 
     use_lp = use_llamaparse.lower() == "true"
-    result = ingest_file(temp_path, use_llamaparse=use_lp)
+    result = ingest_file(temp_path, use_llamaparse=use_lp, vision_template=vision_template)
 
     if "error" not in result:
-        # Generate and save summary in background
         try:
             from retrieval import generate_summary
             from db import save_summary
@@ -73,7 +91,17 @@ class ExtractRequest(BaseModel):
 @app.post("/extract")
 def extract(req: ExtractRequest):
     from retrieval import extract_fields
-    return extract_fields(req.document_id, req.fields)
+    from webhooks import trigger_webhooks
+    result = extract_fields(req.document_id, req.fields)
+
+    # Trigger webhooks
+    trigger_webhooks("extraction.complete", {
+        "document_id": req.document_id,
+        "extracted": result.get("extracted"),
+        "validation": result.get("validation")
+    })
+
+    return result
 
 @app.get("/documents")
 def list_documents():
@@ -233,10 +261,95 @@ class NLExtractRequest(BaseModel):
 @app.post("/extract/nl")
 def extract_natural_language(req: NLExtractRequest):
     from retrieval import nl_to_schema, extract_nl
+    from webhooks import trigger_webhooks
 
     if req.preview_only:
-        # Just return the schema without running extraction
         schema = nl_to_schema(req.instruction)
         return {"schema": schema, "extracted": None, "validation": None}
 
-    return extract_nl(req.document_id, req.instruction)
+    result = extract_nl(req.document_id, req.instruction)
+
+    trigger_webhooks("extraction.complete", {
+        "document_id": req.document_id,
+        "instruction": req.instruction,
+        "extracted": result.get("extracted"),
+        "validation": result.get("validation")
+    })
+
+    return result
+
+class CreateKeyRequest(BaseModel):
+    name: str
+    rate_limit: int = 100
+
+@app.post("/api-keys")
+def create_key(req: CreateKeyRequest):
+    from api_keys import create_api_key
+    return create_api_key(req.name, req.rate_limit)
+
+@app.get("/api-keys")
+def list_keys():
+    from api_keys import list_api_keys
+    return list_api_keys()
+
+@app.delete("/api-keys/{key_id}")
+def revoke_key(key_id: str):
+    from api_keys import revoke_api_key
+    revoke_api_key(key_id)
+    return {"status": "revoked"}
+
+class CreateWebhookRequest(BaseModel):
+    name: str
+    url: str
+    events: list[str] = ["extraction.complete"]
+    secret: str = None
+
+@app.post("/webhooks")
+def create_webhook(req: CreateWebhookRequest):
+    from db import supabase
+    result = supabase.table("webhooks").insert({
+        "name": req.name,
+        "url": req.url,
+        "events": req.events,
+        "secret": req.secret
+    }).execute()
+    return result.data[0]
+
+@app.get("/webhooks")
+def list_webhooks():
+    from db import supabase
+    result = supabase.table("webhooks")\
+        .select("id, name, url, events, is_active, last_triggered, fail_count, created_at")\
+        .order("created_at", desc=True)\
+        .execute()
+    return result.data or []
+
+@app.delete("/webhooks/{webhook_id}")
+def delete_webhook(webhook_id: str):
+    from db import supabase
+    supabase.table("webhooks").delete().eq("id", webhook_id).execute()
+    return {"status": "deleted"}
+
+@app.get("/webhooks/logs")
+def webhook_logs():
+    from db import supabase
+    result = supabase.table("webhook_logs")\
+        .select("*")\
+        .order("created_at", desc=True)\
+        .limit(50)\
+        .execute()
+    return result.data or []
+
+@app.post("/webhooks/{webhook_id}/test")
+def test_webhook(webhook_id: str):
+    from db import supabase
+    from webhooks import send_webhook
+    result = supabase.table("webhooks").select("*").eq("id", webhook_id).execute()
+    if not result.data:
+        return {"error": "Webhook not found"}
+    webhook = result.data[0]
+    success = send_webhook(webhook, "test.ping", {
+        "message": "This is a test ping from DocIntel",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+    return {"success": success}

@@ -134,6 +134,60 @@ TEMPLATES = {
     }
 }
 
+VISION_PROMPTS = {
+    "general": """Describe this image in detail. Include:
+- What type of document or scene this is
+- All visible text, numbers, and data
+- Layout and structure
+- Any important visual elements""",
+
+    "cv_resume": """Analyze this CV or resume image. Describe:
+- The candidate's name and contact details visible
+- Professional experience and companies mentioned
+- Education qualifications
+- Skills and certifications listed
+- Overall document structure and completeness""",
+
+    "invoice": """Analyze this invoice or bill image. Extract and describe:
+- Vendor and client names
+- Invoice number and date
+- All line items with quantities and amounts
+- Tax breakdown (GST/VAT)
+- Total amount payable
+- Payment terms if visible""",
+
+    "construction_loan": """Analyze this construction site or loan document image. Describe:
+- Current construction stage and progress visible
+- Structural elements present (foundation, columns, slabs, walls)
+- Materials and equipment visible
+- Estimated completion percentage
+- Any visible defects or concerns
+- Document details if this is a paper form""",
+
+    "gst_return": """Analyze this GST document or return image. Extract and describe:
+- GSTIN and business name
+- Tax period and return type
+- All financial figures visible
+- Tax amounts (CGST, SGST, IGST)
+- Filing status if shown""",
+
+    "id_document": """Analyze this identity document image. Describe:
+- Document type (Aadhaar, PAN, Passport, Driving License)
+- Name and identifying details visible
+- Issue and expiry dates if present
+- Document number if visible
+- Any other relevant fields""",
+
+    "bank_statement": """Analyze this bank statement image. Describe:
+- Account holder name and account number
+- Bank name and branch
+- Statement period
+- Opening and closing balances
+- Notable transactions if visible"""
+}
+
+def get_vision_prompt(template_id: str = "general") -> str:
+    return VISION_PROMPTS.get(template_id, VISION_PROMPTS["general"])
 
 def get_template(template_id: str) -> dict:
     return TEMPLATES.get(template_id, {})

@@ -160,6 +160,102 @@ def _call_anthropic(client, messages, temperature, max_tokens, stream):
     return response.content[0].text
 
 
+def call_vision_llm(
+    image_path: str,
+    prompt: str,
+    call_type: str = "vision"
+) -> str:
+    """
+    Call vision LLM to describe an image.
+    Returns empty string if no vision model configured.
+    """
+    vision_provider = os.getenv("VISION_PROVIDER", "").strip()
+    vision_model = os.getenv("VISION_MODEL", "").strip()
+
+    if not vision_provider or not vision_model:
+        print("No vision model configured — skipping description")
+        return ""
+
+    try:
+        import base64
+        from llm.usage import log_usage
+
+        # Read and encode image
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+
+        # Detect image type
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_map = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".png": "image/png", ".webp": "image/webp",
+            ".tiff": "image/tiff", ".gif": "image/gif"
+        }
+        mime_type = mime_map.get(ext, "image/jpeg")
+
+        start_time = time.time()
+
+        if vision_provider == "openai":
+            from openai import OpenAI
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            response = client.chat.completions.create(
+                model=vision_model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{mime_type};base64,{image_data}"
+                        }}
+                    ]
+                }],
+                max_tokens=500
+            )
+            description = response.choices[0].message.content
+
+        elif vision_provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            response = client.messages.create(
+                model=vision_model,
+                max_tokens=500,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": image_data
+                            }
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+            )
+            description = response.content[0].text
+
+        else:
+            print(f"Vision provider '{vision_provider}' not supported")
+            return ""
+
+        latency = time.time() - start_time
+        log_usage(
+            call_type=call_type,
+            model=vision_model,
+            prompt_len=len(prompt),
+            response_len=len(description),
+            latency=latency
+        )
+
+        return description
+
+    except Exception as e:
+        print(f"Vision LLM call failed: {e}")
+        return ""
+    
+    
 def _parse_json(text: str) -> dict:
     """Clean and parse JSON from LLM response"""
     text = text.strip()

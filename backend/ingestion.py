@@ -26,11 +26,19 @@ def get_embed_model():
 
 splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
 
-SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".csv", ".xlsx", ".rtf", ".md"]
-
+SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".csv", ".xlsx", ".rtf", ".md", ".png", ".jpg", ".jpeg", ".webp", ".tiff"]
 # --- Parsers ---
 
-def parse_pdf(file_path: str, use_llamaparse: bool = True) -> list[dict]:
+def parse_pdf(file_path: str, use_llamaparse: bool = True, vision_template: str = "general") -> list[dict]:
+    scanned = False
+    if os.getenv("LLAMA_CLOUD_API_KEY"):
+        scanned = is_scanned_pdf(file_path)
+        if scanned:
+            print(f"Scanned PDF detected — forcing LlamaParse")
+            use_llamaparse = True
+
+    pages = []
+
     if use_llamaparse and os.getenv("LLAMA_CLOUD_API_KEY"):
         try:
             from llama_parse import LlamaParse
@@ -40,7 +48,51 @@ def parse_pdf(file_path: str, use_llamaparse: bool = True) -> list[dict]:
                 verbose=False
             )
             docs = parser.load_data(file_path)
-            pages = [{"text": d.text.strip(), "page": str(i+1)} for i, d in enumerate(docs) if d.text.strip()]
+            for i, d in enumerate(docs):
+                if d.text.strip():
+                    pages.append({
+                        "text": d.text.strip(),
+                        "page": str(i+1),
+                        "chunk_type": "text",
+                        "image_ref": None
+                    })
+
+            # For scanned PDFs — also generate page descriptions
+            if scanned and pages:
+                from llm.engine import call_vision_llm
+                from schemas.templates import get_vision_prompt
+                import fitz  # PyMuPDF for page rendering
+
+                vision_prompt = get_vision_prompt(vision_template)
+
+                try:
+                    doc = fitz.open(file_path)
+                    for page_num in range(min(len(doc), 10)):  # max 10 pages
+                        page = doc[page_num]
+                        pix = page.get_pixmap(dpi=150)
+                        temp_img = f"{file_path}_page_{page_num+1}.png"
+                        pix.save(temp_img)
+
+                        description = call_vision_llm(temp_img, vision_prompt, call_type="vision_pdf")
+
+                        if description:
+                            pages.append({
+                                "text": f"[Page {page_num+1} Visual Description]: {description}",
+                                "page": str(page_num+1),
+                                "chunk_type": "description",
+                                "image_ref": f"page_{page_num+1}"
+                            })
+
+                        # Clean up temp image
+                        try:
+                            os.remove(temp_img)
+                        except Exception:
+                            pass
+
+                    doc.close()
+                except Exception as e:
+                    print(f"Page description generation failed: {e}")
+
             if pages:
                 return pages
         except Exception as e:
@@ -48,11 +100,15 @@ def parse_pdf(file_path: str, use_llamaparse: bool = True) -> list[dict]:
 
     from pypdf import PdfReader
     reader = PdfReader(file_path)
-    pages = []
     for i, page in enumerate(reader.pages):
         text = page.extract_text()
         if text and text.strip():
-            pages.append({"text": text.strip(), "page": str(i+1)})
+            pages.append({
+                "text": text.strip(),
+                "page": str(i+1),
+                "chunk_type": "text",
+                "image_ref": None
+            })
     return pages
 
 
@@ -157,7 +213,56 @@ def parse_txt_from_string(text: str) -> list[dict]:
             chunks.append({"text": chunk, "page": str(i // chunk_size + 1)})
     return chunks
 
+def parse_image(file_path: str, vision_template: str = "general") -> list[dict]:
+    """Parse image — OCR text + visual description"""
+    pages = []
 
+    # Step 1 — OCR text via LlamaParse
+    if os.getenv("LLAMA_CLOUD_API_KEY"):
+        try:
+            from llama_parse import LlamaParse
+            parser = LlamaParse(
+                api_key=os.getenv("LLAMA_CLOUD_API_KEY"),
+                result_type="markdown",
+                verbose=False
+            )
+            docs = parser.load_data(file_path)
+            for i, d in enumerate(docs):
+                if d.text.strip():
+                    pages.append({
+                        "text": d.text.strip(),
+                        "page": str(i+1),
+                        "chunk_type": "text",
+                        "image_ref": os.path.basename(file_path)
+                    })
+        except Exception as e:
+            print(f"LlamaParse OCR failed: {e}")
+
+    # Step 2 — Visual description via vision LLM
+    from llm.engine import call_vision_llm
+    from schemas.templates import get_vision_prompt
+
+    vision_prompt = get_vision_prompt(vision_template)
+    description = call_vision_llm(file_path, vision_prompt, call_type="vision")
+
+    if description:
+        pages.append({
+            "text": f"[Visual Description]: {description}",
+            "page": "description",
+            "chunk_type": "description",
+            "image_ref": os.path.basename(file_path)
+        })
+
+    if not pages:
+        pages.append({
+            "text": "No text could be extracted from this image.",
+            "page": "1",
+            "chunk_type": "text",
+            "image_ref": os.path.basename(file_path)
+        })
+
+    return pages
+    
 # --- File router ---
 
 def parse_file(file_path: str, use_llamaparse: bool = True) -> list[dict]:
@@ -170,6 +275,11 @@ def parse_file(file_path: str, use_llamaparse: bool = True) -> list[dict]:
         ".csv":  lambda: parse_csv(file_path),
         ".xlsx": lambda: parse_xlsx(file_path),
         ".rtf":  lambda: parse_rtf(file_path),
+        ".png":  lambda: parse_image(file_path),
+        ".jpg":  lambda: parse_image(file_path),
+        ".jpeg": lambda: parse_image(file_path),
+        ".webp": lambda: parse_image(file_path),
+        ".tiff": lambda: parse_image(file_path),
     }
     parser = parsers.get(ext)
     if not parser:
@@ -179,16 +289,23 @@ def parse_file(file_path: str, use_llamaparse: bool = True) -> list[dict]:
 
 # --- Main file ingestion ---
 
-def ingest_file(file_path: str, use_llamaparse: bool = True) -> dict:
+def ingest_file(file_path: str, use_llamaparse: bool = True, vision_template: str = "general") -> dict:
     file_name = os.path.basename(file_path)
     ext = os.path.splitext(file_path)[1].lower()
     model = get_embed_model()
 
     if ext not in SUPPORTED_EXTENSIONS:
-        return {"error": f"Unsupported file type: {ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"}
+        return {"error": f"Unsupported file type: {ext}"}
 
     print(f"Parsing {file_name} as {ext}")
-    pages = parse_file(file_path, use_llamaparse)
+
+    # Pass vision_template to parsers that support it
+    if ext == ".pdf":
+        pages = parse_pdf(file_path, use_llamaparse, vision_template)
+    elif ext in [".png", ".jpg", ".jpeg", ".webp", ".tiff"]:
+        pages = parse_image(file_path, vision_template)
+    else:
+        pages = parse_file(file_path, use_llamaparse)
 
     if not pages:
         return {"error": "Could not extract text. File may be empty or image-only."}
@@ -210,19 +327,26 @@ def ingest_file(file_path: str, use_llamaparse: bool = True) -> dict:
                 "embedding": embedding,
                 "metadata": {
                     "page": page_data["page"],
-                    "file": file_name
+                    "file": file_name,
+                    "chunk_type": page_data.get("chunk_type", "text"),
+                    "image_ref": page_data.get("image_ref")
                 }
             })
 
     insert_chunks(chunk_rows)
 
+    text_chunks = sum(1 for p in pages if p.get("chunk_type") == "text")
+    desc_chunks = sum(1 for p in pages if p.get("chunk_type") == "description")
+
     return {
         "document_id": doc_id,
         "file": file_name,
         "chunks_stored": len(chunk_rows),
-        "parser": ext.replace(".", "")
+        "text_pages": text_chunks,
+        "description_pages": desc_chunks,
+        "parser": ext.replace(".", ""),
+        "vision_used": desc_chunks > 0
     }
-
 
 # --- URL ingestion ---
 
