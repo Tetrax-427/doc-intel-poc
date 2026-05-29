@@ -162,6 +162,9 @@ def load_document(doc_id: str, doc_name: str):
     st.session_state.api_error = None
     st.session_state["tables"] = []
     st.session_state.doc_summary = None
+    st.session_state["nl_instruction"] = ""
+    st.session_state["injected_schema"] = ""
+
     try:
         res = requests.get(f"{API_URL}/chats/{doc_id}", timeout=5)
         st.session_state.messages = res.json() if res.status_code == 200 else []
@@ -431,7 +434,7 @@ if st.session_state.doc_summary:
         if not any([details.get("overview"), details.get("key_topics")]):
             st.caption(summary.get("summary_short", "No summary available."))
 
-tab1, tab2, tab3 = st.tabs(["💬 Chat", "🗂️ Extract", "📊 Charts"])
+tab1, tab2, tab3, tab4 = st.tabs(["💬 Chat", "🗂️ Extract", "🤖 Smart Extract", "📊 Charts"])
 # --- Tab 1: Chat ---
 with tab1:
 
@@ -649,9 +652,9 @@ with tab2:
 
     schema_input = st.text_area(
         "Extraction schema (JSON)",
-        value=template_schema,
+        value=st.session_state.get("injected_schema") or template_schema,
         height=220,
-        help="Keys = field names. Values = descriptions to guide extraction. Edit freely.",
+        help="Keys = field names. Values = descriptions to guide extraction.",
         key=f"schema_{selected_template}"
     )
 
@@ -659,8 +662,172 @@ with tab2:
     with col1:
         extract_btn = st.button("🗂️ Extract Fields", type="primary", use_container_width=True)
 
-# --- Tab 3: Charts ---
+# --- Tab 3: Smart Extract (NL) ---
 with tab3:
+    st.markdown("**Describe what you want to extract in plain English.**")
+    st.caption("No need to define a schema — just tell DocIntel what you need.")
+
+    # Example instructions
+    st.markdown("**Examples:**")
+    examples = [
+        "Extract the candidate's name, email, phone, skills, and total experience",
+        "Get all financial figures including invoice amount, tax, and payment terms",
+        "Extract all dates, parties involved, and key obligations from this contract",
+        "Pull out the applicant's income, loan amount requested, and employment details",
+        "Get company name, GSTIN, total tax liability, and filing period"
+    ]
+
+    cols = st.columns(2)
+    for i, example in enumerate(examples):
+        with cols[i % 2]:
+            if st.button(f"💡 {example[:50]}...", key=f"ex_{i}", use_container_width=True):
+                st.session_state["nl_instruction"] = example
+
+    st.divider()
+
+    instruction = st.text_area(
+        "Your extraction instruction",
+        value=st.session_state.get("nl_instruction", ""),
+        height=100,
+        placeholder="e.g. Extract the candidate's name, email, current company, skills list, and years of experience",
+        key="nl_input"
+    )
+
+    col1, col2, col3 = st.columns([2, 2, 3])
+    with col1:
+        preview_btn = st.button("👁️ Preview Schema", use_container_width=True)
+    with col2:
+        extract_nl_btn = st.button("🤖 Extract", type="primary", use_container_width=True)
+
+    # Preview schema
+    if preview_btn and instruction:
+        with st.spinner("Generating schema from instruction..."):
+            try:
+                res = requests.post(
+                    f"{API_URL}/extract/nl",
+                    json={
+                        "document_id": st.session_state.document_id,
+                        "instruction": instruction,
+                        "preview_only": True
+                    },
+                    timeout=20
+                )
+                if res.status_code == 200:
+                    schema = res.json().get("schema", {})
+                    st.markdown("**Generated Schema:**")
+                    st.caption("This is what DocIntel will extract based on your instruction. You can copy this to the Extract tab to customize further.")
+                    st.json(schema)
+                else:
+                    st.error("Failed to generate schema.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # Run extraction
+    if extract_nl_btn and instruction:
+        with st.spinner("Understanding instruction and extracting..."):
+            try:
+                res = requests.post(
+                    f"{API_URL}/extract/nl",
+                    json={
+                        "document_id": st.session_state.document_id,
+                        "instruction": instruction,
+                        "preview_only": False
+                    },
+                    timeout=45
+                )
+                if res.status_code == 200:
+                    data = res.json()
+
+                    if "error" in data:
+                        st.error(f"⚠️ {data['error']}")
+                    else:
+                        # Show generated schema
+                        with st.expander("🔍 Generated Schema", expanded=False):
+                            st.json(data.get("schema", {}))
+
+                        st.divider()
+
+                        # Validation summary
+                        validation = data.get("validation")
+                        extracted = data.get("extracted", {})
+
+                        if validation:
+                            overall = validation["overall_confidence"]
+                            found = validation["found_count"]
+                            total = validation["total_count"]
+
+                            if overall >= 0.85:
+                                st.success(f"✅ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+                            elif overall >= 0.5:
+                                st.warning(f"⚠️ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+                            else:
+                                st.error(f"❌ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+
+                            st.divider()
+                            st.markdown("**Extracted Fields**")
+
+                            for field_name, field_data in validation["fields"].items():
+                                status = field_data["status"]
+                                confidence = field_data["confidence"]
+                                value = field_data["value"]
+                                note = field_data.get("validation_note", "")
+
+                                icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
+
+                                col1, col2, col3 = st.columns([2, 3, 1])
+                                with col1:
+                                    st.markdown(f"{icon} **{field_name}**")
+                                    if note:
+                                        st.caption(f"⚠️ {note}")
+                                with col2:
+                                    if isinstance(value, list):
+                                        st.caption(", ".join(str(v) for v in value) if value else "—")
+                                    else:
+                                        st.caption(str(value) if value else "—")
+                                with col3:
+                                    st.caption(f"{int(confidence*100)}%")
+
+                        st.divider()
+
+                        # Raw JSON + copy to Extract tab
+                        with st.expander("📄 Raw JSON"):
+                            st.json(extracted)
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            download_data = json.dumps({
+                                "instruction": instruction,
+                                "extracted": extracted,
+                                "validation": {
+                                    "overall_confidence": validation["overall_confidence"],
+                                    "found_count": validation["found_count"],
+                                    "total_count": validation["total_count"]
+                                } if validation else {}
+                            }, indent=2)
+                            st.download_button(
+                                label="⬇️ Download JSON",
+                                data=download_data,
+                                file_name="nl_extracted.json",
+                                mime="application/json"
+                            )
+                        with col2:
+                            # Copy schema to Extract tab
+                            if st.button("📋 Copy schema to Extract tab"):
+                                st.session_state["injected_schema"] = json.dumps(data.get("schema", {}), indent=2)
+                                st.success("Schema copied! Switch to Extract tab.")
+
+                else:
+                    st.error(f"Extraction failed (HTTP {res.status_code})")
+            except requests.exceptions.Timeout:
+                st.error("⏱️ Timed out. Try a simpler instruction.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    elif extract_nl_btn and not instruction:
+        st.warning("Please enter an instruction first.")
+        
+# --- Tab 4: Charts ---
+with tab4:
     st.markdown("**Tables & Charts extracted from your document**")
     st.caption("DocIntel automatically detects tables and visualizes them.")
 

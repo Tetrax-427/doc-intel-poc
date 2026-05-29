@@ -224,3 +224,19 @@ def get_template(template_id: str):
     if not template:
         return {"error": f"Template '{template_id}' not found"}
     return template
+
+class NLExtractRequest(BaseModel):
+    document_id: str
+    instruction: str
+    preview_only: bool = False  # if True, return schema without extracting
+
+@app.post("/extract/nl")
+def extract_natural_language(req: NLExtractRequest):
+    from retrieval import nl_to_schema, extract_nl
+
+    if req.preview_only:
+        # Just return the schema without running extraction
+        schema = nl_to_schema(req.instruction)
+        return {"schema": schema, "extracted": None, "validation": None}
+
+    return extract_nl(req.document_id, req.instruction)

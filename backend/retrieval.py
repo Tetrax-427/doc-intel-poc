@@ -403,3 +403,56 @@ JSON:""",
             "summary_short": parsed.get("short", "")
         }
     return {"summary": "", "summary_short": ""}
+
+def nl_to_schema(instruction: str) -> dict:
+    """Convert plain English instruction to extraction schema"""
+    result = call_llm(
+        f"""Convert the following extraction instruction into a JSON schema for document extraction.
+
+Rules:
+- Return a JSON object where keys are snake_case field names
+- Values are clear descriptions of what to extract for that field
+- Include all fields mentioned or implied by the instruction
+- For list fields (skills, items, etc.) use descriptive values ending in "as a list"
+- Be specific about which entity the field belongs to
+
+Instruction: {instruction}
+
+Return ONLY valid JSON, no explanation, no markdown.
+
+JSON schema:""",
+        temperature=0.0,
+        json_mode=True,
+        call_type="nl_to_schema"
+    )
+    return result
+
+
+def extract_nl(document_id: str, instruction: str) -> dict:
+    """
+    Natural language extraction pipeline:
+    1. Convert instruction to schema
+    2. Run extraction with validation
+    3. Return schema + extracted + validation
+    """
+    # Step 1 — Convert instruction to schema
+    schema = nl_to_schema(instruction)
+
+    if "error" in schema:
+        return {
+            "error": "Could not parse instruction into schema",
+            "instruction": instruction,
+            "schema": None,
+            "extracted": None,
+            "validation": None
+        }
+
+    # Step 2 — Run extraction using existing pipeline
+    result = extract_fields(document_id, schema)
+
+    return {
+        "instruction": instruction,
+        "schema": schema,
+        "extracted": result.get("extracted"),
+        "validation": result.get("validation")
+    }
