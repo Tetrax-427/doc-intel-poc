@@ -465,3 +465,120 @@ def extract_nl(document_id: str, instruction: str) -> dict:
         "extracted": result.get("extracted"),
         "validation": result.get("validation")
     }
+    
+"""
+APPEND THIS BLOCK TO THE BOTTOM OF retrieval.py
+"""
+
+# ── Document classification ───────────────────────────────────────────────────
+
+# Maps LLM-returned doc_type strings to the matching extraction template ID.
+# Template IDs must match keys returned by schemas/templates.py::list_templates().
+TEMPLATE_MAP = {
+    "invoice":              "invoice",
+    "receipt":              "invoice",        # close enough — reuse invoice template
+    "resume":               "cv_resume",
+    "cv":                   "cv_resume",
+    "curriculum vitae":     "cv_resume",
+    "contract":             "contract",
+    "agreement":            "contract",
+    "nda":                  "contract",
+    "report":               "report",
+    "research paper":       "report",
+    "financial statement":  "financial",
+    "balance sheet":        "financial",
+    "income statement":     "financial",
+    "medical record":       "medical",
+    "prescription":         "medical",
+    "legal document":       "legal",
+    "court filing":         "legal",
+    "article":              "general",
+    "email":                "general",
+    "letter":               "general",
+    "general":              "general",
+}
+
+CONFIDENCE_THRESHOLD = 0.75  # below this → requires_human_review = True
+
+DOCUMENT_CLASSIFIER_PROMPT = """You are a document classification expert.
+
+Analyse the document text below and return ONLY a valid JSON object with:
+- "doc_type": one of: invoice, receipt, resume, cv, contract, agreement, nda, report,
+  research paper, financial statement, balance sheet, income statement, medical record,
+  prescription, legal document, court filing, article, email, letter, general
+- "confidence": float 0.0–1.0 (how confident you are)
+- "reasoning": one sentence explaining your classification
+- "key_signals": list of 2–4 short phrases from the document that led to this classification
+
+Return ONLY valid JSON — no explanation, no markdown fences.
+
+Document (first ~2000 characters):
+{context}
+
+JSON:"""
+
+
+def classify_document(document_id: str) -> dict:
+    """
+    Classify a document into a known type using LLM + confidence scoring.
+
+    Returns a dict with:
+        doc_type, schema_template, confidence,
+        reasoning, key_signals, requires_human_review
+    """
+    all_chunks = get_all_chunks()
+    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+
+    if not doc_chunks:
+        return {
+            "doc_type": "general",
+            "schema_template": "general",
+            "confidence": 0.0,
+            "reasoning": "No document content found.",
+            "key_signals": [],
+            "requires_human_review": True,
+        }
+
+    # Use first ~2000 chars of content for classification — enough signal, cheap to run
+    context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
+
+    try:
+        result = call_llm(
+            DOCUMENT_CLASSIFIER_PROMPT.format(context=context),
+            temperature=0.0,
+            json_mode=True,
+            call_type="classify_document",
+        )
+    except Exception as exc:
+        print(f"[classify_document] LLM call failed: {exc}")
+        return {
+            "doc_type": "general",
+            "schema_template": "general",
+            "confidence": 0.0,
+            "reasoning": f"Classification error: {exc}",
+            "key_signals": [],
+            "requires_human_review": True,
+        }
+
+    if not isinstance(result, dict) or "doc_type" not in result:
+        return {
+            "doc_type": "general",
+            "schema_template": "general",
+            "confidence": 0.0,
+            "reasoning": "LLM returned unexpected format.",
+            "key_signals": [],
+            "requires_human_review": True,
+        }
+
+    doc_type = result.get("doc_type", "general").lower().strip()
+    confidence = float(result.get("confidence", 0.0))
+    schema_template = TEMPLATE_MAP.get(doc_type, "general")
+
+    return {
+        "doc_type": doc_type,
+        "schema_template": schema_template,
+        "confidence": confidence,
+        "reasoning": result.get("reasoning", ""),
+        "key_signals": result.get("key_signals", []),
+        "requires_human_review": confidence < CONFIDENCE_THRESHOLD,
+    }

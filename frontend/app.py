@@ -62,6 +62,61 @@ st.markdown("""
         margin-bottom: 4px;
     }
 
+    /* Doc type badges */
+    .doc-badge {
+        display: inline-block;
+        font-size: 10px;
+        font-weight: 600;
+        padding: 1px 6px;
+        border-radius: 10px;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        margin-left: 4px;
+    }
+    .badge-invoice    { background: #fef3c7; color: #92400e; }
+    .badge-resume     { background: #dbeafe; color: #1e40af; }
+    .badge-cv_resume  { background: #dbeafe; color: #1e40af; }
+    .badge-contract   { background: #ede9fe; color: #5b21b6; }
+    .badge-report     { background: #d1fae5; color: #065f46; }
+    .badge-financial  { background: #fce7f3; color: #9d174d; }
+    .badge-medical    { background: #fee2e2; color: #991b1b; }
+    .badge-legal      { background: #fef9c3; color: #713f12; }
+    .badge-general    { background: #f3f4f6; color: #6b7280; }
+    .badge-unknown    { background: #f3f4f6; color: #6b7280; }
+
+    /* Review flag badge */
+    .badge-review {
+        display: inline-block;
+        font-size: 10px;
+        font-weight: 600;
+        padding: 1px 6px;
+        border-radius: 10px;
+        background: #fff3cd;
+        color: #856404;
+        border: 1px solid #ffc107;
+    }
+
+    /* Classification correction widget */
+    .correction-box {
+        background: #fffbeb;
+        border: 1px solid #fcd34d;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin: 8px 0;
+        font-size: 12px;
+    }
+    .correction-box .title {
+        font-weight: 600;
+        color: #92400e;
+        margin-bottom: 4px;
+        font-size: 12px;
+    }
+    .correction-box .subtitle {
+        color: #78350f;
+        margin-bottom: 8px;
+        font-size: 11px;
+    }
+
     /* Empty state */
     .empty-state {
         text-align: center;
@@ -153,6 +208,47 @@ if "doc_summary" not in st.session_state:
     st.session_state.doc_summary = None
 if "api_error" not in st.session_state:
     st.session_state.api_error = None
+# Classification state
+if "doc_classification" not in st.session_state:
+    st.session_state.doc_classification = None
+# NL extraction state — persists preview schema for edit-then-extract flow
+if "nl_generated_schema" not in st.session_state:
+    st.session_state.nl_generated_schema = {}
+if "nl_instruction" not in st.session_state:
+    st.session_state.nl_instruction = ""
+
+
+# --- Helpers ---
+
+# Maps doc_type values to (emoji, css_class) for badges
+DOC_TYPE_DISPLAY = {
+    "invoice":          ("🧾", "badge-invoice"),
+    "receipt":          ("🧾", "badge-invoice"),
+    "resume":           ("👤", "badge-resume"),
+    "cv":               ("👤", "badge-cv_resume"),
+    "cv_resume":        ("👤", "badge-cv_resume"),
+    "contract":         ("📑", "badge-contract"),
+    "agreement":        ("📑", "badge-contract"),
+    "nda":              ("📑", "badge-contract"),
+    "report":           ("📊", "badge-report"),
+    "research paper":   ("📊", "badge-report"),
+    "financial statement": ("💰", "badge-financial"),
+    "balance sheet":    ("💰", "badge-financial"),
+    "income statement": ("💰", "badge-financial"),
+    "medical record":   ("🏥", "badge-medical"),
+    "prescription":     ("🏥", "badge-medical"),
+    "legal document":   ("⚖️",  "badge-legal"),
+    "court filing":     ("⚖️",  "badge-legal"),
+    "general":          ("📄", "badge-general"),
+}
+
+def doc_type_badge_html(doc_type: str | None) -> str:
+    """Return an HTML badge span for a given doc_type."""
+    if not doc_type or doc_type == "general":
+        return ""
+    _, css = DOC_TYPE_DISPLAY.get(doc_type, ("📄", "badge-unknown"))
+    label = doc_type.replace("_", " ").title()
+    return f'<span class="doc-badge {css}">{label}</span>'
 
 
 def load_document(doc_id: str, doc_name: str):
@@ -162,7 +258,9 @@ def load_document(doc_id: str, doc_name: str):
     st.session_state.api_error = None
     st.session_state["tables"] = []
     st.session_state.doc_summary = None
+    st.session_state.doc_classification = None
     st.session_state["nl_instruction"] = ""
+    st.session_state["nl_generated_schema"] = {}
     st.session_state["injected_schema"] = ""
 
     try:
@@ -179,23 +277,31 @@ def load_document(doc_id: str, doc_name: str):
     except Exception:
         pass
 
-COMPRESSION_THRESHOLD = 10  # compress after 10 messages
+    # Fetch classification
+    try:
+        res = requests.get(f"{API_URL}/documents/{doc_id}/classification", timeout=5)
+        if res.status_code == 200:
+            st.session_state.doc_classification = res.json()
+    except Exception:
+        pass
+
+
+COMPRESSION_THRESHOLD = 10
 
 def maybe_compress_history():
-    """Compress history if it exceeds threshold"""
     if len(st.session_state.messages) >= COMPRESSION_THRESHOLD:
         try:
             res = requests.post(
                 f"{API_URL}/compress",
-                json={"messages": st.session_state.messages[:-4]},  # compress all but last 4
+                json={"messages": st.session_state.messages[:-4]},
                 timeout=20
             )
             if res.status_code == 200:
                 st.session_state.history_summary = res.json()["summary"]
-                # Keep only last 4 messages in memory
                 st.session_state.messages = st.session_state.messages[-4:]
         except Exception:
-            pass  # fail silently, full history still works
+            pass
+
 
 @st.cache_data(ttl=10)
 def check_api():
@@ -268,8 +374,8 @@ with st.sidebar:
                     )
                     if response.status_code == 200:
                         data = response.json()
-                        if "error" in data:
-                            st.error(f"⚠️ {data['error']}")
+                        if data.get("error"):
+                            st.error(f"⚠️ {data['message'] if data.get('message') else data.get('error')}")
                         else:
                             vision_note = " · 🖼️ vision descriptions generated" if data.get("vision_used") else ""
                             st.success(
@@ -301,8 +407,8 @@ with st.sidebar:
                     )
                     if response.status_code == 200:
                         data = response.json()
-                        if "error" in data:
-                            st.error(f"⚠️ {data['error']}")
+                        if data.get("error"):
+                            st.error(f"⚠️ {data['message'] if data.get('message') else data.get('error')}")
                         else:
                             load_document(data["document_id"], data["file"])
                             st.success(f"✅ {data['chunks_stored']} chunks from URL")
@@ -315,7 +421,8 @@ with st.sidebar:
                     st.error(f"Error: {e}")
 
     st.divider()
-    # Documents list
+
+    # ── Documents list ──────────────────────────────────────────────────────
     col1, col2 = st.columns([3, 2])
     with col1:
         st.markdown("**Documents**")
@@ -330,6 +437,10 @@ with st.sidebar:
                 for doc in docs:
                     is_active = doc["id"] == st.session_state.document_id
                     is_selected = doc["id"] in st.session_state.selected_doc_ids
+                    doc_type = doc.get("doc_type") or "general"
+                    requires_review = doc.get("requires_review", False)
+                    badge_html = doc_type_badge_html(doc_type)
+
                     cols = st.columns([5, 1])
                     with cols[0]:
                         if st.session_state.multi_mode:
@@ -343,14 +454,24 @@ with st.sidebar:
                             elif not checked and doc["id"] in st.session_state.selected_doc_ids:
                                 st.session_state.selected_doc_ids.remove(doc["id"])
                         else:
-                            short = doc.get("summary_short", "")
                             label = f"{'🟢 ' if is_active else '📄 '}{doc['name']}"
                             if st.button(label, key=f"load_{doc['id']}", use_container_width=True):
                                 load_document(doc["id"], doc["name"])
                                 st.session_state.selected_doc_ids = [doc["id"]]
                                 st.rerun()
+
+                            # Doc type badge + review flag
+                            badge_parts = []
+                            if badge_html:
+                                badge_parts.append(badge_html)
+                            if requires_review:
+                                badge_parts.append('<span class="badge-review">⚠️ review</span>')
+                            if badge_parts:
+                                st.markdown(" ".join(badge_parts), unsafe_allow_html=True)
+
                             if doc.get("summary_short"):
                                 st.caption(doc["summary_short"])
+
                     with cols[1]:
                         if st.button("🗑️", key=f"del_{doc['id']}", help="Delete document"):
                             with st.spinner("Deleting..."):
@@ -359,6 +480,7 @@ with st.sidebar:
                                 st.session_state.document_id = None
                                 st.session_state.file_name = None
                                 st.session_state.messages = []
+                                st.session_state.doc_classification = None
                             if doc["id"] in st.session_state.selected_doc_ids:
                                 st.session_state.selected_doc_ids.remove(doc["id"])
                             st.rerun()
@@ -373,6 +495,65 @@ with st.sidebar:
                 """, unsafe_allow_html=True)
     except Exception:
         st.warning("⚠️ Could not load documents. Is the API running?")
+
+    # ── Classification correction widget ───────────────────────────────────
+    # Shown only when the active document has a low-confidence classification
+    clf = st.session_state.doc_classification
+    if (
+        clf
+        and st.session_state.document_id
+        and (clf.get("requires_review") or clf.get("classification_confidence", 1.0) < 0.75)
+        and not clf.get("manually_overridden")
+    ):
+        st.divider()
+        confidence_pct = int((clf.get("classification_confidence") or 0) * 100)
+        current_type = clf.get("doc_type", "general")
+
+        st.markdown(f"""
+        <div class="correction-box">
+            <div class="title">⚠️ Low-confidence classification</div>
+            <div class="subtitle">
+                Detected as <strong>{current_type.replace("_"," ").title()}</strong>
+                ({confidence_pct}% confidence) — please confirm or correct.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # All known doc types the user can pick from
+        ALL_DOC_TYPES = [
+            "invoice", "receipt", "resume", "cv_resume", "contract",
+            "agreement", "nda", "report", "research paper",
+            "financial statement", "medical record", "prescription",
+            "legal document", "court filing", "article", "email",
+            "letter", "general",
+        ]
+        default_idx = ALL_DOC_TYPES.index(current_type) if current_type in ALL_DOC_TYPES else len(ALL_DOC_TYPES) - 1
+
+        corrected_type = st.selectbox(
+            "Correct document type",
+            options=ALL_DOC_TYPES,
+            index=default_idx,
+            format_func=lambda x: x.replace("_", " ").title(),
+            key="correction_select",
+            label_visibility="collapsed"
+        )
+        if st.button("✅ Confirm classification", use_container_width=True, key="confirm_classification"):
+            try:
+                res = requests.post(
+                    f"{API_URL}/documents/{st.session_state.document_id}/classification",
+                    json={"doc_type": corrected_type},
+                    timeout=10
+                )
+                if res.status_code == 200:
+                    # Refresh local classification state
+                    st.session_state.doc_classification = res.json().get("classification", clf)
+                    st.session_state.doc_classification["manually_overridden"] = True
+                    st.success(f"✅ Saved as {corrected_type.replace('_',' ').title()}")
+                    st.rerun()
+                else:
+                    st.error("Could not save correction.")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
     # Usage stats
     try:
@@ -406,10 +587,17 @@ if is_multi:
     </div>
     """, unsafe_allow_html=True)
 elif st.session_state.file_name:
+    clf = st.session_state.doc_classification
+    type_badge = ""
+    if clf and clf.get("doc_type") and clf["doc_type"] != "general":
+        emoji, _ = DOC_TYPE_DISPLAY.get(clf["doc_type"], ("📄", ""))
+        confidence_pct = int((clf.get("classification_confidence") or 0) * 100)
+        type_badge = f'<div class="badge">{emoji} {clf["doc_type"].replace("_"," ").title()} · {confidence_pct}%</div>'
     st.markdown(f"""
     <div class="page-title">
         <div class="icon">📄</div>
         <div class="name">{st.session_state.file_name}</div>
+        {type_badge}
     </div>
     """, unsafe_allow_html=True)
 else:
@@ -455,6 +643,8 @@ if st.session_state.doc_summary:
             st.caption(summary.get("summary_short", "No summary available."))
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["💬 Chat", "🗂️ Extract", "🤖 Smart Extract", "📊 Charts", "⚙️ Settings"])
+
+# ── Tab 1: Chat ───────────────────────────────────────────────────────────────
 with tab1:
 
     col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
@@ -511,7 +701,6 @@ with tab1:
             st.session_state.messages = []
             st.session_state.history_summary = ""
             st.rerun()
-
 
     if not st.session_state.messages:
         st.markdown("""
@@ -632,7 +821,6 @@ with tab1:
                 pass
 
             if full_response:
-                # Save assistant message
                 requests.post(
                     f"{API_URL}/chats/{save_doc_id}",
                     json={"role": "assistant", "content": full_response, "sources": sources}
@@ -642,33 +830,55 @@ with tab1:
                     "content": full_response,
                     "sources": sources
                 })
-
-                # Compress if history is getting long
                 maybe_compress_history()
 
-# --- Tab 2: Extract ---
+# ── Tab 2: Extract ────────────────────────────────────────────────────────────
 with tab2:
     st.markdown("**Extract structured fields from this document.**")
 
-    # Template picker
+    # Load templates
+    try:
+        templates_res = requests.get(f"{API_URL}/templates", timeout=5)
+        templates = templates_res.json() if templates_res.status_code == 200 else []
+    except Exception:
+        templates = []
+
+    # ── Auto-template selection based on classification ─────────────────────
+    clf = st.session_state.doc_classification
+    auto_template_id = None
+    if clf and clf.get("doc_type") and clf["doc_type"] != "general":
+        # classification_data may carry schema_template; fall back to doc_type
+        clf_data = clf.get("classification_data") or {}
+        auto_template_id = clf_data.get("schema_template") or clf.get("doc_type")
+
+    template_options = {"custom": "✏️ Custom schema"}
+    template_options.update({t["id"]: t["label"] for t in templates})
+
+    # Determine default index: auto-select if classification matches a template
+    template_keys = list(template_options.keys())
+    default_template = "custom"
+    if auto_template_id and auto_template_id in template_keys:
+        default_template = auto_template_id
+
     col1, col2 = st.columns([3, 2])
     with col1:
         st.markdown("**Choose a template or define custom fields**")
+        # Show auto-select notice if we pre-selected something
+        if default_template != "custom" and clf:
+            confidence_pct = int((clf.get("classification_confidence") or 0) * 100)
+            st.caption(
+                f"🤖 Auto-selected **{template_options[default_template]}** "
+                f"based on document classification ({confidence_pct}% confidence). "
+                f"Change below if needed."
+            )
     with col2:
-        try:
-            templates_res = requests.get(f"{API_URL}/templates", timeout=5)
-            templates = templates_res.json() if templates_res.status_code == 200 else []
-        except Exception:
-            templates = []
-
-        template_options = {"custom": "✏️ Custom schema"} 
-        template_options.update({t["id"]: t["label"] for t in templates})
-
         selected_template = st.selectbox(
             "Template",
-            options=list(template_options.keys()),
+            options=template_keys,
+            index=template_keys.index(default_template),
             format_func=lambda x: template_options[x],
-            label_visibility="collapsed"
+            label_visibility="collapsed",
+            key="extract_template_select"
         )
 
     # Load template schema
@@ -701,7 +911,78 @@ with tab2:
     with col1:
         extract_btn = st.button("🗂️ Extract Fields", type="primary", use_container_width=True)
 
-# --- Tab 3: Smart Extract (NL) ---
+    if extract_btn:
+        try:
+            fields = json.loads(schema_input)
+        except json.JSONDecodeError:
+            st.error("⚠️ Invalid JSON in schema editor. Fix the JSON and try again.")
+            fields = None
+
+        if fields:
+            with st.spinner("Extracting fields..."):
+                try:
+                    res = requests.post(
+                        f"{API_URL}/extract",
+                        json={"document_id": st.session_state.document_id, "fields": fields},
+                        timeout=45
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("error"):
+                            st.error(f"⚠️ {data.get('message', data.get('error'))}")
+                        else:
+                            validation = data.get("validation")
+                            extracted = data.get("extracted", {})
+
+                            if validation:
+                                overall = validation["overall_confidence"]
+                                found = validation["found_count"]
+                                total = validation["total_count"]
+                                if overall >= 0.85:
+                                    st.success(f"✅ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+                                elif overall >= 0.5:
+                                    st.warning(f"⚠️ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+                                else:
+                                    st.error(f"❌ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+
+                                st.divider()
+                                st.markdown("**Extracted Fields**")
+                                for field_name, field_data in validation["fields"].items():
+                                    status = field_data["status"]
+                                    confidence = field_data["confidence"]
+                                    value = field_data["value"]
+                                    note = field_data.get("validation_note", "")
+                                    icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
+                                    c1, c2, c3 = st.columns([2, 3, 1])
+                                    with c1:
+                                        st.markdown(f"{icon} **{field_name}**")
+                                        if note:
+                                            st.caption(f"⚠️ {note}")
+                                    with c2:
+                                        if isinstance(value, list):
+                                            st.caption(", ".join(str(v) for v in value) if value else "—")
+                                        else:
+                                            st.caption(str(value) if value else "—")
+                                    with c3:
+                                        st.caption(f"{int(confidence*100)}%")
+
+                            st.divider()
+                            with st.expander("📄 Raw JSON"):
+                                st.json(extracted)
+                            st.download_button(
+                                label="⬇️ Download JSON",
+                                data=json.dumps(extracted, indent=2),
+                                file_name="extracted_fields.json",
+                                mime="application/json"
+                            )
+                    else:
+                        st.error(f"Extraction failed (HTTP {res.status_code})")
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ Timed out. The document may be too large.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+# ── Tab 3: Smart Extract ──────────────────────────────────────────────────────
 with tab3:
     st.markdown("**Describe what you want to extract in plain English.**")
     st.caption("No need to define a schema — just tell DocIntel what you need.")
@@ -715,12 +996,12 @@ with tab3:
         "Pull out the applicant's income, loan amount requested, and employment details",
         "Get company name, GSTIN, total tax liability, and filing period"
     ]
-
     cols = st.columns(2)
     for i, example in enumerate(examples):
         with cols[i % 2]:
             if st.button(f"💡 {example[:50]}...", key=f"ex_{i}", use_container_width=True):
                 st.session_state["nl_instruction"] = example
+                st.session_state["nl_generated_schema"] = {}  # reset schema on new example
 
     st.divider()
 
@@ -732,13 +1013,18 @@ with tab3:
         key="nl_input"
     )
 
+    # Keep instruction in session state as user types
+    if instruction != st.session_state.get("nl_instruction", ""):
+        st.session_state["nl_instruction"] = instruction
+        st.session_state["nl_generated_schema"] = {}  # reset schema when instruction changes
+
     col1, col2, col3 = st.columns([2, 2, 3])
     with col1:
         preview_btn = st.button("👁️ Preview Schema", use_container_width=True)
     with col2:
         extract_nl_btn = st.button("🤖 Extract", type="primary", use_container_width=True)
 
-    # Preview schema
+    # ── Step 1: Preview / generate schema ───────────────────────────────────
     if preview_btn and instruction:
         with st.spinner("Generating schema from instruction..."):
             try:
@@ -753,15 +1039,73 @@ with tab3:
                 )
                 if res.status_code == 200:
                     schema = res.json().get("schema", {})
-                    st.markdown("**Generated Schema:**")
-                    st.caption("This is what DocIntel will extract based on your instruction. You can copy this to the Extract tab to customize further.")
-                    st.json(schema)
+                    st.session_state["nl_generated_schema"] = schema
+                    st.session_state["nl_instruction"] = instruction
                 else:
                     st.error("Failed to generate schema.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
-    # Run extraction
+    # ── Step 2: Schema editor (shown after preview or if schema already exists) ─
+    if st.session_state.get("nl_generated_schema"):
+        st.markdown("**Generated Schema — edit if needed before extracting:**")
+        st.caption("You can add, remove, or rename fields. Changes here will be used when you click Extract.")
+
+        edited_schema_str = st.text_area(
+            "Schema editor",
+            value=json.dumps(st.session_state["nl_generated_schema"], indent=2),
+            height=180,
+            key="nl_schema_editor",
+            label_visibility="collapsed"
+        )
+
+        # Parse and validate edits live
+        schema_valid = True
+        try:
+            edited_schema = json.loads(edited_schema_str)
+        except json.JSONDecodeError:
+            st.warning("⚠️ Invalid JSON — fix the schema before extracting.")
+            schema_valid = False
+            edited_schema = st.session_state["nl_generated_schema"]
+
+        # Action row: extract with edited schema OR copy to Extract tab
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            run_from_preview = st.button(
+                "🤖 Extract with this schema",
+                type="primary",
+                use_container_width=True,
+                disabled=not schema_valid,
+                key="nl_extract_from_preview"
+            )
+        with action_col2:
+            if st.button("📋 Copy to Extract tab", use_container_width=True, key="nl_copy_to_extract"):
+                st.session_state["injected_schema"] = json.dumps(edited_schema, indent=2)
+                st.success("✅ Schema copied — switch to the Extract tab.")
+
+        if run_from_preview and schema_valid:
+            with st.spinner("Extracting with your schema..."):
+                try:
+                    res = requests.post(
+                        f"{API_URL}/extract",
+                        json={
+                            "document_id": st.session_state.document_id,
+                            "fields": edited_schema
+                        },
+                        timeout=45
+                    )
+                    if res.status_code == 200:
+                        _render_extraction_result(res.json(), instruction)
+                    else:
+                        st.error(f"Extraction failed (HTTP {res.status_code})")
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ Timed out.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        st.divider()
+
+    # ── Step 3: One-shot extract (no preview) ───────────────────────────────
     if extract_nl_btn and instruction:
         with st.spinner("Understanding instruction and extracting..."):
             try:
@@ -776,85 +1120,18 @@ with tab3:
                 )
                 if res.status_code == 200:
                     data = res.json()
-
-                    if "error" in data:
+                    if data.get("error"):
                         st.error(f"⚠️ {data['error']}")
                     else:
-                        # Show generated schema
+                        # Store the generated schema for editing
+                        if data.get("schema"):
+                            st.session_state["nl_generated_schema"] = data["schema"]
+
                         with st.expander("🔍 Generated Schema", expanded=False):
                             st.json(data.get("schema", {}))
 
                         st.divider()
-
-                        # Validation summary
-                        validation = data.get("validation")
-                        extracted = data.get("extracted", {})
-
-                        if validation:
-                            overall = validation["overall_confidence"]
-                            found = validation["found_count"]
-                            total = validation["total_count"]
-
-                            if overall >= 0.85:
-                                st.success(f"✅ {found}/{total} fields extracted · {int(overall*100)}% confidence")
-                            elif overall >= 0.5:
-                                st.warning(f"⚠️ {found}/{total} fields extracted · {int(overall*100)}% confidence")
-                            else:
-                                st.error(f"❌ {found}/{total} fields extracted · {int(overall*100)}% confidence")
-
-                            st.divider()
-                            st.markdown("**Extracted Fields**")
-
-                            for field_name, field_data in validation["fields"].items():
-                                status = field_data["status"]
-                                confidence = field_data["confidence"]
-                                value = field_data["value"]
-                                note = field_data.get("validation_note", "")
-
-                                icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
-
-                                col1, col2, col3 = st.columns([2, 3, 1])
-                                with col1:
-                                    st.markdown(f"{icon} **{field_name}**")
-                                    if note:
-                                        st.caption(f"⚠️ {note}")
-                                with col2:
-                                    if isinstance(value, list):
-                                        st.caption(", ".join(str(v) for v in value) if value else "—")
-                                    else:
-                                        st.caption(str(value) if value else "—")
-                                with col3:
-                                    st.caption(f"{int(confidence*100)}%")
-
-                        st.divider()
-
-                        # Raw JSON + copy to Extract tab
-                        with st.expander("📄 Raw JSON"):
-                            st.json(extracted)
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            download_data = json.dumps({
-                                "instruction": instruction,
-                                "extracted": extracted,
-                                "validation": {
-                                    "overall_confidence": validation["overall_confidence"],
-                                    "found_count": validation["found_count"],
-                                    "total_count": validation["total_count"]
-                                } if validation else {}
-                            }, indent=2)
-                            st.download_button(
-                                label="⬇️ Download JSON",
-                                data=download_data,
-                                file_name="nl_extracted.json",
-                                mime="application/json"
-                            )
-                        with col2:
-                            # Copy schema to Extract tab
-                            if st.button("📋 Copy schema to Extract tab"):
-                                st.session_state["injected_schema"] = json.dumps(data.get("schema", {}), indent=2)
-                                st.success("Schema copied! Switch to Extract tab.")
-
+                        _render_extraction_result(data, instruction)
                 else:
                     st.error(f"Extraction failed (HTTP {res.status_code})")
             except requests.exceptions.Timeout:
@@ -864,8 +1141,9 @@ with tab3:
 
     elif extract_nl_btn and not instruction:
         st.warning("Please enter an instruction first.")
-        
-# --- Tab 4: Charts ---
+
+
+# ── Tab 4: Charts ─────────────────────────────────────────────────────────────
 with tab4:
     st.markdown("**Tables & Charts extracted from your document**")
     st.caption("DocIntel automatically detects tables and visualizes them.")
@@ -910,7 +1188,6 @@ with tab4:
                 st.caption("Could not parse this table.")
                 continue
 
-            # Show raw table
             try:
                 df = pd.DataFrame(rows, columns=headers)
                 st.dataframe(df, use_container_width=True)
@@ -918,7 +1195,6 @@ with tab4:
                 st.caption("Could not render table.")
                 continue
 
-            # Chart controls
             col1, col2, col3 = st.columns([2, 2, 2])
             with col1:
                 chart_choice = st.selectbox(
@@ -932,14 +1208,11 @@ with tab4:
                     str(r[headers.index(h)]).replace('.','').replace('-','').replace(',','').isdigit()
                     for r in rows if len(r) > headers.index(h)
                 )]
-                text_cols = [h for h in headers if h not in numeric_cols]
-
                 x_col = st.selectbox("X axis", headers, index=0, key=f"x_{i}")
             with col3:
                 y_options = numeric_cols if numeric_cols else headers
                 y_col = st.selectbox("Y axis", y_options, index=0, key=f"y_{i}")
 
-            # Render chart
             try:
                 df[y_col] = pd.to_numeric(df[y_col].astype(str).str.replace(',', ''), errors='coerce')
                 df = df.dropna(subset=[y_col])
@@ -959,7 +1232,6 @@ with tab4:
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Download button for the data
                 csv_data = df.to_csv(index=False)
                 st.download_button(
                     label="⬇️ Download CSV",
@@ -971,7 +1243,7 @@ with tab4:
             except Exception as e:
                 st.caption(f"Could not render chart: {e}")
 
-# --- Tab 5: Settings ---
+# ── Tab 5: Settings ───────────────────────────────────────────────────────────
 with tab5:
     st.markdown("## ⚙️ Settings")
 
@@ -1003,7 +1275,6 @@ with tab5:
         else:
             st.warning("Enter a key name first.")
 
-    # List existing keys
     try:
         keys_res = requests.get(f"{API_URL}/api-keys", timeout=5)
         if keys_res.status_code == 200:
@@ -1068,7 +1339,6 @@ with tab5:
         else:
             st.warning("Enter webhook name and URL.")
 
-    # List existing webhooks
     try:
         wh_res = requests.get(f"{API_URL}/webhooks", timeout=5)
         if wh_res.status_code == 200:
@@ -1099,7 +1369,6 @@ with tab5:
                             requests.delete(f"{API_URL}/webhooks/{wh['id']}", timeout=5)
                             st.rerun()
 
-            # Webhook logs
             st.divider()
             st.markdown("**Recent Webhook Logs**")
             try:
@@ -1139,8 +1408,12 @@ with tab5:
 | POST | `/query` | Query a document |
 | POST | `/extract` | Extract structured fields |
 | POST | `/extract/nl` | Natural language extraction |
+| POST | `/extract/batch` | Batch extraction across documents |
 | GET | `/documents` | List all documents |
+| GET | `/documents/{{id}}/classification` | Get document classification |
+| POST | `/documents/{{id}}/classification` | Override classification |
 | GET | `/summary/{{id}}` | Get document summary |
+| GET | `/health` | System health check |
 | POST | `/compress` | Compress chat history |
 | GET | `/usage` | Get usage stats |
 
@@ -1152,3 +1425,77 @@ curl -X POST {API_URL}/extract/nl \\
   -d '{{"document_id": "abc-123", "instruction": "extract name, email and skills"}}'
 ```
         """)
+
+
+# ── Shared extraction result renderer ────────────────────────────────────────
+# Defined after all tabs so it can be referenced above via forward reference.
+# In Python this works fine since the function is called at runtime, not parse time.
+
+def _render_extraction_result(data: dict, instruction: str = ""):
+    """Render a validated extraction result (used in both NL flows)."""
+    validation = data.get("validation")
+    extracted = data.get("extracted", {})
+
+    if validation:
+        overall = validation["overall_confidence"]
+        found = validation["found_count"]
+        total = validation["total_count"]
+
+        if overall >= 0.85:
+            st.success(f"✅ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+        elif overall >= 0.5:
+            st.warning(f"⚠️ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+        else:
+            st.error(f"❌ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+
+        st.divider()
+        st.markdown("**Extracted Fields**")
+
+        for field_name, field_data in validation["fields"].items():
+            status = field_data["status"]
+            confidence = field_data["confidence"]
+            value = field_data["value"]
+            note = field_data.get("validation_note", "")
+            icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
+
+            c1, c2, c3 = st.columns([2, 3, 1])
+            with c1:
+                st.markdown(f"{icon} **{field_name}**")
+                if note:
+                    st.caption(f"⚠️ {note}")
+            with c2:
+                if isinstance(value, list):
+                    st.caption(", ".join(str(v) for v in value) if value else "—")
+                else:
+                    st.caption(str(value) if value else "—")
+            with c3:
+                st.caption(f"{int(confidence*100)}%")
+
+    st.divider()
+
+    with st.expander("📄 Raw JSON"):
+        st.json(extracted)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        download_data = json.dumps({
+            "instruction": instruction,
+            "extracted": extracted,
+            "validation": {
+                "overall_confidence": validation["overall_confidence"],
+                "found_count": validation["found_count"],
+                "total_count": validation["total_count"]
+            } if validation else {}
+        }, indent=2)
+        st.download_button(
+            label="⬇️ Download JSON",
+            data=download_data,
+            file_name="nl_extracted.json",
+            mime="application/json",
+            key=f"dl_nl_{hash(instruction)}"
+        )
+    with col2:
+        if st.button("📋 Copy schema to Extract tab", key=f"copy_nl_{hash(instruction)}"):
+            if data.get("schema"):
+                st.session_state["injected_schema"] = json.dumps(data["schema"], indent=2)
+                st.success("Schema copied! Switch to Extract tab.")
