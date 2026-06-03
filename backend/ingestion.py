@@ -1,12 +1,17 @@
+# backend/ingestion.py
+
 import os
 import threading
+
 from dotenv import load_dotenv
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core import Document as LlamaIndexDocument
+
 from db import insert_document, insert_chunks
 from core.config import config
 from core.logger import get_logger
 from core.errors import ParseError, UnsupportedFileTypeError
+from core.document import ImageElement
 from parsers.router import AutoRouter
 
 load_dotenv()
@@ -20,6 +25,9 @@ SUPPORTED_EXTENSIONS = [
     ".pdf", ".docx", ".txt", ".csv", ".xlsx",
     ".rtf", ".md", ".png", ".jpg", ".jpeg", ".webp", ".tiff"
 ]
+
+# Image file extensions — these trigger whole-file vision (not page rendering)
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tiff"}
 
 
 def get_embed_model():
@@ -45,9 +53,143 @@ splitter = SentenceSplitter(
 _router = AutoRouter(config)
 
 
-# --- Main file ingestion ---
+# ---------------------------------------------------------------------------
+# Embedding helper — cache-aware
+# ---------------------------------------------------------------------------
 
-def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "general") -> dict:
+def _get_embedding(text: str, model) -> list[float]:
+    """
+    Return embedding for text, checking cache first.
+    Falls back to direct model call if cache is unavailable.
+    """
+    try:
+        from core.cache import get_embedding, set_embedding
+        cached = get_embedding(text)
+        if cached is not None:
+            return cached
+        embedding = model.get_text_embedding(text)
+        set_embedding(text, embedding)
+        return embedding
+    except ImportError:
+        # cache.py not yet available — degrade gracefully
+        return model.get_text_embedding(text)
+    except Exception as e:
+        logger.warning("Cache lookup failed — calling model directly", error=str(e))
+        return model.get_text_embedding(text)
+
+
+# ---------------------------------------------------------------------------
+# Vision helper — called per page during ingestion
+# ---------------------------------------------------------------------------
+
+def _run_vision_for_page(
+    file_path: str,
+    page,
+    doc_type: str,
+    is_scanned: bool,
+) -> list[ImageElement]:
+    """
+    Run the vision engine for a single page and return a list of ImageElements
+    with descriptions populated.
+
+    Two cases:
+      A) Page already has ImageElements (from parser) — describe each one.
+      B) Page has no images but vision should still run (scanned PDF / low text) —
+         synthesize one ImageElement by rendering the whole page.
+
+    Returns the same list that was on page.images if no vision ran.
+    Never raises.
+    """
+    try:
+        from vision.triggers import should_use_vision
+        from vision.engine import describe_image, describe_pdf_page
+
+        if not should_use_vision(file_path, page.text, is_scanned, doc_type, config):
+            return page.images  # vision not needed — return existing (empty) list
+
+        ext = os.path.splitext(file_path)[1].lower()
+        is_image_file = ext in _IMAGE_EXTENSIONS
+        updated_images: list[ImageElement] = []
+
+        if page.images:
+            # Case A — parser found embedded images; describe each
+            for img in page.images:
+                if img.description:
+                    # Already has a description (shouldn't happen in Phase 2, but safe)
+                    updated_images.append(img)
+                    continue
+
+                if is_image_file:
+                    description = describe_image(file_path, doc_type)
+                else:
+                    description = describe_pdf_page(
+                        file_path, page.page_num - 1, doc_type
+                    )
+
+                updated_images.append(ImageElement(
+                    page_num=img.page_num,
+                    image_ref=img.image_ref or f"page_{page.page_num}",
+                    ocr_text=img.ocr_text,
+                    description=description,
+                    chunk_type="description" if description else img.chunk_type,
+                    vision_prompt_used=doc_type,
+                ))
+
+        else:
+            # Case B — no embedded images, but vision triggered (scanned / low word count)
+            # Synthesize one ImageElement by rendering the whole page
+            if is_image_file:
+                description = describe_image(file_path, doc_type)
+            else:
+                description = describe_pdf_page(
+                    file_path, page.page_num - 1, doc_type
+                )
+
+            if description:
+                updated_images.append(ImageElement(
+                    page_num=page.page_num,
+                    image_ref=f"page_{page.page_num}",
+                    ocr_text="",
+                    description=description,
+                    chunk_type="description",
+                    vision_prompt_used=doc_type,
+                ))
+
+        return updated_images
+
+    except Exception as e:
+        logger.error(
+            "Vision page processing failed — skipping vision for this page",
+            page=page.page_num,
+            error=str(e)
+        )
+        return page.images  # safe fallback — never block ingestion
+
+
+# ---------------------------------------------------------------------------
+# Main file ingestion
+# ---------------------------------------------------------------------------
+
+def ingest_file(
+    file_path: str,
+    use_llamaparse: bool = True,
+    doc_type: str = "general",
+) -> dict:
+    """
+    Ingest a file into the vector store.
+
+    Args:
+        file_path:      Absolute path to the uploaded file.
+        use_llamaparse: Use LlamaParse for PDF parsing (falls back to pypdf).
+        doc_type:       Pre-classified document type — used to select the right
+                        vision prompt. Pass "general" if classification hasn't
+                        run yet. Dev 2 passes the classified type from the
+                        upload endpoint after quick keyword classification.
+
+    Returns:
+        Dict with document_id, chunk counts, parser used, vision_used flag.
+        Returns {"error": "..."} on failure.
+    """
     file_name = os.path.basename(file_path)
     ext = os.path.splitext(file_path)[1].lower()
     model = get_embed_model()
@@ -56,15 +198,18 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
         logger.error("Unsupported file type", file=file_name, ext=ext)
         return {"error": f"Unsupported file type: {ext}"}
 
-    # Parse file via AutoRouter — returns a structured Document
+    # --- Parse ---
     try:
-        logger.info("Routing file to parser", file=file_name)
+        logger.info("Routing file to parser", file=file_name, doc_type=doc_type)
         document = _router.parse(file_path)
-        logger.info("Parse complete",
-                    file=file_name,
-                    parser=document.parser_used,
-                    pages=document.page_count,
-                    tables=len(document.tables))
+        logger.info(
+            "Parse complete",
+            file=file_name,
+            parser=document.parser_used,
+            pages=document.page_count,
+            tables=len(document.tables),
+            is_scanned=document.is_scanned,
+        )
     except UnsupportedFileTypeError as e:
         logger.error("No parser available", file=file_name, error=str(e))
         return {"error": str(e), "code": e.code}
@@ -77,14 +222,21 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
         return {"error": f"Could not process file: {str(e)}"}
 
     if not document.full_text.strip():
-        return {"error": "Could not extract text. File may be empty or image-only."}
+        # Image-only files may have no text — still allow vision to proceed
+        ext_lower = os.path.splitext(file_path)[1].lower()
+        if ext_lower not in _IMAGE_EXTENSIONS:
+            return {"error": "Could not extract text. File may be empty or image-only."}
 
+    is_scanned = document.is_scanned
     doc_id = insert_document(file_name)
     chunk_rows = []
+    vision_used = False
 
     for page in document.pages:
 
+        # ----------------------------------------------------------------
         # 1. Text chunks
+        # ----------------------------------------------------------------
         llama_doc = LlamaIndexDocument(text=page.text)
         nodes = splitter.get_nodes_from_documents([llama_doc])
 
@@ -92,7 +244,7 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
             clean_text = node.text.replace("\x00", " ").strip()
             if not clean_text:
                 continue
-            embedding = model.get_text_embedding(clean_text)
+            embedding = _get_embedding(clean_text, model)
             chunk_rows.append({
                 "document_id": doc_id,
                 "content": clean_text,
@@ -105,13 +257,15 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
                 }
             })
 
-        # 2. Table chunks — stored separately for precise retrieval
+        # ----------------------------------------------------------------
+        # 2. Table chunks
+        # ----------------------------------------------------------------
         for table in page.tables:
             if not table.raw_text.strip():
                 continue
             table_text = f"[Table: {table.title or 'untitled'}]\n{table.raw_text}"
             clean_table = table_text.replace("\x00", " ").strip()
-            embedding = model.get_text_embedding(clean_table)
+            embedding = _get_embedding(clean_table, model)
             chunk_rows.append({
                 "document_id": doc_id,
                 "content": clean_table,
@@ -124,15 +278,24 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
                 }
             })
 
+        # ----------------------------------------------------------------
         # 3. Vision description chunks
-        for img in page.images:
+        #    Run vision live here — _run_vision_for_page() calls the
+        #    vision engine and returns ImageElements with descriptions.
+        # ----------------------------------------------------------------
+        images_with_descriptions = _run_vision_for_page(
+            file_path, page, doc_type, is_scanned
+        )
+
+        for img in images_with_descriptions:
             if not img.description:
                 continue
             clean_desc = img.description.replace("\x00", " ").strip()
             if not clean_desc:
                 continue
+
             content = f"[Visual Description — Page {page.page_num}]: {clean_desc}"
-            embedding = model.get_text_embedding(content)
+            embedding = _get_embedding(content, model)
             chunk_rows.append({
                 "document_id": doc_id,
                 "content": content,
@@ -140,11 +303,12 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
                 "metadata": {
                     "page": str(page.page_num),
                     "file": file_name,
-                    "chunk_type": "description",
+                    "chunk_type": "description",        # Contract 1 & 2
                     "image_ref": img.image_ref,
                     "vision_prompt_used": img.vision_prompt_used,
                 }
             })
+            vision_used = True
 
     if not chunk_rows:
         return {"error": "No content could be extracted for indexing."}
@@ -155,15 +319,18 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
     table_chunks = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "table")
     desc_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "description")
 
-    logger.info("Ingestion complete",
-                file=file_name,
-                doc_id=doc_id,
-                chunks=len(chunk_rows),
-                text_chunks=text_chunks,
-                table_chunks=table_chunks,
-                desc_chunks=desc_chunks,
-                parser=document.parser_used,
-                vision_used=document.vision_used)
+    logger.info(
+        "Ingestion complete",
+        file=file_name,
+        doc_id=doc_id,
+        chunks=len(chunk_rows),
+        text_chunks=text_chunks,
+        table_chunks=table_chunks,
+        desc_chunks=desc_chunks,
+        parser=document.parser_used,
+        vision_used=vision_used,
+        doc_type=doc_type,
+    )
 
     return {
         "document_id": doc_id,
@@ -175,11 +342,13 @@ def ingest_file(file_path: str, use_llamaparse: bool = True, doc_type: str = "ge
         "parser": document.parser_used,
         "page_count": document.page_count,
         "table_count": len(document.tables),
-        "vision_used": document.vision_used,
+        "vision_used": vision_used,
     }
 
 
-# --- URL ingestion ---
+# ---------------------------------------------------------------------------
+# URL ingestion — unchanged from Phase 1
+# ---------------------------------------------------------------------------
 
 def ingest_url(url: str) -> dict:
     model = get_embed_model()
@@ -209,7 +378,7 @@ def ingest_url(url: str) -> dict:
             clean = node.text.replace("\x00", " ").strip()
             if not clean:
                 continue
-            embedding = model.get_text_embedding(clean)
+            embedding = _get_embedding(clean, model)
             chunk_rows.append({
                 "document_id": doc_id,
                 "content": clean,
@@ -228,10 +397,12 @@ def ingest_url(url: str) -> dict:
 
     insert_chunks(chunk_rows)
 
-    logger.info("URL ingestion complete",
-                url=url,
-                doc_id=doc_id,
-                chunks=len(chunk_rows))
+    logger.info(
+        "URL ingestion complete",
+        url=url,
+        doc_id=doc_id,
+        chunks=len(chunk_rows),
+    )
 
     return {
         "document_id": doc_id,

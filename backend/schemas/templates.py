@@ -253,3 +253,133 @@ def get_template_for_doc_type(doc_type: str) -> str:
         get_template_for_doc_type("unknown")   → "custom"
     """
     return TEMPLATE_MAP.get(doc_type.lower().strip(), "custom")
+
+# ── VISION_PROMPTS — add to bottom of schemas/templates.py ───────────────────
+#
+# Classification-aware prompts for the vision engine.
+# Each prompt is tuned to extract the most useful information
+# for that document type from a rendered image or scanned page.
+#
+# get_vision_prompt() is the public API used by vision/engine.py.
+
+VISION_PROMPTS: dict[str, str] = {
+    "general": """Describe this image in detail. Include:
+- What type of document or scene this is
+- All visible text, numbers, and data
+- Layout and structure (headers, sections, columns)
+- Any important visual elements (logos, stamps, signatures, charts)
+- Language of the document if not English""",
+
+    "invoice": """Analyze this invoice or receipt image. Extract and describe:
+- Vendor name, logo, and contact details
+- Client or billed-to name and address
+- Invoice number and date
+- Due date and payment terms
+- All line items with descriptions, quantities, unit prices, and amounts
+- Subtotal, tax breakdown (CGST/SGST/IGST or GST/VAT), and total amount payable
+- Payment method or bank details if visible
+- Any stamps, signatures, or approval marks""",
+
+    "cv_resume": """Analyze this CV or resume image. Describe:
+- Candidate name, email, phone, and location
+- LinkedIn or portfolio URL if visible
+- Current or most recent job title and company
+- All work experience entries (company, title, dates, responsibilities)
+- Education qualifications (degree, institution, year, grade)
+- Skills, certifications, and tools listed
+- Languages spoken
+- Professional summary or objective if present
+- Overall document structure and layout""",
+
+    "contract": """Analyze this contract or agreement image. Extract:
+- Document title and agreement type (NDA, Service Agreement, MOU, etc.)
+- Names of all parties and their roles
+- Effective date and expiry or termination date
+- Key obligations listed for each party
+- Payment terms and amounts if present
+- Governing law and jurisdiction
+- Signature blocks — names, dates, and whether signed
+- Any highlighted, underlined, or initialled clauses""",
+
+    "gst_return": """Analyze this GST document image. Extract:
+- GSTIN number and business legal name
+- Trade name if different from legal name
+- Filing period (month and year)
+- Return type (GSTR-1, GSTR-3B, GSTR-9, etc.)
+- Taxable turnover figures
+- CGST, SGST, and IGST amounts separately
+- Total tax liability and tax paid (cash + ITC)
+- Late fee or interest if mentioned
+- Filing date and acknowledgement number if visible""",
+
+    "bank_statement": """Analyze this bank statement image. Describe:
+- Bank name and branch details
+- Account holder name and account number (masked if partial)
+- Statement period (from date to date)
+- Opening balance and closing balance
+- Total credits and total debits during the period
+- Currency
+- Any notable large transactions visible
+- Any alerts, notices, or flags on the statement""",
+
+    "construction_photo": """Analyze this construction site photograph. Describe:
+- Current construction stage (foundation, framing, roofing, finishing, etc.)
+- Structural elements visible (columns, beams, slabs, walls, roof)
+- Materials present (concrete, steel, brick, wood, etc.)
+- Equipment and machinery on site
+- Number of workers visible and their activities
+- Safety measures visible (helmets, scaffolding, barriers)
+- Estimated percentage of visible work completed
+- Any visible defects, damage, or areas of concern
+- Weather and lighting conditions""",
+
+    "id_document": """Analyze this identity document image. Extract:
+- Document type (Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, etc.)
+- Full name as printed on the document
+- Date of birth
+- Gender if printed
+- Document number (Aadhaar number, PAN number, passport number, etc.)
+- Issue date and expiry date if present
+- Issuing authority or country
+- Address if printed on the document
+- Any visible QR codes, barcodes, or machine-readable zones
+- Whether the document appears genuine or shows signs of tampering""",
+
+    "offer_letter": """Analyze this offer letter image. Extract:
+- Company name and letterhead details
+- Candidate name and address
+- Job title and department being offered
+- Reporting manager or team
+- Joining date
+- Base salary, CTC, and any variable pay components
+- Probation period
+- Work location (office/remote/hybrid)
+- Offer expiry date
+- Signatory name, designation, and date
+- Whether the letter has been countersigned by the candidate""",
+
+    "loan_application": """Analyze this loan application image. Extract:
+- Applicant full name, date of birth, and contact details
+- Loan type and purpose
+- Loan amount requested and tenure
+- Declared annual income and employment type
+- Employer name and designation
+- Existing loan obligations mentioned
+- Collateral details if offered
+- Co-applicant details if present
+- Application date and reference number
+- Bank or lender name
+- Signature and declaration section""",
+}
+
+
+def get_vision_prompt(doc_type: str = "general") -> str:
+    """
+    Return the vision prompt for a given doc_type.
+    Falls back to the 'general' prompt for unknown types.
+
+    Example:
+        get_vision_prompt("invoice")  → detailed invoice extraction prompt
+        get_vision_prompt("unknown")  → general description prompt
+    """
+    return VISION_PROMPTS.get(doc_type.lower().strip(), VISION_PROMPTS["general"])
