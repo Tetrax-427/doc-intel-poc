@@ -1,58 +1,63 @@
 import logging
-import json
+import sys
 from datetime import datetime, timezone
 
 
 class StructuredLogger:
     """
-    Every log entry is a JSON object with consistent fields.
-    Makes logs searchable and parseable by any log aggregator.
+    Thin wrapper around Python's stdlib logging that appends
+    key=value pairs to every log line for easy grep/parsing.
     """
 
     def __init__(self, name: str):
-        self.name = name
-        self.logger = logging.getLogger(name)
+        self._logger = logging.getLogger(name)
 
-        # Avoid adding duplicate handlers if logger already configured
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            self.logger.addHandler(handler)
-
-        self.logger.setLevel(logging.DEBUG)
-        # Prevent propagation to root logger to avoid duplicate output
-        self.logger.propagate = False
-
-    def _log(self, level: str, message: str, **kwargs):
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": level,
-            "logger": self.name,
-            "message": message,
-            **kwargs,
-        }
-        getattr(self.logger, level.lower())(json.dumps(entry))
+    def _format_kwargs(self, kwargs: dict) -> str:
+        if not kwargs:
+            return ""
+        return " | " + " ".join(f"{k}={v}" for k, v in kwargs.items())
 
     def info(self, message: str, **kwargs):
-        self._log("info", message, **kwargs)
+        self._logger.info(message + self._format_kwargs(kwargs))
 
     def warning(self, message: str, **kwargs):
-        self._log("warning", message, **kwargs)
+        self._logger.warning(message + self._format_kwargs(kwargs))
 
     def error(self, message: str, **kwargs):
-        self._log("error", message, **kwargs)
+        self._logger.error(message + self._format_kwargs(kwargs))
 
     def debug(self, message: str, **kwargs):
-        self._log("debug", message, **kwargs)
+        self._logger.debug(message + self._format_kwargs(kwargs))
+
+
+def _configure_root_logger():
+    """
+    Configure the root logger once at import time.
+    Uses a clean single-line format: timestamp | level | name | message
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return  # already configured (e.g. uvicorn already set up logging)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_configure_root_logger()
 
 
 def get_logger(name: str) -> StructuredLogger:
     """
-    Get a named structured logger. Use the module or component name.
+    Get a named StructuredLogger.
 
-    Usage:
-        logger = get_logger("ingestion")
-        logger.info("Parsing file", doc_id="abc", file="invoice.pdf", parser="llamaparse")
-        logger.error("Parse failed", doc_id="abc", error_code="PARSE_001", retryable=True)
+    Convention: use dotted module path as name.
+        get_logger("routers.documents")
+        get_logger("routers.query")
+        get_logger("retrieval.classify")
     """
     return StructuredLogger(name)

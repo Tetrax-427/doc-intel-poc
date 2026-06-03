@@ -1,200 +1,255 @@
-TEMPLATES = {
-    "cv_resume": {
-        "label": "📄 CV / Resume",
-        "description": "Extract candidate details from a resume or CV",
+"""
+schemas/templates.py
+Extraction template definitions + doc-type → template mapping.
+
+Public API (used by routers and retrieval):
+    list_templates()                    → list of {id, label, description, schema}
+    get_template(template_id)           → single template dict or None
+    get_template_for_doc_type(doc_type) → template ID string
+    TEMPLATE_MAP                        → raw dict for direct lookups
+"""
+
+# ── Template definitions ──────────────────────────────────────────────────────
+
+_TEMPLATES = [
+    {
+        "id": "invoice",
+        "label": "🧾 Invoice / Receipt",
+        "description": "Extract billing details, line items, totals, and payment terms.",
         "schema": {
-            "candidate_name": "full name of the candidate",
-            "email": "candidate's email address, not the company's",
-            "phone": "candidate's phone or mobile number",
-            "location": "candidate's city or location",
-            "current_role": "candidate's current or most recent job title",
-            "current_company": "candidate's current or most recent employer",
-            "total_experience": "total years of professional experience",
-            "education": "highest education qualification and institution",
-            "skills": "list of technical and professional skills",
-            "certifications": "list of certifications or courses completed",
+            "vendor_name": "Name of the company or person issuing the invoice",
+            "vendor_address": "Vendor address",
+            "client_name": "Name of the billed party",
+            "invoice_number": "Invoice or receipt number",
+            "invoice_date": "Date the invoice was issued",
+            "due_date": "Payment due date",
+            "subtotal": "Amount before tax",
+            "tax_amount": "Tax amount",
+            "total_amount": "Total amount due including tax",
+            "payment_terms": "Payment terms (e.g. Net 30)",
+            "line_items": "List of items/services billed as a list",
+        },
+    },
+    {
+        "id": "cv_resume",
+        "label": "👤 CV / Resume",
+        "description": "Extract candidate profile, skills, experience, and education.",
+        "schema": {
+            "full_name": "Candidate's full name",
+            "email": "Email address",
+            "phone": "Phone number",
+            "location": "City and country",
             "linkedin": "LinkedIn profile URL if present",
-            "summary": "professional summary or objective statement"
-        }
+            "current_title": "Most recent job title",
+            "current_company": "Most recent employer",
+            "total_experience_years": "Total years of professional experience",
+            "skills": "List of technical and professional skills as a list",
+            "education": "Highest qualification — degree, institution, year",
+            "languages": "Languages spoken as a list",
+            "summary": "Professional summary or objective if present",
+        },
     },
-
-    "invoice": {
-        "label": "🧾 Invoice",
-        "description": "Extract billing details from an invoice",
+    {
+        "id": "contract",
+        "label": "📑 Contract / Agreement / NDA",
+        "description": "Extract parties, obligations, dates, and key clauses.",
         "schema": {
-            "invoice_number": "unique invoice or bill number",
-            "invoice_date": "date the invoice was issued",
-            "due_date": "payment due date",
-            "vendor_name": "name of the company or person issuing the invoice",
-            "vendor_address": "address of the vendor",
-            "vendor_gstin": "GST identification number of the vendor",
-            "client_name": "name of the client or buyer",
-            "client_address": "address of the client",
-            "client_gstin": "GST identification number of the client",
-            "line_items": "list of products or services with quantities and prices",
-            "subtotal": "amount before tax",
-            "tax_amount": "total tax or GST amount",
-            "total_amount": "final total amount payable",
-            "payment_terms": "payment terms or conditions"
-        }
+            "party_1": "First party name",
+            "party_2": "Second party name",
+            "agreement_type": "Type of agreement (e.g. NDA, Service Agreement)",
+            "effective_date": "Date the contract takes effect",
+            "expiry_date": "Expiry or termination date if specified",
+            "governing_law": "Jurisdiction or governing law",
+            "key_obligations": "Main obligations of each party as a list",
+            "payment_terms": "Payment terms if applicable",
+            "confidentiality_clause": "Summary of confidentiality terms if present",
+            "termination_clause": "Conditions under which the contract can be terminated",
+        },
     },
-
-    "loan_application": {
-        "label": "🏦 Loan Application",
-        "description": "Extract details from a loan application form",
+    {
+        "id": "bank_statement",
+        "label": "💰 Bank Statement / Financial",
+        "description": "Extract account details, balances, and transaction summary.",
         "schema": {
-            "applicant_name": "full name of the loan applicant",
-            "applicant_dob": "date of birth of the applicant",
-            "applicant_pan": "PAN card number of the applicant",
-            "applicant_aadhaar": "Aadhaar number if present",
-            "applicant_address": "permanent address of the applicant",
-            "applicant_phone": "contact number of the applicant",
-            "applicant_email": "email address of the applicant",
-            "employer_name": "name of the applicant's employer",
-            "monthly_income": "monthly gross income of the applicant",
-            "loan_amount": "requested loan amount",
-            "loan_purpose": "purpose of the loan",
-            "loan_tenure": "requested loan tenure in months or years",
-            "existing_loans": "details of any existing loans or EMIs",
-            "collateral": "collateral or security offered if any"
-        }
+            "account_holder": "Name of the account holder",
+            "account_number": "Account number (last 4 digits if masked)",
+            "bank_name": "Name of the bank",
+            "statement_period": "Period covered by the statement",
+            "opening_balance": "Opening balance",
+            "closing_balance": "Closing balance",
+            "total_credits": "Total credits during the period",
+            "total_debits": "Total debits during the period",
+            "currency": "Currency of the account",
+        },
     },
-
-    "offer_letter": {
-        "label": "📋 Offer Letter",
-        "description": "Extract employment offer details",
+    {
+        "id": "gst_return",
+        "label": "🧮 GST Return",
+        "description": "Extract GST registration, filing period, and tax liability.",
         "schema": {
-            "candidate_name": "name of the candidate receiving the offer",
-            "position": "job title or designation offered",
-            "department": "department the candidate will join",
-            "joining_date": "proposed date of joining",
-            "ctc": "total cost to company or annual salary",
-            "basic_salary": "basic salary component",
-            "company_name": "name of the company making the offer",
-            "reporting_to": "name or title of reporting manager",
-            "work_location": "office location or city",
-            "offer_expiry": "date by which offer must be accepted",
-            "probation_period": "probation period duration"
-        }
+            "gstin": "GST Identification Number",
+            "legal_name": "Legal name of the taxpayer",
+            "trade_name": "Trade name if different",
+            "filing_period": "Month and year of the return",
+            "return_type": "Type of return (GSTR-1, GSTR-3B, etc.)",
+            "taxable_turnover": "Total taxable turnover",
+            "total_tax_liability": "Total tax liability (CGST + SGST + IGST)",
+            "tax_paid": "Tax paid via cash/ITC",
+            "late_fee": "Late fee if applicable",
+        },
     },
-
-    "gst_return": {
-        "label": "📊 GST Return",
-        "description": "Extract GST filing details",
+    {
+        "id": "offer_letter",
+        "label": "📨 Offer Letter",
+        "description": "Extract job offer details, compensation, and joining date.",
         "schema": {
-            "gstin": "GST identification number of the taxpayer",
-            "legal_name": "legal name of the registered business",
-            "return_period": "tax period for which return is filed",
-            "return_type": "type of GST return (GSTR-1, GSTR-3B etc.)",
-            "filing_date": "date the return was filed",
-            "total_taxable_value": "total taxable turnover for the period",
-            "total_cgst": "total Central GST amount",
-            "total_sgst": "total State GST amount",
-            "total_igst": "total Integrated GST amount",
-            "total_tax_liability": "total tax liability for the period",
-            "itc_claimed": "total input tax credit claimed",
-            "net_tax_payable": "net tax payable after ITC"
-        }
+            "candidate_name": "Name of the candidate",
+            "job_title": "Offered job title",
+            "department": "Department",
+            "reporting_to": "Reporting manager or role",
+            "joining_date": "Expected joining date",
+            "base_salary": "Annual or monthly base salary",
+            "total_ctc": "Total Cost to Company",
+            "probation_period": "Probation period if mentioned",
+            "work_location": "Office location or remote/hybrid",
+            "offer_expiry": "Date by which the offer must be accepted",
+        },
     },
-
-    "contract": {
-        "label": "📝 Contract / Agreement",
-        "description": "Extract key terms from a legal contract",
+    {
+        "id": "loan_application",
+        "label": "🏦 Loan / Credit Application",
+        "description": "Extract applicant details, loan amount, and terms.",
         "schema": {
-            "contract_title": "title or name of the agreement",
-            "party_1": "name of the first party",
-            "party_2": "name of the second party",
-            "effective_date": "date the contract becomes effective",
-            "expiry_date": "date the contract expires",
-            "contract_value": "total value or consideration of the contract",
-            "payment_terms": "payment schedule or terms",
-            "notice_period": "notice period required for termination",
-            "governing_law": "jurisdiction or governing law",
-            "key_obligations": "list of main obligations of each party",
-            "termination_clause": "conditions under which contract can be terminated",
-            "renewal_terms": "auto-renewal or extension conditions"
-        }
+            "applicant_name": "Full name of applicant",
+            "applicant_dob": "Date of birth",
+            "loan_type": "Type of loan (personal, home, auto, etc.)",
+            "loan_amount_requested": "Amount applied for",
+            "loan_tenure": "Requested repayment tenure",
+            "annual_income": "Declared annual income",
+            "employer_name": "Current employer",
+            "employment_type": "Salaried, self-employed, etc.",
+            "existing_loans": "Existing loan obligations if mentioned",
+            "collateral": "Collateral offered if any",
+        },
     },
-
-    "bank_statement": {
-        "label": "🏧 Bank Statement",
-        "description": "Extract summary from a bank statement",
+    {
+        "id": "general",
+        "label": "📄 General Document",
+        "description": "General-purpose extraction for unclassified documents.",
         "schema": {
-            "account_holder": "name of the account holder",
-            "account_number": "bank account number",
-            "bank_name": "name of the bank",
-            "ifsc_code": "IFSC code of the branch",
-            "statement_period": "period covered by the statement",
-            "opening_balance": "balance at the start of the period",
-            "closing_balance": "balance at the end of the period",
-            "total_credits": "total amount credited during the period",
-            "total_debits": "total amount debited during the period",
-            "average_balance": "average monthly balance if mentioned"
-        }
-    }
-}
+            "title": "Document title or heading",
+            "author": "Author or issuing party",
+            "date": "Document date",
+            "summary": "One paragraph summary of the document",
+            "key_points": "Main points or conclusions as a list",
+            "entities": "People, companies, or organisations mentioned as a list",
+            "amounts": "Any monetary amounts mentioned as a list",
+            "dates": "Any important dates mentioned as a list",
+        },
+    },
+    {
+        "id": "custom",
+        "label": "✏️ Custom Schema",
+        "description": "Define your own fields.",
+        "schema": {
+            "field_name": "description of what to extract",
+            "another_field": "description of this field",
+        },
+    },
+]
 
-VISION_PROMPTS = {
-    "general": """Describe this image in detail. Include:
-- What type of document or scene this is
-- All visible text, numbers, and data
-- Layout and structure
-- Any important visual elements""",
+# Index by ID for O(1) lookup
+_TEMPLATE_INDEX = {t["id"]: t for t in _TEMPLATES}
 
-    "cv_resume": """Analyze this CV or resume image. Describe:
-- The candidate's name and contact details visible
-- Professional experience and companies mentioned
-- Education qualifications
-- Skills and certifications listed
-- Overall document structure and completeness""",
 
-    "invoice": """Analyze this invoice or bill image. Extract and describe:
-- Vendor and client names
-- Invoice number and date
-- All line items with quantities and amounts
-- Tax breakdown (GST/VAT)
-- Total amount payable
-- Payment terms if visible""",
-
-    "construction_loan": """Analyze this construction site or loan document image. Describe:
-- Current construction stage and progress visible
-- Structural elements present (foundation, columns, slabs, walls)
-- Materials and equipment visible
-- Estimated completion percentage
-- Any visible defects or concerns
-- Document details if this is a paper form""",
-
-    "gst_return": """Analyze this GST document or return image. Extract and describe:
-- GSTIN and business name
-- Tax period and return type
-- All financial figures visible
-- Tax amounts (CGST, SGST, IGST)
-- Filing status if shown""",
-
-    "id_document": """Analyze this identity document image. Describe:
-- Document type (Aadhaar, PAN, Passport, Driving License)
-- Name and identifying details visible
-- Issue and expiry dates if present
-- Document number if visible
-- Any other relevant fields""",
-
-    "bank_statement": """Analyze this bank statement image. Describe:
-- Account holder name and account number
-- Bank name and branch
-- Statement period
-- Opening and closing balances
-- Notable transactions if visible"""
-}
-
-def get_vision_prompt(template_id: str = "general") -> str:
-    return VISION_PROMPTS.get(template_id, VISION_PROMPTS["general"])
-
-def get_template(template_id: str) -> dict:
-    return TEMPLATES.get(template_id, {})
-
+# ── Public functions ──────────────────────────────────────────────────────────
 
 def list_templates() -> list[dict]:
-    return [
-        {"id": k, "label": v["label"], "description": v["description"]}
-        for k, v in TEMPLATES.items()
-    ]
+    """Return all templates (id, label, description, schema)."""
+    return _TEMPLATES
+
+
+def get_template(template_id: str) -> dict | None:
+    """Return a single template by ID, or None if not found."""
+    return _TEMPLATE_INDEX.get(template_id)
+
+
+# ── TEMPLATE_MAP — moved here from retrieval.py ───────────────────────────────
+# Maps every LLM-returned doc_type string to a template ID.
+# LLM output is normalised to lowercase before lookup.
+# Any unknown type falls back to "custom" via get_template_for_doc_type().
+
+TEMPLATE_MAP: dict[str, str] = {
+    # Invoice / billing
+    "invoice":                  "invoice",
+    "receipt":                  "invoice",
+    "bill":                     "invoice",
+    "purchase order":           "invoice",
+
+    # CV / resume
+    "resume":                   "cv_resume",
+    "cv":                       "cv_resume",
+    "curriculum vitae":         "cv_resume",
+
+    # Contracts
+    "contract":                 "contract",
+    "agreement":                "contract",
+    "nda":                      "contract",
+    "mou":                      "contract",
+    "memorandum of understanding": "contract",
+
+    # Financial / banking
+    "financial statement":      "bank_statement",
+    "balance sheet":            "bank_statement",
+    "income statement":         "bank_statement",
+    "bank statement":           "bank_statement",
+    "profit and loss":          "bank_statement",
+
+    # GST / tax
+    "gst return":               "gst_return",
+    "gstr-1":                   "gst_return",
+    "gstr-3b":                  "gst_return",
+    "tax return":               "gst_return",
+
+    # Employment
+    "offer letter":             "offer_letter",
+    "appointment letter":       "offer_letter",
+    "employment contract":      "offer_letter",
+
+    # Loans
+    "loan application":         "loan_application",
+    "credit application":       "loan_application",
+    "mortgage application":     "loan_application",
+
+    # Reports (no specific template — use general)
+    "report":                   "general",
+    "research paper":           "general",
+    "annual report":            "general",
+
+    # Medical (no specific template yet)
+    "medical record":           "general",
+    "prescription":             "general",
+
+    # Legal (no specific template yet)
+    "legal document":           "general",
+    "court filing":             "general",
+
+    # Fallback categories → custom
+    "article":                  "custom",
+    "email":                    "custom",
+    "letter":                   "custom",
+    "general":                  "custom",
+}
+
+
+def get_template_for_doc_type(doc_type: str) -> str:
+    """
+    Return the schema template ID for a given doc_type string.
+    Normalises to lowercase before lookup.
+    Falls back to 'custom' for any unknown type.
+
+    Example:
+        get_template_for_doc_type("Invoice")   → "invoice"
+        get_template_for_doc_type("unknown")   → "custom"
+    """
+    return TEMPLATE_MAP.get(doc_type.lower().strip(), "custom")

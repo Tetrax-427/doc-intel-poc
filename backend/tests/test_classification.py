@@ -165,26 +165,42 @@ class TestClassifyDocumentEdgeCases:
 # ---------------------------------------------------------------------------
 
 class TestTemplateMap:
-    """Ensure every alias in TEMPLATE_MAP maps to a known template bucket."""
+    """
+    Ensure every alias in TEMPLATE_MAP maps to a known template ID.
+    TEMPLATE_MAP now lives in schemas/templates.py (moved from retrieval.py in Phase 1 fixes).
+    """
 
-    KNOWN_TEMPLATES = {"invoice", "cv_resume", "contract", "report", "financial", "medical", "legal", "general"}
+    KNOWN_TEMPLATES = {
+        "invoice", "cv_resume", "contract", "bank_statement",
+        "gst_return", "offer_letter", "loan_application", "general", "custom",
+    }
 
     def test_all_template_map_values_are_known(self):
-        from retrieval import TEMPLATE_MAP
+        from schemas.templates import TEMPLATE_MAP
         for doc_type, template in TEMPLATE_MAP.items():
             assert template in self.KNOWN_TEMPLATES, (
-                f"TEMPLATE_MAP['{doc_type}'] = '{template}' is not a known template bucket"
+                f"TEMPLATE_MAP['{doc_type}'] = '{template}' is not a known template ID"
             )
 
     def test_receipt_maps_to_invoice(self):
-        from retrieval import TEMPLATE_MAP
+        from schemas.templates import TEMPLATE_MAP
         assert TEMPLATE_MAP["receipt"] == "invoice"
 
     def test_cv_and_resume_both_map_to_cv_resume(self):
-        from retrieval import TEMPLATE_MAP
+        from schemas.templates import TEMPLATE_MAP
         assert TEMPLATE_MAP["cv"] == "cv_resume"
         assert TEMPLATE_MAP["resume"] == "cv_resume"
 
     def test_nda_maps_to_contract(self):
-        from retrieval import TEMPLATE_MAP
+        from schemas.templates import TEMPLATE_MAP
         assert TEMPLATE_MAP["nda"] == "contract"
+
+    def test_get_template_for_doc_type_normalises_case(self):
+        from schemas.templates import get_template_for_doc_type
+        assert get_template_for_doc_type("Invoice") == "invoice"
+        assert get_template_for_doc_type("RESUME") == "cv_resume"
+
+    def test_get_template_for_doc_type_unknown_returns_custom(self):
+        from schemas.templates import get_template_for_doc_type
+        assert get_template_for_doc_type("quantum_manifesto") == "custom"
+        assert get_template_for_doc_type("") == "custom"

@@ -518,30 +518,69 @@ Document (first ~2000 characters):
 JSON:"""
 
 
+from core.logger import get_logger as _get_logger
+from schemas.templates import get_template_for_doc_type
+ 
+_clf_logger = _get_logger("retrieval.classify")
+ 
+DOCUMENT_CLASSIFIER_PROMPT = """You are a document classification expert.
+ 
+Analyse the document text below and return ONLY a valid JSON object with:
+- "doc_type": one of: invoice, receipt, resume, cv, contract, agreement, nda, report,
+  research paper, financial statement, balance sheet, income statement, medical record,
+  prescription, legal document, court filing, article, email, letter, general,
+  gst return, gstr-1, gstr-3b, offer letter, loan application, bank statement
+- "confidence": float 0.0–1.0 (how confident you are)
+- "reasoning": one sentence explaining your classification
+- "key_signals": list of 2–4 short phrases from the document that led to this classification
+ 
+Return ONLY valid JSON — no explanation, no markdown fences.
+ 
+Document (first ~2000 characters):
+{context}
+ 
+JSON:"""
+ 
+ 
+def _get_confidence_threshold() -> float:
+    """
+    Read the confidence threshold from app config.
+    Falls back to 0.75 if config is not available (e.g. during tests).
+    """
+    try:
+        from core.config import config as app_config
+        return float(app_config.classification_confidence_threshold)
+    except Exception:
+        return 0.75
+ 
+ 
 def classify_document(document_id: str) -> dict:
     """
     Classify a document into a known type using LLM + confidence scoring.
-
+ 
     Returns a dict with:
         doc_type, schema_template, confidence,
         reasoning, key_signals, requires_human_review
+ 
+    Never raises — always returns a safe default on failure.
     """
     all_chunks = get_all_chunks()
     doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
-
+ 
     if not doc_chunks:
+        _clf_logger.warning("No chunks found for classification", document_id=document_id)
         return {
             "doc_type": "general",
-            "schema_template": "general",
+            "schema_template": "custom",
             "confidence": 0.0,
             "reasoning": "No document content found.",
             "key_signals": [],
             "requires_human_review": True,
         }
-
-    # Use first ~2000 chars of content for classification — enough signal, cheap to run
+ 
+    # Use first ~2000 chars — enough signal, cheap to run
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
-
+ 
     try:
         result = call_llm(
             DOCUMENT_CLASSIFIER_PROMPT.format(context=context),
@@ -550,35 +589,46 @@ def classify_document(document_id: str) -> dict:
             call_type="classify_document",
         )
     except Exception as exc:
-        print(f"[classify_document] LLM call failed: {exc}")
+        _clf_logger.error("LLM call failed during classification", document_id=document_id, error=str(exc))
         return {
             "doc_type": "general",
-            "schema_template": "general",
+            "schema_template": "custom",
             "confidence": 0.0,
             "reasoning": f"Classification error: {exc}",
             "key_signals": [],
             "requires_human_review": True,
         }
-
+ 
     if not isinstance(result, dict) or "doc_type" not in result:
+        _clf_logger.error("LLM returned unexpected format", document_id=document_id, result_type=type(result).__name__)
         return {
             "doc_type": "general",
-            "schema_template": "general",
+            "schema_template": "custom",
             "confidence": 0.0,
             "reasoning": "LLM returned unexpected format.",
             "key_signals": [],
             "requires_human_review": True,
         }
-
+ 
     doc_type = result.get("doc_type", "general").lower().strip()
     confidence = float(result.get("confidence", 0.0))
-    schema_template = TEMPLATE_MAP.get(doc_type, "general")
-
+    schema_template = get_template_for_doc_type(doc_type)
+    threshold = _get_confidence_threshold()
+ 
+    _clf_logger.info(
+        "Document classified",
+        document_id=document_id,
+        doc_type=doc_type,
+        confidence=round(confidence, 3),
+        schema_template=schema_template,
+        requires_review=confidence < threshold,
+    )
+ 
     return {
         "doc_type": doc_type,
         "schema_template": schema_template,
         "confidence": confidence,
         "reasoning": result.get("reasoning", ""),
         "key_signals": result.get("key_signals", []),
-        "requires_human_review": confidence < CONFIDENCE_THRESHOLD,
+        "requires_human_review": confidence < threshold,
     }

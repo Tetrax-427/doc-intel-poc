@@ -1,13 +1,3 @@
-"""
-routers/query.py
-Endpoints:
-    POST  /query
-    POST  /query/stream
-    GET   /chats/{document_id}
-    POST  /chats/{document_id}
-    POST  /compress
-"""
-
 import base64
 
 from fastapi import APIRouter
@@ -15,6 +5,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, validator
 
 from core.responses import bad_request, internal_error
+from core.logger import get_logger
+
+logger = get_logger("routers.query")
 
 router = APIRouter(tags=["Query"])
 
@@ -107,7 +100,7 @@ def query_stream(req: QueryRequest):
         except GeneratorExit:
             pass
         except Exception as exc:
-            print(f"[query/stream] Stream error: {exc}")
+            logger.error("Stream error", error=str(exc))
         finally:
             yield "data: [DONE]\n\n"
 
