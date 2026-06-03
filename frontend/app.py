@@ -312,6 +312,76 @@ def check_api():
         return False
 
 
+def _render_extraction_result(data: dict, instruction: str = ""):
+    """Render a validated extraction result (used in both NL flows)."""
+    validation = data.get("validation")
+    extracted = data.get("extracted", {})
+
+    if validation:
+        overall = validation["overall_confidence"]
+        found = validation["found_count"]
+        total = validation["total_count"]
+
+        if overall >= 0.85:
+            st.success(f"✅ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+        elif overall >= 0.5:
+            st.warning(f"⚠️ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+        else:
+            st.error(f"❌ {found}/{total} fields extracted · {int(overall*100)}% confidence")
+
+        st.divider()
+        st.markdown("**Extracted Fields**")
+
+        for field_name, field_data in validation["fields"].items():
+            status = field_data["status"]
+            confidence = field_data["confidence"]
+            value = field_data["value"]
+            note = field_data.get("validation_note", "")
+            icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
+
+            c1, c2, c3 = st.columns([2, 3, 1])
+            with c1:
+                st.markdown(f"{icon} **{field_name}**")
+                if note:
+                    st.caption(f"⚠️ {note}")
+            with c2:
+                if isinstance(value, list):
+                    st.caption(", ".join(str(v) for v in value) if value else "—")
+                else:
+                    st.caption(str(value) if value else "—")
+            with c3:
+                st.caption(f"{int(confidence*100)}%")
+
+    st.divider()
+
+    with st.expander("📄 Raw JSON"):
+        st.json(extracted)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        download_data = json.dumps({
+            "instruction": instruction,
+            "extracted": extracted,
+            "validation": {
+                "overall_confidence": validation["overall_confidence"],
+                "found_count": validation["found_count"],
+                "total_count": validation["total_count"]
+            } if validation else {}
+        }, indent=2)
+        st.download_button(
+            label="⬇️ Download JSON",
+            data=download_data,
+            file_name="nl_extracted.json",
+            mime="application/json",
+            key=f"dl_nl_{hash(instruction)}"
+        )
+    with col2:
+        if st.button("📋 Copy schema to Extract tab", key=f"copy_nl_{hash(instruction)}"):
+            if data.get("schema"):
+                st.session_state["injected_schema"] = json.dumps(data["schema"], indent=2)
+                st.success("Schema copied! Switch to Extract tab.")
+
+
 # --- Sidebar ---
 with st.sidebar:
     # Brand
@@ -1425,77 +1495,3 @@ curl -X POST {API_URL}/extract/nl \\
   -d '{{"document_id": "abc-123", "instruction": "extract name, email and skills"}}'
 ```
         """)
-
-
-# ── Shared extraction result renderer ────────────────────────────────────────
-# Defined after all tabs so it can be referenced above via forward reference.
-# In Python this works fine since the function is called at runtime, not parse time.
-
-def _render_extraction_result(data: dict, instruction: str = ""):
-    """Render a validated extraction result (used in both NL flows)."""
-    validation = data.get("validation")
-    extracted = data.get("extracted", {})
-
-    if validation:
-        overall = validation["overall_confidence"]
-        found = validation["found_count"]
-        total = validation["total_count"]
-
-        if overall >= 0.85:
-            st.success(f"✅ {found}/{total} fields extracted · {int(overall*100)}% confidence")
-        elif overall >= 0.5:
-            st.warning(f"⚠️ {found}/{total} fields extracted · {int(overall*100)}% confidence")
-        else:
-            st.error(f"❌ {found}/{total} fields extracted · {int(overall*100)}% confidence")
-
-        st.divider()
-        st.markdown("**Extracted Fields**")
-
-        for field_name, field_data in validation["fields"].items():
-            status = field_data["status"]
-            confidence = field_data["confidence"]
-            value = field_data["value"]
-            note = field_data.get("validation_note", "")
-            icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
-
-            c1, c2, c3 = st.columns([2, 3, 1])
-            with c1:
-                st.markdown(f"{icon} **{field_name}**")
-                if note:
-                    st.caption(f"⚠️ {note}")
-            with c2:
-                if isinstance(value, list):
-                    st.caption(", ".join(str(v) for v in value) if value else "—")
-                else:
-                    st.caption(str(value) if value else "—")
-            with c3:
-                st.caption(f"{int(confidence*100)}%")
-
-    st.divider()
-
-    with st.expander("📄 Raw JSON"):
-        st.json(extracted)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        download_data = json.dumps({
-            "instruction": instruction,
-            "extracted": extracted,
-            "validation": {
-                "overall_confidence": validation["overall_confidence"],
-                "found_count": validation["found_count"],
-                "total_count": validation["total_count"]
-            } if validation else {}
-        }, indent=2)
-        st.download_button(
-            label="⬇️ Download JSON",
-            data=download_data,
-            file_name="nl_extracted.json",
-            mime="application/json",
-            key=f"dl_nl_{hash(instruction)}"
-        )
-    with col2:
-        if st.button("📋 Copy schema to Extract tab", key=f"copy_nl_{hash(instruction)}"):
-            if data.get("schema"):
-                st.session_state["injected_schema"] = json.dumps(data["schema"], indent=2)
-                st.success("Schema copied! Switch to Extract tab.")
