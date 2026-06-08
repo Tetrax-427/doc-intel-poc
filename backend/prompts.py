@@ -77,6 +77,7 @@ Original question: {question}
 
 Rewritten question:"""
 
+
 EXTRACTION_PROMPT = """You are a precise data extraction assistant.
 Extract the following fields from the document below.
 
@@ -88,7 +89,7 @@ Rules:
 - Do NOT mix up entities (e.g. don't return company email when asked for candidate email)
 - Return ONLY a valid JSON object, no explanation, no markdown fences
 
-Fields to extract (name: description):
+{correction_examples}Fields to extract (name: description):
 {fields_with_descriptions}
 
 Document:

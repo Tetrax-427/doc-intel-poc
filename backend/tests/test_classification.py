@@ -167,7 +167,7 @@ class TestClassifyDocumentEdgeCases:
 class TestTemplateMap:
     """
     Ensure every alias in TEMPLATE_MAP maps to a known template ID.
-    TEMPLATE_MAP now lives in schemas/templates.py (moved from retrieval.py in Phase 1 fixes).
+    TEMPLATE_MAP now lives in schemas/templates.py.
     """
 
     KNOWN_TEMPLATES = {

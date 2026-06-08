@@ -4,15 +4,17 @@ FastAPI application entry point.
 
 Responsibilities:
 - Create the app instance
+- Register CORS middleware
 - Register API-key auth middleware
 - Mount all routers
-- Run startup warmup (embedding model pre-load)
+- Run startup warmup (embedding model pre-load + task queue start)
 
 All route logic lives in routers/. Nothing else belongs here.
 """
 
 import os
 from fastapi import FastAPI, Security, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 
@@ -48,10 +50,35 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS — open during initial deploy; tighten to Streamlit Cloud domain after
+# first successful end-to-end test on live URL.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event("startup")
 async def warmup():
-    """Pre-load the embedding model so the first request isn't slow."""
+    """
+    Server startup tasks:
+    1. Start the async task queue.
+       Fails silently so the server starts regardless of whether queue is ready.
+    2. Pre-load the embedding model so the first request isn't slow.
+    """
+    # Task queue — guarded import; queue.py may not exist yet
+    try:
+        from core.queue import task_queue
+        task_queue.start()
+        print("[startup] Task queue started.")
+    except ImportError:
+        print("[startup] Task queue not available yet — skipping.")
+    except Exception as exc:
+        print(f"[startup] Task queue failed to start: {exc} — continuing.")
+
+    # Embedding model warmup
     print("[startup] Warming up embedding model...")
     from ingestion import get_embed_model
     get_embed_model()

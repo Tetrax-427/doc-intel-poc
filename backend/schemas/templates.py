@@ -254,13 +254,17 @@ def get_template_for_doc_type(doc_type: str) -> str:
     """
     return TEMPLATE_MAP.get(doc_type.lower().strip(), "custom")
 
-# ── VISION_PROMPTS — add to bottom of schemas/templates.py ───────────────────
+# ── VISION_PROMPTS ───────────────────
 #
 # Classification-aware prompts for the vision engine.
 # Each prompt is tuned to extract the most useful information
 # for that document type from a rendered image or scanned page.
 #
 # get_vision_prompt() is the public API used by vision/engine.py.
+
+# ── VISION_PROMPTS ────────────────────────────────────────────────────────────
+# Classification-aware prompts for the vision engine.
+# Used by vision/engine.py via get_vision_prompt(doc_type).
 
 VISION_PROMPTS: dict[str, str] = {
     "general": """Describe this image in detail. Include:
@@ -298,7 +302,7 @@ VISION_PROMPTS: dict[str, str] = {
 - Key obligations listed for each party
 - Payment terms and amounts if present
 - Governing law and jurisdiction
-- Signature blocks — names, dates, and whether signed
+- Signature blocks -- names, dates, and whether signed
 - Any highlighted, underlined, or initialled clauses""",
 
     "gst_return": """Analyze this GST document image. Extract:
@@ -379,7 +383,7 @@ def get_vision_prompt(doc_type: str = "general") -> str:
     Falls back to the 'general' prompt for unknown types.
 
     Example:
-        get_vision_prompt("invoice")  → detailed invoice extraction prompt
-        get_vision_prompt("unknown")  → general description prompt
+        get_vision_prompt("invoice")  -> detailed invoice extraction prompt
+        get_vision_prompt("unknown")  -> general description prompt
     """
     return VISION_PROMPTS.get(doc_type.lower().strip(), VISION_PROMPTS["general"])

@@ -251,6 +251,46 @@ def doc_type_badge_html(doc_type: str | None) -> str:
     return f'<span class="doc-badge {css}">{label}</span>'
 
 
+def render_sources(sources: list):
+    """Render source citations with type icons and exact evidence.
+
+    Uses exact_sentence when available. Falls back to preview for backwards compatibility.
+    Chunk type icons match Contract 1 in CONTRACTS.md.
+    """
+    for s in sources:
+        chunk_type = s.get("chunk_type", "text")
+        image_ref = s.get("image_ref")
+        exact_sentence = s.get("exact_sentence")  
+        file_info = f" · {s['file']}" if s.get("file") else ""
+
+        # Type icon — matches chunk_type from CONTRACTS.md Contract 1
+        if chunk_type == "description":
+            type_icon, type_label = "🖼️", "Image description"
+        elif chunk_type == "table":
+            type_icon, type_label = "📊", "Table"
+        else:
+            type_icon, type_label = "📄", "Text"
+
+        st.caption(
+            f"{type_icon} {type_label} · Page {s['page']}{file_info}"
+            + (f" · ref: {image_ref}" if image_ref else "")
+        )
+
+        # Show exact sentence if available (Contract 3), fallback to preview
+        if exact_sentence:
+            st.markdown(f"> *\"{exact_sentence}\"*")
+        elif s.get("preview"):
+            st.text(s["preview"])
+
+        # Image reference callout
+        if chunk_type == "description" and image_ref:
+            st.info(
+                f"💡 Answer references a visual element — "
+                f"see **{image_ref}** in the original document."
+            )
+        st.divider()
+
+
 def load_document(doc_id: str, doc_name: str):
     st.session_state.document_id = doc_id
     st.session_state.file_name = doc_name
@@ -382,6 +422,26 @@ def _render_extraction_result(data: dict, instruction: str = ""):
                 st.success("Schema copied! Switch to Extract tab.")
 
 
+def _show_upload_success(data: dict):
+    """Show upload success message with classification info."""
+    vision_note = " · 🖼️ vision" if data.get("vision_used") else ""
+    st.success(
+        f"✅ {data.get('chunks_stored', 0)} chunks · "
+        f"{data.get('parser_used', data.get('parser', 'unknown'))}{vision_note}"
+    )
+    classification = data.get("classification", {})
+    doc_type = classification.get("doc_type", "")
+    confidence = classification.get("confidence", 0.0)
+    if doc_type and doc_type != "general":
+        label = doc_type.replace("_", " ").title()
+        requires = classification.get("requires_human_review", False)
+        if requires:
+            st.warning(f"🏷️ Detected: **{label}** · {int(confidence*100)}% — please verify type")
+        else:
+            st.info(f"🏷️ Detected: **{label}** · {int(confidence*100)}% confidence")
+    st.session_state["doc_classification"] = classification
+
+
 # --- Sidebar ---
 with st.sidebar:
     # Brand
@@ -444,16 +504,51 @@ with st.sidebar:
                     )
                     if response.status_code == 200:
                         data = response.json()
-                        if data.get("error"):
-                            st.error(f"⚠️ {data['message'] if data.get('message') else data.get('error')}")
-                        else:
-                            vision_note = " · 🖼️ vision descriptions generated" if data.get("vision_used") else ""
-                            st.success(
-                                f"✅ {data['chunks_stored']} chunks · "
-                                f"{data.get('parser', 'pypdf')}{vision_note}"
-                            )
-                            load_document(data["document_id"], data["file"])
-                            st.rerun()
+                        if "task_id" in data:
+                            # Async path — Contract 5
+                            import time
+                            task_id = data["task_id"]
+                            progress = st.progress(0, text="Processing document...")
+                            max_wait, interval, waited = 120, 3, 0
+                            while waited < max_wait:
+                                time.sleep(interval)
+                                waited += interval
+                                progress.progress(
+                                    min(waited / max_wait, 0.9),
+                                    text=f"Processing... ({waited}s)"
+                                )
+                                try:
+                                    status_res = requests.get(
+                                        f"{API_URL}/tasks/{task_id}", timeout=5
+                                    )
+                                    if status_res.status_code == 200:
+                                        status_data = status_res.json()
+                                        if status_data.get("status") == "done":
+                                            result = status_data.get("result", {})
+                                            progress.progress(1.0, text="Done!")
+                                            if "document_id" in result:
+                                                load_document(result["document_id"], result["file"])
+                                                _show_upload_success(result)
+                                                st.rerun()
+                                            break
+                                        elif status_data.get("status") == "failed":
+                                            progress.empty()
+                                            st.error(f"Processing failed: {status_data.get('error')}")
+                                            break
+                                except Exception:
+                                    pass
+                            else:
+                                progress.empty()
+                                st.warning("Taking longer than expected — check back in a moment.")
+
+                        elif "document_id" in data:
+                            # Sync path
+                            if data.get("error"):
+                                st.error(f"⚠️ {data['message'] if data.get('message') else data.get('error')}")
+                            else:
+                                load_document(data["document_id"], data["file"])
+                                _show_upload_success(data)
+                                st.rerun()
                     else:
                         st.error(f"Upload failed (HTTP {response.status_code})")
                 except requests.exceptions.Timeout:
@@ -567,7 +662,6 @@ with st.sidebar:
         st.warning("⚠️ Could not load documents. Is the API running?")
 
     # ── Classification correction widget ───────────────────────────────────
-    # Shown only when the active document has a low-confidence classification
     clf = st.session_state.doc_classification
     if (
         clf
@@ -589,7 +683,6 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
-        # All known doc types the user can pick from
         ALL_DOC_TYPES = [
             "invoice", "receipt", "resume", "cv_resume", "contract",
             "agreement", "nda", "report", "research paper",
@@ -615,7 +708,6 @@ with st.sidebar:
                     timeout=10
                 )
                 if res.status_code == 200:
-                    # Refresh local classification state
                     st.session_state.doc_classification = res.json().get("classification", clf)
                     st.session_state.doc_classification["manually_overridden"] = True
                     st.success(f"✅ Saved as {corrected_type.replace('_',' ').title()}")
@@ -671,7 +763,6 @@ elif st.session_state.file_name:
     </div>
     """, unsafe_allow_html=True)
 else:
-    # Empty state
     st.markdown("""
     <div class="empty-state">
         <div class="icon">📄</div>
@@ -712,7 +803,9 @@ if st.session_state.doc_summary:
         if not any([details.get("overview"), details.get("key_topics")]):
             st.caption(summary.get("summary_short", "No summary available."))
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["💬 Chat", "🗂️ Extract", "🤖 Smart Extract", "📊 Charts", "⚙️ Settings"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "💬 Chat", "🗂️ Extract", "🤖 Smart Extract", "📊 Charts", "👤 Review", "⚙️ Settings"
+])
 
 # ── Tab 1: Chat ───────────────────────────────────────────────────────────────
 with tab1:
@@ -783,25 +876,13 @@ with tab1:
         </div>
         """, unsafe_allow_html=True)
 
+    # Chat history — uses render_sources()
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["role"] == "assistant" and msg.get("sources"):
                 with st.expander("📎 Sources"):
-                    for s in msg["sources"]:
-                        chunk_type = s.get("chunk_type", "text")
-                        image_ref = s.get("image_ref")
-                        file_info = f" · {s['file']}" if s.get("file") else ""
-                        if chunk_type == "description":
-                            type_icon = "🖼️ Image description"
-                        elif chunk_type == "table":
-                            type_icon = "📊 Table"
-                        else:
-                            type_icon = "📄 Text"
-                        st.caption(f"{type_icon} · Page {s['page']}{file_info}" + (f" · ref: {image_ref}" if image_ref else ""))
-                        st.text(s["preview"])
-                        if chunk_type == "description" and image_ref:
-                            st.info(f"💡 This answer references an image — see {image_ref} in the original document.")
+                    render_sources(msg["sources"])
 
     question = st.chat_input("Ask anything about the document...")
 
@@ -872,21 +953,9 @@ with tab1:
                     if answer_type == "general":
                         st.caption("💬 General answer — not from documents")
                     elif sources:
+                        # Live sources — uses render_sources()
                         with st.expander("📎 Sources"):
-                            for s in sources:
-                                chunk_type = s.get("chunk_type", "text")
-                                image_ref = s.get("image_ref")
-                                file_info = f" · {s['file']}" if s.get("file") else ""
-                                if chunk_type == "description":
-                                    type_icon = "🖼️ Image description"
-                                elif chunk_type == "table":
-                                    type_icon = "📊 Table"
-                                else:
-                                    type_icon = "📄 Text"
-                                st.caption(f"{type_icon} · Page {s['page']}{file_info}" + (f" · ref: {image_ref}" if image_ref else ""))
-                                st.text(s["preview"])
-                                if chunk_type == "description" and image_ref:
-                                    st.info(f"💡 This answer references an image — see {image_ref} in the original document.")
+                            render_sources(sources)
             except Exception:
                 pass
 
@@ -917,14 +986,12 @@ with tab2:
     clf = st.session_state.doc_classification
     auto_template_id = None
     if clf and clf.get("doc_type") and clf["doc_type"] != "general":
-        # classification_data may carry schema_template; fall back to doc_type
         clf_data = clf.get("classification_data") or {}
         auto_template_id = clf_data.get("schema_template") or clf.get("doc_type")
 
     template_options = {"custom": "✏️ Custom schema"}
     template_options.update({t["id"]: t["label"] for t in templates})
 
-    # Determine default index: auto-select if classification matches a template
     template_keys = list(template_options.keys())
     default_template = "custom"
     if auto_template_id and auto_template_id in template_keys:
@@ -933,7 +1000,6 @@ with tab2:
     col1, col2 = st.columns([3, 2])
     with col1:
         st.markdown("**Choose a template or define custom fields**")
-        # Show auto-select notice if we pre-selected something
         if default_template != "custom" and clf:
             confidence_pct = int((clf.get("classification_confidence") or 0) * 100)
             st.caption(
@@ -1036,6 +1102,34 @@ with tab2:
                                     with c3:
                                         st.caption(f"{int(confidence*100)}%")
 
+                            # Business validation — 
+                            business_val = data.get("business_validation", {})
+                            if business_val and business_val.get("rules_run", 0) > 0:
+                                st.divider()
+                                st.markdown("**Business Rule Validation**")
+
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Rules Run", business_val.get("rules_run", 0))
+                                with col2:
+                                    st.metric("✅ Passed", business_val.get("passed", 0))
+                                with col3:
+                                    st.metric("❌ Failed", business_val.get("failed", 0))
+
+                                if business_val.get("is_valid"):
+                                    st.success("All business rules passed")
+                                else:
+                                    with st.expander("🔍 Rule Results"):
+                                        for r in business_val.get("results", []):
+                                            if r["status"] == "PASS":
+                                                st.markdown(f"✅ **{r['field']}** — {r['message']}")
+                                            elif r["status"] == "FAIL":
+                                                icon = "🔴" if r["blocking"] else "🟡"
+                                                st.markdown(f"{icon} **{r['field']}** — {r['message']}")
+                                                st.caption(f"`{r['rule_code']}` · {'Blocking' if r['blocking'] else 'Warning'}")
+                                            elif r["status"] == "WARNING":
+                                                st.markdown(f"⚠️ **{r['field']}** — {r['message']}")
+
                             st.divider()
                             with st.expander("📄 Raw JSON"):
                                 st.json(extracted)
@@ -1057,7 +1151,6 @@ with tab3:
     st.markdown("**Describe what you want to extract in plain English.**")
     st.caption("No need to define a schema — just tell DocIntel what you need.")
 
-    # Example instructions
     st.markdown("**Examples:**")
     examples = [
         "Extract the candidate's name, email, phone, skills, and total experience",
@@ -1071,7 +1164,7 @@ with tab3:
         with cols[i % 2]:
             if st.button(f"💡 {example[:50]}...", key=f"ex_{i}", use_container_width=True):
                 st.session_state["nl_instruction"] = example
-                st.session_state["nl_generated_schema"] = {}  # reset schema on new example
+                st.session_state["nl_generated_schema"] = {}
 
     st.divider()
 
@@ -1083,10 +1176,9 @@ with tab3:
         key="nl_input"
     )
 
-    # Keep instruction in session state as user types
     if instruction != st.session_state.get("nl_instruction", ""):
         st.session_state["nl_instruction"] = instruction
-        st.session_state["nl_generated_schema"] = {}  # reset schema when instruction changes
+        st.session_state["nl_generated_schema"] = {}
 
     col1, col2, col3 = st.columns([2, 2, 3])
     with col1:
@@ -1094,7 +1186,6 @@ with tab3:
     with col2:
         extract_nl_btn = st.button("🤖 Extract", type="primary", use_container_width=True)
 
-    # ── Step 1: Preview / generate schema ───────────────────────────────────
     if preview_btn and instruction:
         with st.spinner("Generating schema from instruction..."):
             try:
@@ -1116,7 +1207,6 @@ with tab3:
             except Exception as e:
                 st.error(f"Error: {e}")
 
-    # ── Step 2: Schema editor (shown after preview or if schema already exists) ─
     if st.session_state.get("nl_generated_schema"):
         st.markdown("**Generated Schema — edit if needed before extracting:**")
         st.caption("You can add, remove, or rename fields. Changes here will be used when you click Extract.")
@@ -1129,7 +1219,6 @@ with tab3:
             label_visibility="collapsed"
         )
 
-        # Parse and validate edits live
         schema_valid = True
         try:
             edited_schema = json.loads(edited_schema_str)
@@ -1138,7 +1227,6 @@ with tab3:
             schema_valid = False
             edited_schema = st.session_state["nl_generated_schema"]
 
-        # Action row: extract with edited schema OR copy to Extract tab
         action_col1, action_col2 = st.columns(2)
         with action_col1:
             run_from_preview = st.button(
@@ -1175,7 +1263,6 @@ with tab3:
 
         st.divider()
 
-    # ── Step 3: One-shot extract (no preview) ───────────────────────────────
     if extract_nl_btn and instruction:
         with st.spinner("Understanding instruction and extracting..."):
             try:
@@ -1193,7 +1280,6 @@ with tab3:
                     if data.get("error"):
                         st.error(f"⚠️ {data['error']}")
                     else:
-                        # Store the generated schema for editing
                         if data.get("schema"):
                             st.session_state["nl_generated_schema"] = data["schema"]
 
@@ -1313,8 +1399,204 @@ with tab4:
             except Exception as e:
                 st.caption(f"Could not render chart: {e}")
 
-# ── Tab 5: Settings ───────────────────────────────────────────────────────────
+# ── Tab 5: Review ─────────────────────────────────────────────────────────────
 with tab5:
+    st.markdown("## 👤 Human Review")
+    st.caption("Verify extracted fields with evidence. Approve, correct, or reject each field.")
+
+    if not st.session_state.document_id:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="icon">👤</div>
+            <div class="title">No document selected</div>
+            <div class="desc">Select a document from the sidebar to start reviewing.</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+    if "review_data" not in st.session_state:
+        st.session_state.review_data = {}
+
+    # Load extraction for review
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        review_instruction = st.text_input(
+            "What to extract for review",
+            placeholder="e.g. extract total amount, vendor name, and invoice date",
+            label_visibility="collapsed"
+        )
+    with col2:
+        load_btn = st.button("📥 Load", type="primary", use_container_width=True)
+
+    if load_btn and review_instruction:
+        with st.spinner("Extracting for review..."):
+            try:
+                res = requests.post(
+                    f"{API_URL}/extract/nl",
+                    json={
+                        "document_id": st.session_state.document_id,
+                        "instruction": review_instruction
+                    },
+                    timeout=30
+                )
+                if res.status_code == 200:
+                    st.session_state.review_data = res.json()
+                else:
+                    st.error(f"Extraction failed (HTTP {res.status_code})")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # Render review UI
+    data = st.session_state.review_data
+    if not data:
+        st.info("Enter an extraction instruction above and click Load.")
+    else:
+        extracted = data.get("extracted", {})
+        validation = data.get("validation", {})
+        business_val = data.get("business_validation", {})
+        sources = data.get("sources", [])
+
+        # Business validation banner — 
+        if business_val and business_val.get("rules_run", 0) > 0:
+            if business_val.get("is_valid"):
+                st.success(
+                    f"✅ All business rules passed — "
+                    f"{business_val['passed']}/{business_val['rules_run']} OK"
+                )
+            else:
+                st.error(
+                    f"❌ {business_val['blocking_failures']} blocking failure(s) — "
+                    f"review required"
+                )
+                with st.expander("🔍 Rule Details"):
+                    for r in business_val.get("results", []):
+                        if r["status"] == "FAIL":
+                            icon = "🔴" if r["blocking"] else "🟡"
+                            st.markdown(f"{icon} **{r['field']}** — {r['message']}")
+                            st.caption(f"Rule: `{r['rule_code']}`")
+
+        st.divider()
+        st.markdown("**Review each field:**")
+        actions_to_submit = {}
+
+        for field_name, value in extracted.items():
+            field_val = validation.get("fields", {}).get(field_name, {})
+            confidence = field_val.get("confidence", 0)
+            status = field_val.get("status", "NOT_FOUND")
+            val_note = field_val.get("validation_note", "")
+
+            conf_icon = "🟢" if status == "FOUND" else "🟡" if status == "LOW_CONFIDENCE" else "🔴"
+            expanded = status != "FOUND"
+
+            with st.expander(
+                f"{conf_icon} **{field_name}** — {int(confidence * 100)}% confidence",
+                expanded=expanded
+            ):
+                col1, col2 = st.columns([3, 2])
+
+                with col1:
+                    st.markdown("**Extracted value:**")
+                    if isinstance(value, list):
+                        st.write(value)
+                    else:
+                        st.code(str(value) if value else "— not found —")
+
+                    if val_note:
+                        st.caption(f"⚠️ Format issue: {val_note}")
+
+                    # Show top 2 evidence sources
+                    if sources:
+                        st.markdown("**Evidence:**")
+                        for s in sources[:2]:
+                            chunk_type = s.get("chunk_type", "text")
+                            icon = "🖼️" if chunk_type == "description" else "📄"
+                            evidence_text = s.get("exact_sentence") or s.get("preview", "")
+                            if evidence_text:
+                                st.caption(f"{icon} Page {s['page']}: \"{evidence_text[:120]}\"")
+
+                with col2:
+                    st.markdown("**Your decision:**")
+                    action = st.radio(
+                        "Action",
+                        ["✅ Approve", "✏️ Correct", "❌ Reject"],
+                        key=f"action_{field_name}",
+                        label_visibility="collapsed"
+                    )
+
+                    corrected_value = str(value) if value else ""
+                    if "Correct" in action:
+                        corrected_value = st.text_input(
+                            "Corrected value",
+                            value=str(value) if value else "",
+                            key=f"corrected_{field_name}"
+                        )
+
+                    reviewer_note = st.text_input(
+                        "Note (optional)",
+                        key=f"note_{field_name}",
+                        placeholder="Why did you change this?"
+                    )
+
+                    actions_to_submit[field_name] = {
+                        "action": "approve" if "Approve" in action
+                                  else "correct" if "Correct" in action
+                                  else "reject",
+                        "original_value": str(value) if value else "",
+                        "corrected_value": corrected_value,
+                        "reviewer_note": reviewer_note
+                    }
+
+        st.divider()
+
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            submit_btn = st.button("💾 Submit Review", type="primary", use_container_width=True)
+
+        if submit_btn:
+            with st.spinner("Saving review..."):
+                review_payload = [
+                    {
+                        "field": field,
+                        "action": details["action"],
+                        "original_value": details["original_value"],
+                        "corrected_value": details["corrected_value"],
+                        "reviewer_note": details["reviewer_note"]
+                    }
+                    for field, details in actions_to_submit.items()
+                ]
+                try:
+                    res = requests.post(
+                        f"{API_URL}/review/{st.session_state.document_id}",
+                        json=review_payload,
+                        timeout=10
+                    )
+                    if res.status_code == 200:
+                        approved = sum(1 for a in review_payload if a["action"] == "approve")
+                        corrected = sum(1 for a in review_payload if a["action"] == "correct")
+                        rejected = sum(1 for a in review_payload if a["action"] == "reject")
+                        st.success(
+                            f"✅ Saved — {approved} approved · "
+                            f"{corrected} corrected · {rejected} rejected"
+                        )
+                        final = {
+                            field: details["corrected_value"]
+                            for field, details in actions_to_submit.items()
+                            if details["action"] != "reject"
+                        }
+                        st.download_button(
+                            "⬇️ Download reviewed JSON",
+                            data=json.dumps(final, indent=2),
+                            file_name="reviewed_extraction.json",
+                            mime="application/json"
+                        )
+                        st.session_state.review_data = {}
+                    else:
+                        st.error("Failed to save review.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+# ── Tab 6: Settings ───────────────────────────────────────────────────────────
+with tab6:
     st.markdown("## ⚙️ Settings")
 
     # --- API Keys ---
@@ -1486,6 +1768,9 @@ with tab5:
 | GET | `/health` | System health check |
 | POST | `/compress` | Compress chat history |
 | GET | `/usage` | Get usage stats |
+| POST | `/review/{{id}}` | Submit human review |
+| GET | `/review/{{id}}/corrections` | Get past corrections |
+| GET | `/tasks/{{id}}` | Poll async task status |
 
 **Example — Extract fields via API:**
 ```bash

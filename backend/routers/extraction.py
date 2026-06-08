@@ -7,6 +7,8 @@ Endpoints:
     GET   /templates
     GET   /templates/{template_id}
     GET   /tables/{document_id}
+    POST  /review/{document_id}
+    GET   /review/{document_id}/corrections
 """
 
 from fastapi import APIRouter
@@ -51,7 +53,7 @@ class NLExtractRequest(BaseModel):
 class BatchExtractRequest(BaseModel):
     document_ids: list[str]
     fields: dict = {}
-    instruction: str | None = None  # if provided, NL extraction is used
+    instruction: str | None = None
 
     @validator("document_ids")
     def ids_not_empty(cls, v):
@@ -61,12 +63,25 @@ class BatchExtractRequest(BaseModel):
 
     @validator("fields")
     def fields_or_instruction_required(cls, v, values):
-        # We can't cross-validate with instruction here easily in Pydantic v1,
-        # so we do it at route level.
         return v
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+class ReviewAction(BaseModel):
+    field: str
+    action: str                  # "approve" | "reject" | "correct"
+    original_value: str = ""
+    corrected_value: str = ""
+    evidence_used: str = ""
+    reviewer_note: str = ""
+
+    @validator("action")
+    def action_must_be_valid(cls, v):
+        if v not in ("approve", "reject", "correct"):
+            raise ValueError("action must be 'approve', 'reject', or 'correct'")
+        return v
+
+
+# ── Extraction routes ─────────────────────────────────────────────────────────
 
 @router.post("/extract")
 def extract(req: ExtractRequest):
@@ -130,13 +145,12 @@ def extract_natural_language(req: NLExtractRequest):
 def batch_extract(req: BatchExtractRequest):
     """
     Extract fields from multiple documents using the same schema or instruction.
-    Runs sequentially; returns one result per document_id.
+    Runs sequentially.
     Provide either `fields` (schema dict) or `instruction` (natural language).
     """
     from retrieval import extract_fields, extract_nl
     from webhooks import trigger_webhooks
 
-    # Validate that at least one extraction method is specified
     if not req.fields and not req.instruction:
         return bad_request(
             "Provide either 'fields' (schema dict) or 'instruction' (natural language).",
@@ -207,3 +221,53 @@ def get_tables(document_id: str):
         return {"tables": tables}
     except Exception as exc:
         return internal_error(f"Table extraction failed: {exc}")
+
+
+# ── Review routes ─────────────────────────────────────────────────────────────
+
+@router.post("/review/{document_id}")
+def submit_review(document_id: str, actions: list[ReviewAction]):
+    """
+    Submit human review decisions for a document's extracted fields.
+    Persists each decision to review_corrections so the feedback loop
+    can inject past corrections into future extraction prompts.
+    """
+    from db import save_correction, get_classification
+
+    cls = get_classification(document_id)
+    doc_type = cls.get("doc_type", "general") if cls else "general"
+
+    for action in actions:
+        save_correction(
+            document_id=document_id,
+            doc_type=doc_type,
+            field_name=action.field,
+            original=action.original_value,
+            corrected=action.corrected_value,
+            action=action.action,
+            evidence=action.evidence_used,
+            note=action.reviewer_note,
+        )
+
+    return {
+        "reviewed_fields": [a.field for a in actions],
+        "doc_type": doc_type,
+        "saved": len(actions),
+    }
+
+
+@router.get("/review/{document_id}/corrections")
+def get_corrections(document_id: str):
+    """
+    Return all review corrections saved for a document, newest-first.
+    Used by the frontend to show review history.
+    """
+    from db import supabase
+    result = (
+        supabase.table("review_corrections")
+        .select("*")
+        .eq("document_id", document_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []

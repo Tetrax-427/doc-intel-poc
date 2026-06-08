@@ -115,7 +115,7 @@ def _run_vision_for_page(
             # Case A — parser found embedded images; describe each
             for img in page.images:
                 if img.description:
-                    # Already has a description (shouldn't happen in Phase 2, but safe)
+                    # Already has a description.
                     updated_images.append(img)
                     continue
 
@@ -183,8 +183,7 @@ def ingest_file(
         use_llamaparse: Use LlamaParse for PDF parsing (falls back to pypdf).
         doc_type:       Pre-classified document type — used to select the right
                         vision prompt. Pass "general" if classification hasn't
-                        run yet. Dev 2 passes the classified type from the
-                        upload endpoint after quick keyword classification.
+                        run yet.
 
     Returns:
         Dict with document_id, chunk counts, parser used, vision_used flag.
@@ -303,7 +302,7 @@ def ingest_file(
                 "metadata": {
                     "page": str(page.page_num),
                     "file": file_name,
-                    "chunk_type": "description",        # Contract 1 & 2
+                    "chunk_type": "description",       
                     "image_ref": img.image_ref,
                     "vision_prompt_used": img.vision_prompt_used,
                 }
@@ -347,7 +346,7 @@ def ingest_file(
 
 
 # ---------------------------------------------------------------------------
-# URL ingestion — unchanged from Phase 1
+# URL ingestion —
 # ---------------------------------------------------------------------------
 
 def ingest_url(url: str) -> dict:

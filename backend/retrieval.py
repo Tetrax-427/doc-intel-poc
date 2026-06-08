@@ -234,7 +234,7 @@ Summary:""",
 
 
 # ---------------------------------------------------------------------------
-# D6 — Exact evidence extraction
+# Exact evidence extraction
 # ---------------------------------------------------------------------------
 
 def get_exact_sentence(chunk_content: str, question: str) -> str:
@@ -254,7 +254,6 @@ def get_exact_sentence(chunk_content: str, question: str) -> str:
         if not chunk_content:
             return ""
 
-        # Split into sentences, filter out very short fragments
         sentences = [
             s.strip()
             for s in chunk_content.split(".")
@@ -267,7 +266,6 @@ def get_exact_sentence(chunk_content: str, question: str) -> str:
         if len(sentences) == 1:
             return sentences[0]
 
-        # Cap at 10 sentences — enough signal, cheap to run
         candidates = sentences[:10]
 
         result = call_llm(
@@ -285,7 +283,6 @@ Return ONLY the sentence text, nothing else. No numbering, no explanation.""",
         return extracted if extracted else sentences[0]
 
     except Exception:
-        # Never block query results over an evidence extraction failure
         return chunk_content[:200] if chunk_content else ""
 
 
@@ -338,7 +335,6 @@ def query_document(
                 "preview":        c["content"][:150],
                 "chunk_type":     c.get("chunk_type", "text"),
                 "image_ref":      c.get("image_ref"),
-                # D6 — Contract 3: exact sentence most relevant to the question
                 "exact_sentence": get_exact_sentence(c["content"], question),
             }
             for c in chunks
@@ -390,7 +386,55 @@ def query_document_stream(
 
 
 # ---------------------------------------------------------------------------
-# D5 — Field extraction with business validation
+# Correction feedback loop (Phase 2)
+# ---------------------------------------------------------------------------
+
+def build_correction_examples(doc_type: str, fields: dict) -> str:
+    """
+    Build few-shot correction examples from past human review decisions.
+
+    Queries review_corrections for recent "correct" actions on this
+    (doc_type, field_name) pair and formats them as natural language
+    examples for the extraction prompt.
+
+    Returns an empty string when no corrections exist, so the prompt
+    is unchanged for documents that haven't been reviewed yet.
+    Never raises — DB failures return empty string silently.
+    """
+    try:
+        from db import get_corrections_for_doc_type
+    except ImportError:
+        return ""
+
+    examples = []
+    # Cap field iteration — no point looking up corrections for every field
+    # in a very large schema; first 5 cover the most common extraction targets
+    for field_name in list(fields.keys())[:5]:
+        try:
+            corrections = get_corrections_for_doc_type(doc_type, field_name, limit=3)
+        except Exception:
+            continue  # DB unavailable for this field — skip silently
+
+        for c in corrections:
+            orig = c.get("original_value", "")
+            corr = c.get("corrected_value", "")
+            # Only emit examples where the value actually changed
+            if orig and corr and orig != corr:
+                examples.append(
+                    f"- '{field_name}': was incorrectly extracted as "
+                    f"'{orig}', correct value is '{corr}'"
+                )
+
+    if not examples:
+        return ""
+
+    # Cap total examples injected — keeps prompt size predictable
+    lines = examples[:5]
+    return "Learn from these past corrections:\n" + "\n".join(lines) + "\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Field extraction with correction feedback loop + business validation
 # ---------------------------------------------------------------------------
 
 def extract_fields(
@@ -399,32 +443,39 @@ def extract_fields(
     doc_type: str = "general",
 ) -> dict:
     """
-    Extract fields from a document and run both confidence scoring
-    and business logic validation.
+    Extract fields from a document.
+
+    Pipeline:
+    1. Auto-detect doc_type from stored classification if not passed explicitly
+    2. Build few-shot correction examples from past human review decisions
+    3. Format and run the extraction prompt with corrections injected
+    4. Run confidence scoring (existing Phase 1 behaviour)
+    5. Run business logic validation (Phase 2 — skipped silently if Dev 1's
+       ValidationEngine isn't available yet)
 
     Args:
         document_id: UUID of the document to extract from.
         fields:      Schema dict of {field_name: description}.
-        doc_type:    Document type for ruleset selection. If "general",
-                     auto-detects from stored classification.
+        doc_type:    Document type for ruleset selection. Auto-detected if "general".
 
     Returns:
         {
             "extracted":           dict of extracted values,
-            "validation":          confidence scoring result (existing),
-            "business_validation": Contract 4 shaped validation result (Phase 2),
+            "validation":          confidence scoring result,
+            "business_validation": Contract 4 shaped result, or {} if not available,
         }
     """
     from schemas.validator import validate_extraction
-    from validation.engine import ValidationEngine
 
-    # Auto-detect doc_type from stored classification if not explicitly passed
+    # 1. Auto-detect doc_type from stored classification if not explicitly passed
     if doc_type == "general":
         try:
-            cls_result = classify_document(document_id)
-            detected = cls_result.get("doc_type", "general")
-            if detected and detected != "general":
-                doc_type = detected
+            from db import get_classification
+            cls = get_classification(document_id)
+            if cls:
+                detected = cls.get("doc_type", "general")
+                if detected and detected != "general":
+                    doc_type = detected
         except Exception:
             pass  # classification unavailable — proceed with "general"
 
@@ -437,31 +488,43 @@ def extract_fields(
         for key, value in fields.items()
     ])
 
+    # 2. Build correction examples from past human review — empty string if none exist
+    correction_examples = build_correction_examples(doc_type, fields)
+
+    # 3. Format prompt with corrections injected
     prompt = EXTRACTION_PROMPT.format(
+        correction_examples=correction_examples,
         fields_with_descriptions=fields_with_desc,
-        context=context
+        context=context,
     )
 
     extracted = call_llm(
         prompt,
         temperature=0.0,
         json_mode=True,
-        call_type="extract"
+        call_type="extract",
     )
 
     if "error" in extracted:
         return {
             "extracted":           extracted,
             "validation":          None,
-            "business_validation": None,
+            "business_validation": {},
         }
 
-    # Confidence scoring (existing Phase 1 behaviour)
+    # 4. Confidence scoring (Phase 1 behaviour — unchanged)
     validation = validate_extraction(extracted, fields)
 
-    # Business logic validation (Phase 2 — Contract 4)
-    biz_validator      = ValidationEngine()
-    business_validation = biz_validator.validate(extracted, doc_type)
+    # 5. Business logic validation — guarded import, never breaks extraction
+    business_validation = {}
+    try:
+        from validation.engine import ValidationEngine
+        engine = ValidationEngine()
+        business_validation = engine.validate(extracted, doc_type)
+    except ImportError:
+        pass  # Dev 1 hasn't delivered ValidationEngine yet — skip silently
+    except Exception:
+        pass  # never break extraction over a validation failure
 
     return {
         "extracted":           extracted,
@@ -471,7 +534,7 @@ def extract_fields(
 
 
 # ---------------------------------------------------------------------------
-# Table extraction — unchanged from Phase 1
+# Table extraction
 # ---------------------------------------------------------------------------
 
 def extract_tables(document_id: str) -> list[dict]:
@@ -510,7 +573,7 @@ JSON array:""",
 
 
 # ---------------------------------------------------------------------------
-# Summary generation — unchanged from Phase 1
+# Summary generation
 # ---------------------------------------------------------------------------
 
 def generate_summary(document_id: str) -> dict:
@@ -551,7 +614,7 @@ JSON:""",
 
 
 # ---------------------------------------------------------------------------
-# NL to schema — unchanged from Phase 1
+# NL to schema
 # ---------------------------------------------------------------------------
 
 def nl_to_schema(instruction: str) -> dict:
@@ -582,33 +645,34 @@ def extract_nl(document_id: str, instruction: str) -> dict:
     """
     Natural language extraction pipeline:
     1. Convert instruction to schema
-    2. Run extraction with validation
-    3. Return schema + extracted + validation
+    2. Run extraction with feedback loop + validation
+    3. Return schema + extracted + validation + business_validation
     """
     schema = nl_to_schema(instruction)
 
     if "error" in schema:
         return {
-            "error":      "Could not parse instruction into schema",
-            "instruction": instruction,
-            "schema":      None,
-            "extracted":   None,
-            "validation":  None,
+            "error":               "Could not parse instruction into schema",
+            "instruction":         instruction,
+            "schema":              None,
+            "extracted":           None,
+            "validation":          None,
+            "business_validation": {},
         }
 
     result = extract_fields(document_id, schema)
 
     return {
-        "instruction":        instruction,
-        "schema":             schema,
-        "extracted":          result.get("extracted"),
-        "validation":         result.get("validation"),
+        "instruction":         instruction,
+        "schema":              schema,
+        "extracted":           result.get("extracted"),
+        "validation":          result.get("validation"),
         "business_validation": result.get("business_validation"),
     }
 
 
 # ---------------------------------------------------------------------------
-# Document classification (Dev 2 built in Phase 1 — preserved exactly)
+# Document classification (Phase 1 — preserved exactly)
 # ---------------------------------------------------------------------------
 
 from core.logger import get_logger as _get_logger
@@ -670,6 +734,7 @@ def _get_confidence_threshold() -> float:
 def classify_document(document_id: str) -> dict:
     """
     Classify a document into a known type using LLM + confidence scoring.
+    Checks classification cache first — LLM only called on cache miss.
     Never raises — always returns a safe default on failure.
     """
     all_chunks = get_all_chunks()
@@ -678,15 +743,25 @@ def classify_document(document_id: str) -> dict:
     if not doc_chunks:
         _clf_logger.warning("No chunks found for classification", document_id=document_id)
         return {
-            "doc_type":            "general",
-            "schema_template":     "custom",
-            "confidence":          0.0,
-            "reasoning":           "No document content found.",
-            "key_signals":         [],
+            "doc_type":              "general",
+            "schema_template":       "custom",
+            "confidence":            0.0,
+            "reasoning":             "No document content found.",
+            "key_signals":           [],
             "requires_human_review": True,
         }
 
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
+
+    try:
+        from core.cache import get_classification, set_classification, make_text_hash
+        text_hash = make_text_hash(context)
+        cached = get_classification(text_hash)
+        if cached is not None:
+            _clf_logger.info("Classification cache hit", document_id=document_id)
+            return cached
+    except Exception:
+        text_hash = None
 
     try:
         result = call_llm(
@@ -699,11 +774,11 @@ def classify_document(document_id: str) -> dict:
         _clf_logger.error("LLM call failed during classification",
                           document_id=document_id, error=str(exc))
         return {
-            "doc_type":            "general",
-            "schema_template":     "custom",
-            "confidence":          0.0,
-            "reasoning":           f"Classification error: {exc}",
-            "key_signals":         [],
+            "doc_type":              "general",
+            "schema_template":       "custom",
+            "confidence":            0.0,
+            "reasoning":             f"Classification error: {exc}",
+            "key_signals":           [],
             "requires_human_review": True,
         }
 
@@ -711,11 +786,11 @@ def classify_document(document_id: str) -> dict:
         _clf_logger.error("LLM returned unexpected format",
                           document_id=document_id, result_type=type(result).__name__)
         return {
-            "doc_type":            "general",
-            "schema_template":     "custom",
-            "confidence":          0.0,
-            "reasoning":           "LLM returned unexpected format.",
-            "key_signals":         [],
+            "doc_type":              "general",
+            "schema_template":       "custom",
+            "confidence":            0.0,
+            "reasoning":             "LLM returned unexpected format.",
+            "key_signals":           [],
             "requires_human_review": True,
         }
 
@@ -733,11 +808,19 @@ def classify_document(document_id: str) -> dict:
         requires_review=confidence < threshold,
     )
 
-    return {
-        "doc_type":            doc_type,
-        "schema_template":     schema_template,
-        "confidence":          confidence,
-        "reasoning":           result.get("reasoning", ""),
-        "key_signals":         result.get("key_signals", []),
+    classification_result = {
+        "doc_type":              doc_type,
+        "schema_template":       schema_template,
+        "confidence":            confidence,
+        "reasoning":             result.get("reasoning", ""),
+        "key_signals":           result.get("key_signals", []),
         "requires_human_review": confidence < threshold,
     }
+
+    try:
+        if text_hash:
+            set_classification(text_hash, classification_result)
+    except Exception:
+        pass
+
+    return classification_result

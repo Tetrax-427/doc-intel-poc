@@ -2,9 +2,8 @@
 db.py
 Supabase client and all table helpers.
 
-Changes from original:
-- get_all_documents now selects doc_type + classification_confidence
-- Added: save_classification, get_classification
+- insert_document, get_all_documents, get_all_chunks accept user_id for workspace scoping
+- Added: save_correction, get_corrections_for_doc_type
 """
 
 import os
@@ -21,19 +20,24 @@ supabase = create_client(
 
 # ── Documents ─────────────────────────────────────────────────────────────────
 
-def insert_document(name: str) -> str:
-    result = supabase.table("documents").insert({"name": name}).execute()
+def insert_document(name: str, user_id: str = "anonymous") -> str:
+    result = supabase.table("documents").insert({
+        "name": name,
+        "user_id": user_id,
+    }).execute()
     return result.data[0]["id"]
 
 
-def get_all_documents() -> list[dict]:
+def get_all_documents(user_id: str = "anonymous") -> list[dict]:
     """
-    Return all documents ordered newest-first.
+    Return all documents for a user, ordered newest-first.
     Includes classification columns so the UI can show doc-type badges.
+    Defaults to 'anonymous' .
     """
     result = (
         supabase.table("documents")
         .select("id, name, summary_short, doc_type, classification_confidence, requires_review, created_at")
+        .eq("user_id", user_id)
         .order("created_at", desc=True)
         .execute()
     )
@@ -101,9 +105,22 @@ def insert_chunks(chunks: list[dict]):
     supabase.table("chunks").insert(chunks).execute()
 
 
-def get_all_chunks() -> list[dict]:
-    result = supabase.table("chunks").select("*").execute()
-    return result.data
+def get_all_chunks(user_id: str = "anonymous") -> list[dict]:
+    """
+    Return all chunks belonging to documents owned by user_id.
+    Defaults to 'anonymous'.
+    """
+    docs = get_all_documents(user_id)
+    doc_ids = [d["id"] for d in docs]
+    if not doc_ids:
+        return []
+    result = (
+        supabase.table("chunks")
+        .select("*")
+        .in_("document_id", doc_ids)
+        .execute()
+    )
+    return result.data or []
 
 
 # ── Chats ─────────────────────────────────────────────────────────────────────
@@ -126,3 +143,55 @@ def get_chat_history(document_id: str) -> list[dict]:
         .execute()
     )
     return result.data
+
+
+# ── Review corrections ────────────────────────────────────────────────────────
+
+def save_correction(
+    document_id: str,
+    doc_type: str,
+    field_name: str,
+    original: str,
+    corrected: str,
+    action: str,
+    evidence: str = "",
+    note: str = "",
+) -> None:
+    """
+    Persist a single human review decision to review_corrections.
+    action must be one of: "approve" | "reject" | "correct"
+    """
+    supabase.table("review_corrections").insert({
+        "document_id": document_id,
+        "doc_type": doc_type,
+        "field_name": field_name,
+        "original_value": str(original) if original else "",
+        "corrected_value": str(corrected) if corrected else "",
+        "action": action,
+        "evidence_used": evidence,
+        "reviewer_note": note,
+    }).execute()
+
+
+def get_corrections_for_doc_type(
+    doc_type: str,
+    field_name: str,
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Fetch the most recent human corrections for a (doc_type, field_name) pair.
+    Used by build_correction_examples() to inject few-shot examples into the
+    extraction prompt so past mistakes improve future extractions.
+    Only returns rows where action == "correct" (not approvals or rejections).
+    """
+    result = (
+        supabase.table("review_corrections")
+        .select("*")
+        .eq("doc_type", doc_type)
+        .eq("field_name", field_name)
+        .eq("action", "correct")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []
