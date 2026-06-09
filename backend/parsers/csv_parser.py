@@ -1,6 +1,4 @@
 """
-backend/parsers/csv_parser.py
-
 Handles .csv and .xlsx files via pandas.
 Produces structured Table objects alongside text representations.
 """
@@ -13,7 +11,8 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError
 from parsers.base import BaseParser
-
+import pandas as pd
+            
 logger = get_logger("csv")
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx"}
@@ -37,7 +36,6 @@ class CsvParser(BaseParser):
         ext = os.path.splitext(file_path)[1].lower()
 
         try:
-            import pandas as pd
             sheets = self._load_sheets(file_path, ext, pd)
         except Exception as e:
             raise ParseError(

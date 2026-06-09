@@ -1,6 +1,4 @@
 """
-backend/parsers/pypdf_parser.py
-
 Handles text-based PDFs locally via pypdf.
 No API key required — always available as fallback.
 """
@@ -13,6 +11,7 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError
 from parsers.base import BaseParser
+import pypdf
 
 logger = get_logger("pypdf")
 
@@ -33,7 +32,6 @@ class PyPDFParser(BaseParser):
         file_name = os.path.basename(file_path)
 
         try:
-            import pypdf
             reader = pypdf.PdfReader(file_path)
         except Exception as e:
             raise ParseError(

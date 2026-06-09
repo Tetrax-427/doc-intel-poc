@@ -1,6 +1,4 @@
 """
-backend/parsers/base.py
-
 Abstract base class for all parsers.
 The rest of the system only ever talks to BaseParser — never to specific parsers.
 """

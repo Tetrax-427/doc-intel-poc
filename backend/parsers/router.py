@@ -1,6 +1,4 @@
 """
-backend/parsers/router.py
-
 AutoRouter selects the best available parser for a given file.
 Falls back gracefully when the preferred parser is unavailable.
 
@@ -21,7 +19,13 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError, UnsupportedFileTypeError
 from parsers.base import BaseParser
-
+from parsers.llamaparse import LlamaParseParser
+from parsers.pypdf_parser import PyPDFParser
+from parsers.docx_parser import DocxParser
+from parsers.csv_parser import CsvParser
+from parsers.text_parser import TextParser
+from parsers.url_parser import UrlParser
+        
 logger = get_logger("router")
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tiff"}
@@ -39,14 +43,8 @@ class AutoRouter:
         self._register_parsers()
 
     def _register_parsers(self):
-        """Import and register all available parsers."""
-        from parsers.llamaparse import LlamaParseParser
-        from parsers.pypdf_parser import PyPDFParser
-        from parsers.docx_parser import DocxParser
-        from parsers.csv_parser import CsvParser
-        from parsers.text_parser import TextParser
-        from parsers.url_parser import UrlParser
-
+        """register all available parsers."""
+       
         self._parsers = [
             LlamaParseParser(),
             PyPDFParser(),

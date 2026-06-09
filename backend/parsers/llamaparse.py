@@ -1,6 +1,4 @@
 """
-backend/parsers/llamaparse.py
-
 Handles PDFs (text + scanned) and images via the LlamaParse cloud API.
 Falls back signals to AutoRouter if LLAMA_CLOUD_API_KEY is not set.
 """
@@ -13,6 +11,7 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError
 from parsers.base import BaseParser
+from llama_parse import LlamaParse
 
 logger = get_logger("llamaparse")
 
@@ -35,7 +34,6 @@ class LlamaParseParser(BaseParser):
         file_name = os.path.basename(file_path)
 
         try:
-            from llama_parse import LlamaParse
             parser = LlamaParse(
                 api_key=config.llama_cloud_api_key,
                 result_type="markdown",

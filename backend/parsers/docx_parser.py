@@ -1,6 +1,4 @@
 """
-backend/parsers/docx_parser.py
-
 Handles .docx files via python-docx.
 Extracts paragraphs and tables, preserving structure.
 """
@@ -13,6 +11,7 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError
 from parsers.base import BaseParser
+from docx import Document as DocxDocument
 
 logger = get_logger("docx")
 
@@ -33,7 +32,6 @@ class DocxParser(BaseParser):
         file_name = os.path.basename(file_path)
 
         try:
-            from docx import Document as DocxDocument
             doc = DocxDocument(file_path)
         except Exception as e:
             raise ParseError(

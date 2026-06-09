@@ -1,6 +1,4 @@
 """
-backend/parsers/text_parser.py
-
 Handles .txt, .md, and .rtf files.
 No external dependencies beyond striprtf for RTF.
 """
@@ -13,6 +11,7 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError
 from parsers.base import BaseParser
+from striprtf.striprtf import rtf_to_text
 
 logger = get_logger("text")
 
@@ -93,7 +92,6 @@ class TextParser(BaseParser):
     def _read_file(self, file_path: str, ext: str, file_name: str) -> str:
         try:
             if ext == ".rtf":
-                from striprtf.striprtf import rtf_to_text
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     return rtf_to_text(f.read())
             else:

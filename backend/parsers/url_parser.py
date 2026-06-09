@@ -1,6 +1,4 @@
 """
-backend/parsers/url_parser.py
-
 Handles URLs — fetches and extracts text via httpx + BeautifulSoup.
 Special-cases Wikipedia URLs to use the Wikipedia API for clean text.
 """
@@ -14,7 +12,9 @@ from core.config import Config
 from core.logger import get_logger
 from core.errors import ParseError
 from parsers.base import BaseParser
-
+import httpx
+from bs4 import BeautifulSoup
+     
 logger = get_logger("url")
 
 CHUNK_SIZE = 3000
@@ -120,7 +120,6 @@ class UrlParser(BaseParser):
 
         page_title = wiki_match.group(1).split("#")[0]
         try:
-            import httpx
             r = httpx.get(
                 "https://en.wikipedia.org/w/api.php",
                 params={
@@ -153,9 +152,7 @@ class UrlParser(BaseParser):
     def _fetch_generic(self, url: str) -> tuple[str, str]:
         """Generic HTML fetch and text extraction via BeautifulSoup."""
         try:
-            import httpx
-            from bs4 import BeautifulSoup
-
+            
             headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
