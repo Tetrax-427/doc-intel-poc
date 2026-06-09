@@ -2,6 +2,12 @@ import os
 import time
 import json
 from dotenv import load_dotenv
+from groq import Groq
+from openai import OpenAI
+import anthropic
+from llm.usage import log_usage
+import base64
+        
 
 load_dotenv()
 
@@ -16,13 +22,10 @@ RETRY_DELAY = 2  # seconds
 def _get_client():
     """Return the right LLM client based on provider"""
     if LLM_PROVIDER == "groq":
-        from groq import Groq
         return Groq(api_key=os.getenv("GROQ_API_KEY"))
     elif LLM_PROVIDER == "openai":
-        from openai import OpenAI
         return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     elif LLM_PROVIDER == "anthropic":
-        import anthropic
         return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     else:
         raise ValueError(f"Unknown LLM provider: {LLM_PROVIDER}")
@@ -52,7 +55,6 @@ def call_llm(
     Returns:
         str | dict | generator depending on json_mode and stream
     """
-    from llm.usage import log_usage
 
     messages = []
     if system:
@@ -100,7 +102,7 @@ def call_llm(
                 print(f"LLM call failed (attempt {attempt+1}): {e}")
                 if attempt == MAX_RETRIES - 1:
                     raise
-                time.sleep(RETRY_DELAY)
+                time.sleep(RETRY_DELAY*(attempt+1))
 
     raise Exception("LLM call failed after max retries")
 
@@ -177,9 +179,6 @@ def call_vision_llm(
         return ""
 
     try:
-        import base64
-        from llm.usage import log_usage
-
         # Read and encode image
         with open(image_path, "rb") as f:
             image_data = base64.b64encode(f.read()).decode("utf-8")
@@ -196,7 +195,6 @@ def call_vision_llm(
         start_time = time.time()
 
         if vision_provider == "openai":
-            from openai import OpenAI
             client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             response = client.chat.completions.create(
                 model=vision_model,
@@ -214,7 +212,6 @@ def call_vision_llm(
             description = response.choices[0].message.content
 
         elif vision_provider == "anthropic":
-            import anthropic
             client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
             response = client.messages.create(
                 model=vision_model,

@@ -1,7 +1,6 @@
-import os
-import time
 from datetime import datetime
 from dotenv import load_dotenv
+from db import supabase
 
 load_dotenv()
 
@@ -24,7 +23,6 @@ def log_usage(call_type: str, model: str, prompt_len: int, response_len: int, la
 
     # Persist to Supabase
     try:
-        from db import supabase
         supabase.table("usage_logs").insert(entry).execute()
     except Exception as e:
         pass  # fail silently — don't break the app over logging
