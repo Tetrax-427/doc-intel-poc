@@ -8,21 +8,21 @@ Endpoints:
     GET    /summary/{document_id}
     GET    /documents/{document_id}/classification
     POST   /documents/{document_id}/classification
+
+Fix 2: auth dependency added to /upload, /ingest-url, /documents.
+       user_id threaded through to db and ingestion calls.
 """
 
 import os
 import shutil
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from pydantic import BaseModel, validator
 
+from core.auth import get_current_user, get_user_id
 from core.responses import (
-    bad_request,
-    error_response,
-    internal_error,
-    not_found,
-    success_response,
-    unsupported_file_type,
+    bad_request, error_response, internal_error,
+    not_found, success_response, unsupported_file_type,
 )
 
 router = APIRouter(tags=["Documents"])
@@ -57,10 +57,9 @@ class ClassificationOverrideRequest(BaseModel):
 
 def _run_post_ingest(document_id: str, result: dict) -> dict:
     """
-    After ingestion succeeds, run summary generation and document classification.
+    After ingestion succeeds, run summary generation and classification.
     Both are non-blocking — failures are logged but don't fail the request.
     """
-    # Summary
     try:
         from retrieval import generate_summary
         from db import save_summary
@@ -70,7 +69,6 @@ def _run_post_ingest(document_id: str, result: dict) -> dict:
     except Exception as exc:
         print(f"[documents] Summary generation failed (non-blocking): {exc}")
 
-    # Classification
     try:
         from retrieval import classify_document
         from db import save_classification
@@ -91,11 +89,14 @@ async def upload_document(
     file: UploadFile = File(...),
     use_llamaparse: str = Form("True"),
     vision_template: str = Form("general"),
+    user=Depends(get_current_user),           # Fix 2
 ):
     """
     Upload and ingest a document file.
-    Supported types: PDF, DOCX, TXT, CSV, XLSX, RTF, MD, PNG, JPG, JPEG, WEBP, TIFF.
+    Supported: PDF, DOCX, TXT, CSV, XLSX, RTF, MD, PNG, JPG, JPEG, WEBP, TIFF.
     """
+    uid = get_user_id(user)                   # Fix 2 — "anonymous" in dev mode
+
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         return unsupported_file_type(ext)
@@ -110,7 +111,12 @@ async def upload_document(
     try:
         from ingestion import ingest_file
         use_lp = use_llamaparse.lower() == "true"
-        result = ingest_file(temp_path, use_llamaparse=use_lp, vision_template=vision_template)
+        result = ingest_file(
+            temp_path,
+            use_llamaparse=use_lp,
+            vision_template=vision_template,
+            user_id=uid,                      # Fix 2
+        )
     except Exception as exc:
         return internal_error(f"Ingestion failed: {exc}")
 
@@ -122,11 +128,16 @@ async def upload_document(
 
 
 @router.post("/ingest-url")
-async def ingest_from_url(req: URLRequest):
+async def ingest_from_url(
+    req: URLRequest,
+    user=Depends(get_current_user),           # Fix 2
+):
     """Ingest a document from a public URL."""
+    uid = get_user_id(user)
+
     try:
         from ingestion import ingest_url
-        result = ingest_url(req.url)
+        result = ingest_url(req.url, user_id=uid)   # Fix 2
     except Exception as exc:
         return internal_error(f"URL ingestion failed: {exc}")
 
@@ -142,27 +153,24 @@ def list_documents(
     doc_type: str | None = None,
     requires_review: bool | None = None,
     limit: int = 50,
+    user=Depends(get_current_user),           # Fix 2
 ):
     """
-    List documents, ordered newest-first.
+    List documents for the current user, ordered newest-first.
     Supports filtering: ?doc_type=invoice  and/or  ?requires_review=true
     """
-    from db import supabase
+    uid = get_user_id(user)
+    from db import get_all_documents
 
-    query = (
-        supabase.table("documents")
-        .select("id, name, summary_short, doc_type, classification_confidence, requires_review, created_at")
-        .order("created_at", desc=True)
-        .limit(limit)
-    )
+    # get_all_documents handles user scoping; apply extra filters after
+    docs = get_all_documents(user_id=uid)     # Fix 2
 
     if doc_type:
-        query = query.eq("doc_type", doc_type)
+        docs = [d for d in docs if d.get("doc_type") == doc_type]
     if requires_review is not None:
-        query = query.eq("requires_review", requires_review)
+        docs = [d for d in docs if d.get("requires_review") == requires_review]
 
-    result = query.execute()
-    return result.data or []
+    return docs[:limit]
 
 
 @router.delete("/documents/{document_id}")
@@ -175,9 +183,7 @@ def delete_document(document_id: str):
 
 @router.get("/summary/{document_id}")
 def get_doc_summary(document_id: str):
-    """
-    Return the document summary. If none exists yet, generate it on demand.
-    """
+    """Return the document summary. Generates on demand if not cached."""
     import json
     from db import get_summary, save_summary
     from retrieval import generate_summary
@@ -197,10 +203,7 @@ def get_doc_summary(document_id: str):
     except Exception:
         parsed = {}
 
-    return {
-        "summary_short": data.get("summary_short", ""),
-        "details": parsed,
-    }
+    return {"summary_short": data.get("summary_short", ""), "details": parsed}
 
 
 # ── Classification endpoints ──────────────────────────────────────────────────
@@ -217,13 +220,9 @@ def get_doc_classification(document_id: str):
 
 @router.post("/documents/{document_id}/classification")
 def override_classification(document_id: str, body: ClassificationOverrideRequest):
-    """
-    Manually override classification.
-    Sets confidence to 1.0 and clears the requires_review flag.
-    """
+    """Manually override classification. Sets confidence 1.0, clears requires_review."""
     from db import save_classification, get_classification
 
-    # Pull existing data so we don't wipe reasoning/key_signals
     existing = get_classification(document_id) or {}
     existing_data = existing.get("classification_data") or {}
 

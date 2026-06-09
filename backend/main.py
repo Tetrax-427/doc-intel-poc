@@ -2,14 +2,9 @@
 main.py
 FastAPI application entry point.
 
-Responsibilities:
-- Create the app instance
-- Register CORS middleware
-- Register API-key auth middleware
-- Mount all routers
-- Run startup warmup (embedding model pre-load + task queue start)
-
-All route logic lives in routers/. Nothing else belongs here.
+Phase 2 fixes:
+- Fix 5: CORS tightened — reads STREAMLIT_URL from env; falls back to wildcard
+         only when not set (dev mode). Set STREAMLIT_URL in Railway after deploy.
 """
 
 import os
@@ -28,11 +23,6 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def verify_api_key(api_key: str = Security(api_key_header)):
-    """
-    Validate API key when provided.
-    No key = UI/browser mode — allowed through.
-    Invalid key = 401.
-    """
     if not api_key:
         return None
     from api_keys import validate_api_key
@@ -50,11 +40,22 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS — open during initial deploy; tighten to Streamlit Cloud domain after
-# first successful end-to-end test on live URL.
+# Fix 5 — CORS: specific domain in prod, wildcard only in dev
+_streamlit_url = os.getenv("STREAMLIT_URL", "").strip()
+ALLOWED_ORIGINS = (
+    [
+        _streamlit_url,
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ]
+    if _streamlit_url
+    else ["*"]   # dev fallback — set STREAMLIT_URL in Railway to lock down
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=bool(_streamlit_url),  # only send credentials in prod
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -62,12 +63,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def warmup():
-    """
-    Server startup tasks:
-    1. Start the async task queue.
-       Fails silently so the server starts regardless of whether queue is ready.
-    2. Pre-load the embedding model so the first request isn't slow.
-    """
     # Task queue — guarded import; queue.py may not exist yet
     try:
         from core.queue import task_queue
@@ -78,7 +73,6 @@ async def warmup():
     except Exception as exc:
         print(f"[startup] Task queue failed to start: {exc} — continuing.")
 
-    # Embedding model warmup
     print("[startup] Warming up embedding model...")
     from ingestion import get_embed_model
     get_embed_model()

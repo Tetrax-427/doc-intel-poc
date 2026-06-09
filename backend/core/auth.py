@@ -35,6 +35,21 @@ class UserContext:
     is_dev: bool = False   # True when running without Clerk configured
 
 
+def get_user_id(user) -> str:
+    """
+    Extract user_id from a UserContext or dict safely.
+    Returns 'anonymous' for None or missing key.
+ 
+    Accepts both UserContext (dataclass) and dict for flexibility.
+    """
+    if user is None:
+        return "anonymous"
+    if isinstance(user, UserContext):
+        return user.user_id or "anonymous"
+    if isinstance(user, dict):
+        return user.get("user_id", "anonymous")
+    return "anonymous"
+ 
 # ── Clerk JWT verification ────────────────────────────────────────────────────
 
 def _verify_clerk_token(token: str) -> UserContext:
