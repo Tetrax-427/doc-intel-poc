@@ -2,9 +2,14 @@
 main.py
 FastAPI application entry point.
 
-Phase 2 fixes:
-- Fix 5: CORS tightened — reads STREAMLIT_URL from env; falls back to wildcard
-         only when not set (dev mode). Set STREAMLIT_URL in Railway after deploy.
+Responsibilities:
+- Create the app instance
+- Register CORS middleware
+- Register API-key auth middleware
+- Mount all routers
+- Run startup warmup (embedding model pre-load + task queue start)
+
+All route logic lives in routers/. Nothing else belongs here.
 """
 
 import os

@@ -8,9 +8,6 @@ Endpoints:
     GET    /summary/{document_id}
     GET    /documents/{document_id}/classification
     POST   /documents/{document_id}/classification
-
-Fix 2: auth dependency added to /upload, /ingest-url, /documents.
-       user_id threaded through to db and ingestion calls.
 """
 
 import os
@@ -114,8 +111,7 @@ async def upload_document(
         result = ingest_file(
             temp_path,
             use_llamaparse=use_lp,
-            vision_template=vision_template,
-            user_id=uid,                      # Fix 2
+            doc_type=vision_template,
         )
     except Exception as exc:
         return internal_error(f"Ingestion failed: {exc}")
@@ -137,7 +133,7 @@ async def ingest_from_url(
 
     try:
         from ingestion import ingest_url
-        result = ingest_url(req.url, user_id=uid)   # Fix 2
+        result = ingest_url(req.url)
     except Exception as exc:
         return internal_error(f"URL ingestion failed: {exc}")
 
