@@ -1,5 +1,4 @@
 """
-core/responses.py
 Consistent response shapes for all API endpoints.
 Every error goes through error_response(); every success through success_response().
 """

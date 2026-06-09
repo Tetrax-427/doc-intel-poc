@@ -1,15 +1,10 @@
 """
-backend/core/document.py
-
 The central data model for DocIntel.
 Every parser returns a Document. Every downstream component consumes a Document.
 This is the shared contract between all parts of the system.
-
-COMMIT EARLY — do not change the public interface after committing
-without team discussion.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime, timezone
 

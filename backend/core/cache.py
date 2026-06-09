@@ -1,5 +1,3 @@
-# backend/core/cache.py
-
 import time
 import hashlib
 import threading

@@ -1,5 +1,4 @@
 """
-core/auth.py
 Clerk JWT authentication for DocIntel.
 
 Usage in FastAPI routes:
@@ -23,6 +22,8 @@ from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import jwt                         
+import requests as _requests        
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -46,17 +47,14 @@ def _verify_clerk_token(token: str) -> UserContext:
     Raises HTTPException(401) on any verification failure so the
     caller can return immediately without extra error handling.
     """
-    import jwt                          # PyJWT — already in requirements
-    import requests as _requests        # standard requests
 
-    clerk_secret = os.getenv("CLERK_SECRET_KEY", "")
     jwks_url = "https://api.clerk.dev/v1/jwks"
 
     try:
-        # Fetch JWKS — Clerk rotates keys occasionally so we fetch live
+        # Fetch JWKS — 
         jwks_resp = _requests.get(jwks_url, timeout=5)
         jwks_resp.raise_for_status()
-        jwks = jwks_resp.json()
+        
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

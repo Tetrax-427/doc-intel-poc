@@ -23,7 +23,7 @@ class Config:
     llama_cloud_api_key: str
     cohere_api_key: str
 
-    # Supabase (required)
+    # Supabase 
     supabase_url: str
     supabase_key: str
 
