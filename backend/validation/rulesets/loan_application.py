@@ -1,5 +1,3 @@
-# backend/validation/rulesets/loan_application.py
-
 from validation.rules.arithmetic import PositiveAmountRule
 from validation.rules.logic import ConditionalRequiredRule, NotFutureDateRule
 from validation.rules.completeness import RequiredFieldsRule, MinLengthRule

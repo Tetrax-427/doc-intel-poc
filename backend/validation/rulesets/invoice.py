@@ -1,5 +1,3 @@
-# backend/validation/rulesets/invoice.py
-
 from validation.rules.arithmetic import SumRule, TotalConsistencyRule, PositiveAmountRule
 from validation.rules.logic import DateOrderRule, NotFutureDateRule
 from validation.rules.completeness import RequiredFieldsRule, NoEmptyListRule

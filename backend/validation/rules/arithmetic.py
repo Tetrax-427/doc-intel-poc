@@ -1,5 +1,3 @@
-# backend/validation/rules/arithmetic.py
-
 from validation.rules.base import BaseRule, ValidationResult
 
 

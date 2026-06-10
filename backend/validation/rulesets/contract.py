@@ -1,5 +1,3 @@
-# backend/validation/rulesets/contract.py
-
 from validation.rules.logic import DateOrderRule, NotFutureDateRule
 from validation.rules.completeness import RequiredFieldsRule, NoEmptyListRule, MinLengthRule
 

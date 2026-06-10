@@ -1,5 +1,3 @@
-# backend/validation/rules/logic.py
-
 import re
 from datetime import datetime
 from validation.rules.base import BaseRule, ValidationResult

@@ -1,5 +1,3 @@
-# backend/validation/rules/completeness.py
-
 from validation.rules.base import BaseRule, ValidationResult
 
 

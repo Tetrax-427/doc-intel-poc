@@ -1,5 +1,3 @@
-# backend/validation/rulesets/cv_resume.py
-
 from validation.rules.logic import RegexRule
 from validation.rules.completeness import RequiredFieldsRule, NoEmptyListRule, MinLengthRule
 

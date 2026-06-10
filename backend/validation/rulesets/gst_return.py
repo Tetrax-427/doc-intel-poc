@@ -1,5 +1,3 @@
-# backend/validation/rulesets/gst_return.py
-
 from validation.rules.arithmetic import GSTConsistencyRule, PositiveAmountRule
 from validation.rules.logic import RegexRule
 from validation.rules.completeness import RequiredFieldsRule

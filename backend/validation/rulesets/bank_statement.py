@@ -1,5 +1,3 @@
-# backend/validation/rulesets/bank_statement.py
-
 from validation.rules.arithmetic import PositiveAmountRule
 from validation.rules.completeness import RequiredFieldsRule, MinLengthRule
 
