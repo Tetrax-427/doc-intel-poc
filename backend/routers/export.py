@@ -1,5 +1,4 @@
 """
-routers/export.py
 Endpoints:
     POST /export/pdf
     POST /export/docx
@@ -10,7 +9,8 @@ from fastapi.responses import Response
 from pydantic import BaseModel, validator
 
 from core.responses import internal_error
-
+from export import export_chat_pdf,export_chat_docx
+ 
 router = APIRouter(tags=["Export"])
 
 
@@ -42,7 +42,6 @@ class ExportRequest(BaseModel):
 def export_pdf(req: ExportRequest):
     """Export a chat conversation as a formatted PDF report."""
     try:
-        from export import export_chat_pdf
         pdf_bytes = export_chat_pdf(req.file_name, req.messages, req.summary)
     except Exception as exc:
         return internal_error(f"PDF export failed: {exc}")
@@ -60,7 +59,6 @@ def export_pdf(req: ExportRequest):
 def export_docx(req: ExportRequest):
     """Export a chat conversation as a formatted Word document."""
     try:
-        from export import export_chat_docx
         docx_bytes = export_chat_docx(req.file_name, req.messages, req.summary)
     except Exception as exc:
         return internal_error(f"DOCX export failed: {exc}")

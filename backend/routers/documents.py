@@ -1,5 +1,4 @@
 """
-routers/documents.py
 Endpoints:
     POST   /upload
     POST   /ingest-url
@@ -18,9 +17,18 @@ from pydantic import BaseModel, validator
 
 from core.auth import get_current_user, get_user_id
 from core.responses import (
-    bad_request, error_response, internal_error,
-    not_found, success_response, unsupported_file_type,
+     error_response, internal_error, unsupported_file_type,
 )
+from retrieval import generate_summary,classify_document
+from db import (
+    save_summary,save_classification, get_classification,
+    get_summary,
+    get_all_documents, delete_document_by_id
+)
+from ingestion import ingest_file, ingest_url
+import json
+    
+
 
 router = APIRouter(tags=["Documents"])
 
@@ -57,9 +65,7 @@ def _run_post_ingest(document_id: str, result: dict) -> dict:
     After ingestion succeeds, run summary generation and classification.
     Both are non-blocking — failures are logged but don't fail the request.
     """
-    try:
-        from retrieval import generate_summary
-        from db import save_summary
+    try: 
         summary_data = generate_summary(document_id)
         save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
         result["summary_short"] = summary_data["summary_short"]
@@ -67,8 +73,6 @@ def _run_post_ingest(document_id: str, result: dict) -> dict:
         print(f"[documents] Summary generation failed (non-blocking): {exc}")
 
     try:
-        from retrieval import classify_document
-        from db import save_classification
         classification = classify_document(document_id)
         save_classification(document_id, classification)
         result["classification"] = classification
@@ -92,7 +96,6 @@ async def upload_document(
     Upload and ingest a document file.
     Supported: PDF, DOCX, TXT, CSV, XLSX, RTF, MD, PNG, JPG, JPEG, WEBP, TIFF.
     """
-    uid = get_user_id(user)                   # Fix 2 — "anonymous" in dev mode
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -106,7 +109,6 @@ async def upload_document(
         return internal_error(f"Could not save uploaded file: {exc}")
 
     try:
-        from ingestion import ingest_file
         use_lp = use_llamaparse.lower() == "true"
         result = ingest_file(
             temp_path,
@@ -126,13 +128,11 @@ async def upload_document(
 @router.post("/ingest-url")
 async def ingest_from_url(
     req: URLRequest,
-    user=Depends(get_current_user),           # Fix 2
+    user=Depends(get_current_user),          
 ):
     """Ingest a document from a public URL."""
-    uid = get_user_id(user)
-
+    
     try:
-        from ingestion import ingest_url
         result = ingest_url(req.url)
     except Exception as exc:
         return internal_error(f"URL ingestion failed: {exc}")
@@ -149,15 +149,14 @@ def list_documents(
     doc_type: str | None = None,
     requires_review: bool | None = None,
     limit: int = 50,
-    user=Depends(get_current_user),           # Fix 2
+    user=Depends(get_current_user),          
 ):
     """
     List documents for the current user, ordered newest-first.
     Supports filtering: ?doc_type=invoice  and/or  ?requires_review=true
     """
     uid = get_user_id(user)
-    from db import get_all_documents
-
+    
     # get_all_documents handles user scoping; apply extra filters after
     docs = get_all_documents(user_id=uid)     # Fix 2
 
@@ -172,7 +171,6 @@ def list_documents(
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str):
     """Permanently delete a document and all its chunks and chats."""
-    from db import delete_document_by_id
     delete_document_by_id(document_id)
     return {"status": "deleted", "document_id": document_id}
 
@@ -180,10 +178,6 @@ def delete_document(document_id: str):
 @router.get("/summary/{document_id}")
 def get_doc_summary(document_id: str):
     """Return the document summary. Generates on demand if not cached."""
-    import json
-    from db import get_summary, save_summary
-    from retrieval import generate_summary
-
     data = get_summary(document_id)
 
     if not data.get("summary"):
@@ -207,7 +201,6 @@ def get_doc_summary(document_id: str):
 @router.get("/documents/{document_id}/classification")
 def get_doc_classification(document_id: str):
     """Return the stored classification for a document."""
-    from db import get_classification
     classification = get_classification(document_id)
     if not classification:
         return {"doc_type": "general", "confidence": 0.0, "requires_review": False}
@@ -217,8 +210,7 @@ def get_doc_classification(document_id: str):
 @router.post("/documents/{document_id}/classification")
 def override_classification(document_id: str, body: ClassificationOverrideRequest):
     """Manually override classification. Sets confidence 1.0, clears requires_review."""
-    from db import save_classification, get_classification
-
+    
     existing = get_classification(document_id) or {}
     existing_data = existing.get("classification_data") or {}
 

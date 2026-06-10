@@ -1,5 +1,4 @@
 """
-routers/extraction.py
 Endpoints:
     POST  /extract
     POST  /extract/nl
@@ -15,6 +14,10 @@ from fastapi import APIRouter
 from pydantic import BaseModel, validator
 
 from core.responses import bad_request, error_response, internal_error, not_found
+from retrieval import extract_fields,nl_to_schema, extract_nl,extract_tables
+from webhooks import trigger_webhooks, trigger_webhooks
+from schemas.templates import list_templates
+from db import get_classification, save_correction,supabase
 
 router = APIRouter(tags=["Extraction"])
 
@@ -89,9 +92,6 @@ def extract(req: ExtractRequest):
     Extract structured fields from a document using a field schema dict.
     Each key is a field name; each value is a description of what to extract.
     """
-    from retrieval import extract_fields
-    from webhooks import trigger_webhooks
-
     try:
         result = extract_fields(req.document_id, req.fields)
     except Exception as exc:
@@ -113,8 +113,7 @@ def extract_natural_language(req: NLExtractRequest):
     Converts a plain-English instruction to a field schema, then extracts.
     Set preview_only=true to return the generated schema without extracting.
     """
-    from retrieval import nl_to_schema, extract_nl
-    from webhooks import trigger_webhooks
+    
 
     if req.preview_only:
         try:
@@ -148,8 +147,6 @@ def batch_extract(req: BatchExtractRequest):
     Runs sequentially.
     Provide either `fields` (schema dict) or `instruction` (natural language).
     """
-    from retrieval import extract_fields, extract_nl
-    from webhooks import trigger_webhooks
 
     if not req.fields and not req.instruction:
         return bad_request(
@@ -195,14 +192,12 @@ def batch_extract(req: BatchExtractRequest):
 @router.get("/templates")
 def get_templates():
     """List all available extraction templates."""
-    from schemas.templates import list_templates
     return list_templates()
 
 
 @router.get("/templates/{template_id}")
 def get_template(template_id: str):
     """Return a single extraction template by ID."""
-    from schemas.templates import get_template
     template = get_template(template_id)
     if not template:
         return not_found(f"Template '{template_id}'")
@@ -215,7 +210,7 @@ def get_tables(document_id: str):
     Extract and return all tables found in a document as structured JSON.
     Each table includes headers, rows, and a suggested chart type.
     """
-    from retrieval import extract_tables
+
     try:
         tables = extract_tables(document_id)
         return {"tables": tables}
@@ -232,8 +227,7 @@ def submit_review(document_id: str, actions: list[ReviewAction]):
     Persists each decision to review_corrections so the feedback loop
     can inject past corrections into future extraction prompts.
     """
-    from db import save_correction, get_classification
-
+    
     cls = get_classification(document_id)
     doc_type = cls.get("doc_type", "general") if cls else "general"
 
@@ -262,7 +256,7 @@ def get_corrections(document_id: str):
     Return all review corrections saved for a document, newest-first.
     Used by the frontend to show review history.
     """
-    from db import supabase
+    
     result = (
         supabase.table("review_corrections")
         .select("*")

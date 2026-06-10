@@ -1,5 +1,4 @@
 """
-routers/integration.py
 Endpoints:
     POST   /api-keys
     GET    /api-keys
@@ -20,8 +19,12 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 from pydantic import BaseModel, validator
 
-from core.responses import error_response, internal_error, not_found
+from core.responses import internal_error, not_found
+from api_keys import create_api_key,revoke_api_key,list_api_keys
+from db import supabase
+from webhooks import send_webhook
 
+    
 router = APIRouter(tags=["Integration"])
 
 
@@ -76,32 +79,28 @@ class CreateWebhookRequest(BaseModel):
 @router.post("/api-keys")
 def create_key(req: CreateKeyRequest):
     """Generate a new API key."""
-    from api_keys import create_api_key
     return create_api_key(req.name, req.rate_limit)
 
 
 @router.get("/api-keys")
 def list_keys():
     """List all active API keys (hashed — raw key is only shown at creation)."""
-    from api_keys import list_api_keys
     return list_api_keys()
 
 
 @router.delete("/api-keys/{key_id}")
 def revoke_key(key_id: str):
     """Revoke (deactivate) an API key by ID."""
-    from api_keys import revoke_api_key
     revoke_api_key(key_id)
     return {"status": "revoked", "key_id": key_id}
 
 
 # ── Webhook routes ────────────────────────────────────────────────────────────
-# IMPORTANT: /webhooks/logs is registered first to avoid path-param collision.
+# /webhooks/logs is registered first to avoid path-param collision.
 
 @router.get("/webhooks/logs")
 def webhook_logs():
     """Return the 50 most recent webhook delivery log entries."""
-    from db import supabase
     result = (
         supabase.table("webhook_logs")
         .select("*")
@@ -115,7 +114,6 @@ def webhook_logs():
 @router.post("/webhooks")
 def create_webhook(req: CreateWebhookRequest):
     """Register a new webhook endpoint."""
-    from db import supabase
     try:
         result = supabase.table("webhooks").insert({
             "name": req.name,
@@ -131,7 +129,6 @@ def create_webhook(req: CreateWebhookRequest):
 @router.get("/webhooks")
 def list_webhooks():
     """List all registered webhooks."""
-    from db import supabase
     result = (
         supabase.table("webhooks")
         .select("id, name, url, events, is_active, last_triggered, fail_count, created_at")
@@ -144,7 +141,6 @@ def list_webhooks():
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: str):
     """Permanently delete a webhook."""
-    from db import supabase
     supabase.table("webhooks").delete().eq("id", webhook_id).execute()
     return {"status": "deleted", "webhook_id": webhook_id}
 
@@ -152,9 +148,6 @@ def delete_webhook(webhook_id: str):
 @router.post("/webhooks/{webhook_id}/test")
 def test_webhook(webhook_id: str):
     """Send a test ping to a webhook to verify it's reachable."""
-    from db import supabase
-    from webhooks import send_webhook
-
     result = supabase.table("webhooks").select("*").eq("id", webhook_id).execute()
     if not result.data:
         return not_found("Webhook")

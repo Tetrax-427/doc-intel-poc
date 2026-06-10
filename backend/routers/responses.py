@@ -1,5 +1,4 @@
 """
-core/responses.py
 Consistent response shapes for all API endpoints.
 Every error goes through error_response(); every success through success_response().
 """
@@ -14,7 +13,6 @@ def error_response(
 ) -> JSONResponse:
     """
     Return a uniform error envelope.
-
     Shape:
         { "error": true, "message": "...", "code": "SNAKE_CASE_CODE" }
     """
@@ -31,7 +29,6 @@ def error_response(
 def success_response(data: dict, message: str = "") -> dict:
     """
     Return a uniform success envelope.
-
     Shape:
         { "error": false, "message": "...", "data": { ... } }
     """
