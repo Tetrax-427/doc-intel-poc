@@ -1,9 +1,8 @@
 """
-db.py
 Supabase client and all table helpers.
 
 - insert_document, get_all_documents, get_all_chunks accept user_id for workspace scoping
-- Added: save_correction, get_corrections_for_doc_type
+- save_correction, get_corrections_for_doc_type
 """
 
 import os

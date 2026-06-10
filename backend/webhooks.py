@@ -5,6 +5,7 @@ import hashlib
 import httpx
 from datetime import datetime
 from dotenv import load_dotenv
+from db import supabase
 
 load_dotenv()
 
@@ -21,7 +22,6 @@ def sign_payload(payload: str, secret: str) -> str:
 def get_active_webhooks(event: str) -> list[dict]:
     """Get all active webhooks subscribed to an event"""
     try:
-        from db import supabase
         result = supabase.table("webhooks")\
             .select("*")\
             .eq("is_active", True)\
@@ -36,7 +36,6 @@ def get_active_webhooks(event: str) -> list[dict]:
 def log_webhook(webhook_id: str, event: str, payload: dict, status: int, success: bool):
     """Log webhook delivery attempt"""
     try:
-        from db import supabase
         supabase.table("webhook_logs").insert({
             "webhook_id": webhook_id,
             "event": event,

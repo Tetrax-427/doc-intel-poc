@@ -12,13 +12,19 @@ from prompts import (
     QA_PROMPT, QA_PROMPT_MULTI, GENERAL_PROMPT,
     CLASSIFIER_PROMPT, QUERY_EXPANSION_PROMPT, EXTRACTION_PROMPT
 )
+from db import get_corrections_for_doc_type
 from llm.engine import call_llm, call_llm_stream
-
+from schemas.validator import validate_extraction
+from validation.engine import ValidationEngine
 load_dotenv()
+from core.logger import get_logger as _get_logger
+from schemas.templates import get_template_for_doc_type
+from core.config import config as app_config
+from core.cache import get_classification, set_classification, make_text_hash
 
 import cohere
 co = cohere.Client(os.getenv("COHERE_API_KEY"))
-
+_clf_logger = _get_logger("retrieval.classify")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -401,11 +407,7 @@ def build_correction_examples(doc_type: str, fields: dict) -> str:
     is unchanged for documents that haven't been reviewed yet.
     Never raises — DB failures return empty string silently.
     """
-    try:
-        from db import get_corrections_for_doc_type
-    except ImportError:
-        return ""
-
+    
     examples = []
     # Cap field iteration — no point looking up corrections for every field
     # in a very large schema; first 5 cover the most common extraction targets
@@ -465,8 +467,7 @@ def extract_fields(
             "business_validation": Contract 4 shaped result, or {} if not available,
         }
     """
-    from schemas.validator import validate_extraction
-
+    
     # 1. Auto-detect doc_type from stored classification if not explicitly passed
     if doc_type == "general":
         try:
@@ -518,7 +519,6 @@ def extract_fields(
     # 5. Business logic validation — guarded import, never breaks extraction
     business_validation = {}
     try:
-        from validation.engine import ValidationEngine
         engine = ValidationEngine()
         business_validation = engine.validate(extracted, doc_type)
     except ImportError:
@@ -672,13 +672,9 @@ def extract_nl(document_id: str, instruction: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Document classification (Phase 1 — preserved exactly)
+# Document classification 
 # ---------------------------------------------------------------------------
 
-from core.logger import get_logger as _get_logger
-from schemas.templates import get_template_for_doc_type
-
-_clf_logger = _get_logger("retrieval.classify")
 
 DOCUMENT_CLASSIFIER_PROMPT = """You are a document classification expert.
 
@@ -725,7 +721,6 @@ TEMPLATE_MAP = {
 
 def _get_confidence_threshold() -> float:
     try:
-        from core.config import config as app_config
         return float(app_config.classification_confidence_threshold)
     except Exception:
         return 0.75
@@ -754,7 +749,6 @@ def classify_document(document_id: str) -> dict:
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
 
     try:
-        from core.cache import get_classification, set_classification, make_text_hash
         text_hash = make_text_hash(context)
         cached = get_classification(text_hash)
         if cached is not None:

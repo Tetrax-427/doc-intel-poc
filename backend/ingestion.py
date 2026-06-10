@@ -12,8 +12,13 @@ from core.config import config
 from core.logger import get_logger
 from core.errors import ParseError, UnsupportedFileTypeError
 from core.document import ImageElement
+from core.cache import get_embedding, set_embedding
+from vision.triggers import should_use_vision
+from vision.engine import describe_image, describe_pdf_page
 from parsers.router import AutoRouter
 
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+             
 load_dotenv()
 
 logger = get_logger("ingestion")
@@ -36,7 +41,6 @@ def get_embed_model():
         with _model_lock:
             if embed_model is None:
                 logger.info("Loading embedding model (first time only)")
-                from llama_index.embeddings.huggingface import HuggingFaceEmbedding
                 embed_model = HuggingFaceEmbedding(
                     model_name="BAAI/bge-small-en-v1.5",
                     device="cpu"
@@ -63,7 +67,6 @@ def _get_embedding(text: str, model) -> list[float]:
     Falls back to direct model call if cache is unavailable.
     """
     try:
-        from core.cache import get_embedding, set_embedding
         cached = get_embedding(text)
         if cached is not None:
             return cached
@@ -101,8 +104,6 @@ def _run_vision_for_page(
     Never raises.
     """
     try:
-        from vision.triggers import should_use_vision
-        from vision.engine import describe_image, describe_pdf_page
 
         if not should_use_vision(file_path, page.text, is_scanned, doc_type, config):
             return page.images  # vision not needed — return existing (empty) list

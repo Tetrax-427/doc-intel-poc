@@ -3,6 +3,7 @@ import hashlib
 import secrets
 from datetime import date
 from dotenv import load_dotenv
+from db import supabase
 
 load_dotenv()
 
@@ -17,7 +18,6 @@ def generate_api_key() -> tuple[str, str, str]:
 
 def create_api_key(name: str, rate_limit: int = 100) -> dict:
     """Create and store a new API key"""
-    from db import supabase
     key, prefix, key_hash = generate_api_key()
 
     supabase.table("api_keys").insert({
@@ -39,7 +39,6 @@ def create_api_key(name: str, rate_limit: int = 100) -> dict:
 def validate_api_key(key: str) -> tuple[bool, str]:
     """Validate an API key — returns (is_valid, reason)"""
     try:
-        from db import supabase
         key_hash = hashlib.sha256(key.encode()).hexdigest()
         result = supabase.table("api_keys")\
             .select("*")\
@@ -80,7 +79,6 @@ def validate_api_key(key: str) -> tuple[bool, str]:
 
 def list_api_keys() -> list[dict]:
     """List all API keys (without hashes)"""
-    from db import supabase
     result = supabase.table("api_keys")\
         .select("id, name, key_prefix, is_active, rate_limit, calls_today, created_at")\
         .order("created_at", desc=True)\
@@ -90,7 +88,6 @@ def list_api_keys() -> list[dict]:
 
 def revoke_api_key(key_id: str):
     """Revoke an API key"""
-    from db import supabase
     supabase.table("api_keys")\
         .update({"is_active": False})\
         .eq("id", key_id)\

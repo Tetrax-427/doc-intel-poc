@@ -1,15 +1,18 @@
 import json
 from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
 
+from docx import Document
+from docx.shared import Pt, RGBColor, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from io import BytesIO
 
 def export_chat_pdf(file_name: str, messages: list[dict], summary: dict = None) -> bytes:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
-    from io import BytesIO
-
+    
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -121,11 +124,7 @@ def export_chat_pdf(file_name: str, messages: list[dict], summary: dict = None) 
 
 
 def export_chat_docx(file_name: str, messages: list[dict], summary: dict = None) -> bytes:
-    from docx import Document
-    from docx.shared import Pt, RGBColor, Cm
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from io import BytesIO
-
+    
     doc = Document()
 
     # Page margins

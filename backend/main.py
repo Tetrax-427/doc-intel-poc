@@ -1,5 +1,4 @@
 """
-main.py
 FastAPI application entry point.
 
 Responsibilities:
@@ -17,7 +16,9 @@ from fastapi import FastAPI, Security, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
-
+from core.queue import task_queue
+from ingestion import get_embed_model
+    
 from routers import system, documents, query, extraction, export, integration
 
 load_dotenv()
@@ -70,7 +71,6 @@ app.add_middleware(
 async def warmup():
     # Task queue — guarded import; queue.py may not exist yet
     try:
-        from core.queue import task_queue
         task_queue.start()
         print("[startup] Task queue started.")
     except ImportError:
@@ -79,7 +79,6 @@ async def warmup():
         print(f"[startup] Task queue failed to start: {exc} — continuing.")
 
     print("[startup] Warming up embedding model...")
-    from ingestion import get_embed_model
     get_embed_model()
     print("[startup] Embedding model ready.")
 
