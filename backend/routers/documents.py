@@ -1,4 +1,5 @@
 """
+routers/documents.py
 Endpoints:
     POST   /upload
     POST   /ingest-url
@@ -11,24 +12,19 @@ Endpoints:
 
 import os
 import shutil
+import json
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from pydantic import BaseModel, validator
 
 from core.auth import get_current_user, get_user_id
-from core.responses import (
-     error_response, internal_error, unsupported_file_type,
-)
-from retrieval import generate_summary,classify_document
+from core.responses import error_response, internal_error, unsupported_file_type
+from retrieval import generate_summary, classify_document
 from db import (
-    save_summary,save_classification, get_classification,
-    get_summary,
-    get_all_documents, delete_document_by_id
+    save_summary, save_classification, get_classification,
+    get_summary, get_all_documents, delete_document_by_id,
 )
 from ingestion import ingest_file, ingest_url
-import json
-    
-
 
 router = APIRouter(tags=["Documents"])
 
@@ -61,11 +57,8 @@ class ClassificationOverrideRequest(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _run_post_ingest(document_id: str, result: dict) -> dict:
-    """
-    After ingestion succeeds, run summary generation and classification.
-    Both are non-blocking — failures are logged but don't fail the request.
-    """
-    try: 
+    """Run summary + classification after ingestion. Non-blocking."""
+    try:
         summary_data = generate_summary(document_id)
         save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
         result["summary_short"] = summary_data["summary_short"]
@@ -90,13 +83,9 @@ async def upload_document(
     file: UploadFile = File(...),
     use_llamaparse: str = Form("True"),
     vision_template: str = Form("general"),
-    user=Depends(get_current_user),           # Fix 2
+    user=Depends(get_current_user),
 ):
-    """
-    Upload and ingest a document file.
-    Supported: PDF, DOCX, TXT, CSV, XLSX, RTF, MD, PNG, JPG, JPEG, WEBP, TIFF.
-    """
-
+    uid = get_user_id(user)
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         return unsupported_file_type(ext)
@@ -114,6 +103,7 @@ async def upload_document(
             temp_path,
             use_llamaparse=use_lp,
             doc_type=vision_template,
+            user_id=uid,                  # ← scopes document to this user
         )
     except Exception as exc:
         return internal_error(f"Ingestion failed: {exc}")
@@ -128,12 +118,11 @@ async def upload_document(
 @router.post("/ingest-url")
 async def ingest_from_url(
     req: URLRequest,
-    user=Depends(get_current_user),          
+    user=Depends(get_current_user),
 ):
-    """Ingest a document from a public URL."""
-    
+    uid = get_user_id(user)
     try:
-        result = ingest_url(req.url)
+        result = ingest_url(req.url, user_id=uid)
     except Exception as exc:
         return internal_error(f"URL ingestion failed: {exc}")
 
@@ -149,16 +138,10 @@ def list_documents(
     doc_type: str | None = None,
     requires_review: bool | None = None,
     limit: int = 50,
-    user=Depends(get_current_user),          
+    user=Depends(get_current_user),
 ):
-    """
-    List documents for the current user, ordered newest-first.
-    Supports filtering: ?doc_type=invoice  and/or  ?requires_review=true
-    """
-    uid = get_user_id(user)
-    
-    # get_all_documents handles user scoping; apply extra filters after
-    docs = get_all_documents(user_id=uid)     # Fix 2
+    uid  = get_user_id(user)
+    docs = get_all_documents(user_id=uid)
 
     if doc_type:
         docs = [d for d in docs if d.get("doc_type") == doc_type]
@@ -170,16 +153,13 @@ def list_documents(
 
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str):
-    """Permanently delete a document and all its chunks and chats."""
     delete_document_by_id(document_id)
     return {"status": "deleted", "document_id": document_id}
 
 
 @router.get("/summary/{document_id}")
 def get_doc_summary(document_id: str):
-    """Return the document summary. Generates on demand if not cached."""
     data = get_summary(document_id)
-
     if not data.get("summary"):
         try:
             summary_data = generate_summary(document_id)
@@ -196,11 +176,8 @@ def get_doc_summary(document_id: str):
     return {"summary_short": data.get("summary_short", ""), "details": parsed}
 
 
-# ── Classification endpoints ──────────────────────────────────────────────────
-
 @router.get("/documents/{document_id}/classification")
 def get_doc_classification(document_id: str):
-    """Return the stored classification for a document."""
     classification = get_classification(document_id)
     if not classification:
         return {"doc_type": "general", "confidence": 0.0, "requires_review": False}
@@ -209,17 +186,14 @@ def get_doc_classification(document_id: str):
 
 @router.post("/documents/{document_id}/classification")
 def override_classification(document_id: str, body: ClassificationOverrideRequest):
-    """Manually override classification. Sets confidence 1.0, clears requires_review."""
-    
-    existing = get_classification(document_id) or {}
+    existing      = get_classification(document_id) or {}
     existing_data = existing.get("classification_data") or {}
-
     updated = {
         **existing_data,
-        "doc_type": body.doc_type,
-        "schema_template": body.schema_template or body.doc_type,
-        "confidence": 1.0,
-        "manually_overridden": True,
+        "doc_type":              body.doc_type,
+        "schema_template":       body.schema_template or body.doc_type,
+        "confidence":            1.0,
+        "manually_overridden":   True,
         "requires_human_review": False,
     }
     save_classification(document_id, updated)

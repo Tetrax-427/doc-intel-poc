@@ -302,27 +302,237 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state defaults ────────────────────────────────────────────────────
+# ── Session state defaults (REPLACE your existing _defaults block) ────────────
 _defaults = {
-    "document_id":        None,
-    "file_name":          None,
-    "messages":           [],
-    "selected_doc_ids":   [],
-    "multi_mode":         False,
-    "history_summary":    "",
-    "doc_summary":        None,
-    "api_error":          None,
-    "doc_classification": None,
-    "nl_generated_schema": {},
-    "nl_instruction":     "",
-    "injected_schema":    "",
-    "tables":             [],
-    "review_data":        {},
+    "document_id":          None,
+    "file_name":            None,
+    "messages":             [],
+    "selected_doc_ids":     [],
+    "multi_mode":           False,
+    "history_summary":      "",
+    "doc_summary":          None,
+    "api_error":            None,
+    "doc_classification":   None,
+    "nl_generated_schema":  {},
+    "nl_instruction":       "",
+    "injected_schema":      "",
+    "tables":               [],
+    "review_data":          {},
+    # ── Auth ──
+    "auth_token": None,   # JWT from backend
+    "auth_user":  None,   # {"id": "...", "email": "..."}
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
-
+ 
+ 
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+ 
+def _auth_headers() -> dict:
+    """
+    Return Authorization header dict for every API call.
+    Drop this into every requests.get/post/delete call:
+        requests.get(url, headers=_auth_headers(), ...)
+    """
+    if st.session_state.auth_token:
+        return {"Authorization": f"Bearer {st.session_state.auth_token}"}
+    return {}
+ 
+ 
+def _do_login(email: str, password: str) -> str | None:
+    """
+    Call POST /auth/login on the backend.
+    Returns None on success, error message string on failure.
+    """
+    try:
+        res = requests.post(
+            f"{API_URL}/auth/login",
+            json={"email": email, "password": password},headers=_auth_headers(),
+            timeout=15,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            st.session_state.auth_token = data["access_token"]
+            st.session_state.auth_user  = data["user"]
+            return None
+        return res.json().get("detail", "Login failed.")
+    except Exception as e:
+        return f"Could not reach server: {e}"
+ 
+ 
+def _do_signup(email: str, password: str) -> str | None:
+    """
+    Call POST /auth/signup on the backend.
+    Returns None on success, error message string on failure.
+    """
+    try:
+        res = requests.post(
+            f"{API_URL}/auth/signup",
+            json={"email": email, "password": password},headers=_auth_headers(),
+            timeout=15,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            st.session_state.auth_token = data["access_token"]
+            st.session_state.auth_user  = data["user"]
+            return None
+        return res.json().get("detail", "Signup failed.")
+    except Exception as e:
+        return f"Could not reach server: {e}"
+ 
+ 
+def _do_logout():
+    """Clear auth state and rerun."""
+    try:
+        requests.post(
+            f"{API_URL}/auth/logout",
+            headers=_auth_headers(),
+            timeout=5,
+        )
+    except Exception:
+        pass
+    st.session_state.auth_token         = None
+    st.session_state.auth_user          = None
+    st.session_state.document_id        = None
+    st.session_state.file_name          = None
+    st.session_state.messages           = []
+    st.session_state.selected_doc_ids   = []
+    st.session_state.doc_summary        = None
+    st.session_state.doc_classification = None
+    st.rerun()
+ 
+ 
+def _verify_session() -> bool:
+    """
+    Ping GET /auth/me to check the stored token is still valid.
+    Called once on app load. Clears token if expired.
+    """
+    if not st.session_state.auth_token:
+        return False
+    try:
+        res = requests.get(
+            f"{API_URL}/auth/me",
+            headers=_auth_headers(),
+            timeout=5,
+        )
+        if res.status_code == 200:
+            st.session_state.auth_user = res.json()
+            return True
+        # Token expired or invalid — clear it
+        st.session_state.auth_token = None
+        st.session_state.auth_user  = None
+        return False
+    except Exception:
+        return False
+ 
+ 
+# ── Login / Signup page ───────────────────────────────────────────────────────
+ 
+def _render_auth_page():
+    """
+    Full-screen login + signup form.
+    Shown when the user is not authenticated.
+    Pure Streamlit — no Supabase imports needed here.
+    """
+    st.markdown("""
+    <style>
+    .auth-wrap  { max-width:400px; margin:60px auto 0; }
+    .auth-logo  { text-align:center; font-size:48px; margin-bottom:8px; }
+    .auth-title { text-align:center; font-size:26px; font-weight:700;
+                  color:#f1f5f9; margin-bottom:4px; }
+    .auth-sub   { text-align:center; font-size:13px; color:#64748b;
+                  margin-bottom:28px; }
+    .auth-foot  { text-align:center; font-size:12px; color:#475569;
+                  margin-top:20px; }
+    </style>
+    """, unsafe_allow_html=True)
+ 
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.markdown('<div class="auth-logo">📄</div>', unsafe_allow_html=True)
+        st.markdown('<div class="auth-title">DocIntel</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="auth-sub">AI Document Intelligence</div>',
+            unsafe_allow_html=True
+        )
+ 
+        tab_in, tab_up = st.tabs(["Sign In", "Create Account"])
+ 
+        # ── Sign In ──────────────────────────────────────────────────────────
+        with tab_in:
+            with st.form("login_form"):
+                email    = st.text_input("Email",    placeholder="you@company.com")
+                password = st.text_input("Password", placeholder="••••••••", type="password")
+                submit   = st.form_submit_button(
+                    "Sign In", type="primary", use_container_width=True
+                )
+            if submit:
+                if not email or not password:
+                    st.error("Please enter your email and password.")
+                else:
+                    with st.spinner("Signing in…"):
+                        err = _do_login(email.strip(), password)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+ 
+        # ── Create Account ───────────────────────────────────────────────────
+        with tab_up:
+            with st.form("signup_form"):
+                su_email   = st.text_input("Email",            placeholder="you@company.com",  key="su_e")
+                su_pass    = st.text_input("Password",         placeholder="min 8 characters", type="password", key="su_p")
+                su_confirm = st.text_input("Confirm Password", placeholder="repeat password",  type="password", key="su_c")
+                su_submit  = st.form_submit_button(
+                    "Create Account", type="primary", use_container_width=True
+                )
+            if su_submit:
+                if not su_email or not su_pass:
+                    st.error("Please fill in all fields.")
+                elif len(su_pass) < 8:
+                    st.error("Password must be at least 8 characters.")
+                elif su_pass != su_confirm:
+                    st.error("Passwords do not match.")
+                else:
+                    with st.spinner("Creating account…"):
+                        err = _do_signup(su_email.strip(), su_pass)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+ 
+        st.markdown(
+            '<div class="auth-foot">Secure · Each user sees only their own documents</div>',
+            unsafe_allow_html=True
+        )
+ 
+    st.stop()
+ 
+ 
+# ── Auth gate ─────────────────────────────────────────────────────────────────
+# Check if auth is enforced (SUPABASE_JWT_SECRET set on backend)
+# We detect this by trying /auth/me — if it returns 401, auth is required
+ 
+@st.cache_data(ttl=60)
+def _auth_required() -> bool:
+    """Returns True if the backend has auth enabled."""
+    try:
+        res = requests.get(f"{API_URL}/auth/me",headers=_auth_headers(), timeout=5)
+        # 200 = dev mode (no auth required, dev_user returned)
+        # 401 = auth required
+        return res.status_code == 401
+    except Exception:
+        return False
+ 
+# On every page load — verify existing token or show login
+if _auth_required():
+    if not st.session_state.auth_token or not _verify_session():
+        _render_auth_page()
+ 
+# ══════════════════════════════════════════════════════════════════════════════
+# END OF AUTH BLOCK — main app continues below
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Helper functions
@@ -473,20 +683,20 @@ def load_document(doc_id: str, doc_name: str):
     st.session_state.review_data        = {}
 
     try:
-        res = requests.get(f"{API_URL}/chats/{doc_id}", timeout=5)
+        res = requests.get(f"{API_URL}/chats/{doc_id}",headers=_auth_headers(), timeout=5)
         st.session_state.messages = res.json() if res.status_code == 200 else []
     except Exception:
         st.session_state.messages = []
 
     try:
-        res = requests.get(f"{API_URL}/summary/{doc_id}", timeout=15)
+        res = requests.get(f"{API_URL}/summary/{doc_id}",headers=_auth_headers(), timeout=15)
         if res.status_code == 200:
             st.session_state.doc_summary = res.json()
     except Exception:
         pass
 
     try:
-        res = requests.get(f"{API_URL}/documents/{doc_id}/classification", timeout=5)
+        res = requests.get(f"{API_URL}/documents/{doc_id}/classification",headers=_auth_headers(), timeout=5)
         if res.status_code == 200:
             st.session_state.doc_classification = res.json()
     except Exception:
@@ -499,7 +709,7 @@ def maybe_compress_history():
         try:
             res = requests.post(
                 f"{API_URL}/compress",
-                json={"messages": st.session_state.messages[:-4]},
+                json={"messages": st.session_state.messages[:-4]},headers=_auth_headers(),
                 timeout=20,
             )
             if res.status_code == 200:
@@ -532,7 +742,7 @@ def show_upload_success(data: dict):
 @st.cache_data(ttl=10)
 def check_api() -> bool:
     try:
-        res = requests.get(f"{API_URL}/", timeout=5)
+        res = requests.get(f"{API_URL}/", headers=_auth_headers(),timeout=5)
         return res.status_code == 200
     except Exception:
         return False
@@ -595,7 +805,7 @@ with st.sidebar:
                     response  = requests.post(
                         f"{API_URL}/upload",
                         files={"file": (uploaded_file.name, uploaded_file, mime_type)},
-                        data={"use_llamaparse": str(use_llamaparse), "vision_template": vision_template},
+                        data={"use_llamaparse": str(use_llamaparse), "vision_template": vision_template},headers=_auth_headers(),
                         timeout=120,
                     )
                     if response.status_code == 200:
@@ -612,7 +822,7 @@ with st.sidebar:
                                 waited += interval
                                 progress.progress(min(waited / max_wait, 0.9), text=f"Processing… ({waited}s)")
                                 try:
-                                    status_res  = requests.get(f"{API_URL}/tasks/{task_id}", timeout=5)
+                                    status_res  = requests.get(f"{API_URL}/tasks/{task_id}",headers=_auth_headers(), timeout=5)
                                     if status_res.status_code == 200:
                                         status_data = status_res.json()
                                         if status_data.get("status") == "done":
@@ -661,7 +871,7 @@ with st.sidebar:
     if url_input and st.button("🔗 Ingest URL", use_container_width=True, disabled=not api_ok):
         with st.spinner("Fetching and indexing URL…"):
             try:
-                response = requests.post(f"{API_URL}/ingest-url", json={"url": url_input}, timeout=60)
+                response = requests.post(f"{API_URL}/ingest-url", json={"url": url_input}, headers=_auth_headers(),timeout=60)
                 if response.status_code == 200:
                     data = response.json()
                     if data.get("error"):
@@ -690,7 +900,7 @@ with st.sidebar:
         )
 
     try:
-        docs_res = requests.get(f"{API_URL}/documents", timeout=5)
+        docs_res = requests.get(f"{API_URL}/documents",headers=_auth_headers(), timeout=5)
         if docs_res.status_code == 200:
             docs = docs_res.json()
             if docs:
@@ -729,7 +939,7 @@ with st.sidebar:
                     with cols[1]:
                         if st.button("🗑️", key=f"del_{doc['id']}", help="Delete document"):
                             with st.spinner("Deleting…"):
-                                requests.delete(f"{API_URL}/documents/{doc['id']}", timeout=5)
+                                requests.delete(f"{API_URL}/documents/{doc['id']}", headers=_auth_headers(),timeout=5)
                             if st.session_state.document_id == doc["id"]:
                                 for k in ("document_id", "file_name", "messages", "doc_classification"):
                                     st.session_state[k] = [] if k == "messages" else None
@@ -782,7 +992,7 @@ with st.sidebar:
             try:
                 res = requests.post(
                     f"{API_URL}/documents/{st.session_state.document_id}/classification",
-                    json={"doc_type": corrected_type},
+                    json={"doc_type": corrected_type},headers=_auth_headers(),
                     timeout=10,
                 )
                 if res.status_code == 200:
@@ -797,7 +1007,7 @@ with st.sidebar:
 
     # ── Usage stats ───────────────────────────────────────────────────────────
     try:
-        usage_res = requests.get(f"{API_URL}/usage", timeout=3)
+        usage_res = requests.get(f"{API_URL}/usage",headers=_auth_headers(), timeout=3)
         if usage_res.status_code == 200:
             usage = usage_res.json()
             if usage["total_calls"] > 0:
@@ -808,7 +1018,17 @@ with st.sidebar:
                 c2.metric("~Tokens",    f"{usage['total_tokens']:,}")
     except Exception:
         pass
-
+    
+    if st.session_state.auth_user:
+        st.divider()
+        email = st.session_state.auth_user.get("email", "")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.caption(f"👤 {email}")
+        with col2:
+            if st.button("↩", help="Sign out", use_container_width=True):
+                _do_logout()
+                
     st.divider()
     st.markdown('<div style="font-size:11px;color:#475569;text-align:center">DocIntel · v0.1 POC</div>', unsafe_allow_html=True)
 
@@ -916,6 +1136,7 @@ with tab1:
                             "messages":    st.session_state.messages,
                             "summary":     st.session_state.doc_summary or {},
                         },
+                        headers=_auth_headers(),
                         timeout=30,
                     )
                     if res.status_code == 200:
@@ -941,6 +1162,7 @@ with tab1:
                             "messages":    st.session_state.messages,
                             "summary":     st.session_state.doc_summary or {},
                         },
+                        headers=_auth_headers(),
                         timeout=30,
                     )
                     if res.status_code == 200:
@@ -1002,7 +1224,7 @@ with tab1:
             }
 
         save_doc_id = st.session_state.selected_doc_ids[0] if is_multi else st.session_state.document_id
-        requests.post(f"{API_URL}/chats/{save_doc_id}", json={"role": "user", "content": question})
+        requests.post(f"{API_URL}/chats/{save_doc_id}", json={"role": "user", "content": question},headers=_auth_headers(),)
         st.session_state.messages.append({"role": "user", "content": question})
 
         with st.chat_message("user"):
@@ -1020,7 +1242,7 @@ with tab1:
                 with requests.post(
                     f"{API_URL}/query/stream",
                     json=query_payload,
-                    stream=True,
+                    stream=True,headers=_auth_headers(),
                     timeout=60,
                 ) as stream_res:
                     if stream_res.status_code != 200:
@@ -1050,7 +1272,7 @@ with tab1:
             sources = []
             try:
                 status_placeholder.caption("_Fetching sources…_")
-                sources_res = requests.post(f"{API_URL}/query", json=query_payload, timeout=30)
+                sources_res = requests.post(f"{API_URL}/query", json=query_payload,headers=_auth_headers(), timeout=30)
                 status_placeholder.empty()
                 if sources_res.status_code == 200:
                     resp_data   = sources_res.json()
@@ -1067,7 +1289,7 @@ with tab1:
             if full_response:
                 requests.post(
                     f"{API_URL}/chats/{save_doc_id}",
-                    json={"role": "assistant", "content": full_response, "sources": sources},
+                    json={"role": "assistant", "content": full_response, "sources": sources},headers=_auth_headers(),
                 )
                 st.session_state.messages.append({
                     "role":    "assistant",
@@ -1084,7 +1306,7 @@ with tab2:
 
     # ── Load templates ────────────────────────────────────────────────────────
     try:
-        templates_res = requests.get(f"{API_URL}/templates", timeout=5)
+        templates_res = requests.get(f"{API_URL}/templates", headers=_auth_headers(), timeout=5)
         templates     = templates_res.json() if templates_res.status_code == 200 else []
     except Exception:
         templates = []
@@ -1122,7 +1344,7 @@ with tab2:
     # ── Schema editor ─────────────────────────────────────────────────────────
     if selected_template != "custom":
         try:
-            tmpl_res = requests.get(f"{API_URL}/templates/{selected_template}", timeout=5)
+            tmpl_res = requests.get(f"{API_URL}/templates/{selected_template}",headers=_auth_headers(), timeout=5)
             if tmpl_res.status_code == 200:
                 tmpl_data       = tmpl_res.json()
                 template_schema = json.dumps(tmpl_data.get("schema", {}), indent=2)
@@ -1157,7 +1379,7 @@ with tab2:
                 try:
                     res = requests.post(
                         f"{API_URL}/extract",
-                        json={"document_id": st.session_state.document_id, "fields": fields},
+                        json={"document_id": st.session_state.document_id, "fields": fields},headers=_auth_headers(),
                         timeout=45,
                     )
                     if res.status_code == 200:
@@ -1222,6 +1444,7 @@ with tab3:
                 res = requests.post(
                     f"{API_URL}/extract/nl",
                     json={"document_id": st.session_state.document_id, "instruction": instruction, "preview_only": True},
+                    headers=_auth_headers(),
                     timeout=20,
                 )
                 if res.status_code == 200:
@@ -1268,6 +1491,7 @@ with tab3:
                     res = requests.post(
                         f"{API_URL}/extract",
                         json={"document_id": st.session_state.document_id, "fields": edited_schema},
+                        headers=_auth_headers(),
                         timeout=45,
                     )
                     if res.status_code == 200:
@@ -1290,6 +1514,7 @@ with tab3:
                     res = requests.post(
                         f"{API_URL}/extract/nl",
                         json={"document_id": st.session_state.document_id, "instruction": instruction, "preview_only": False},
+                        headers=_auth_headers(),
                         timeout=45,
                     )
                     if res.status_code == 200:
@@ -1319,7 +1544,7 @@ with tab4:
     if st.button("🔍 Extract Tables & Charts", type="primary"):
         with st.spinner("Scanning document for tables…"):
             try:
-                res = requests.get(f"{API_URL}/tables/{st.session_state.document_id}", timeout=30)
+                res = requests.get(f"{API_URL}/tables/{st.session_state.document_id}", headers=_auth_headers(),timeout=30)
                 if res.status_code == 200:
                     st.session_state.tables = res.json().get("tables", [])
                 else:
@@ -1433,6 +1658,7 @@ with tab5:
                     res = requests.post(
                         f"{API_URL}/extract/nl",
                         json={"document_id": st.session_state.document_id, "instruction": review_instruction},
+                        headers=_auth_headers(),
                         timeout=30,
                     )
                     if res.status_code == 200:
@@ -1538,6 +1764,7 @@ with tab5:
                         res = requests.post(
                             f"{API_URL}/review/{st.session_state.document_id}",
                             json=review_payload,
+                            headers=_auth_headers(),
                             timeout=10,
                         )
                         if res.status_code == 200:
@@ -1582,7 +1809,7 @@ with tab6:
             try:
                 res = requests.post(
                     f"{API_URL}/api-keys",
-                    json={"name": key_name, "rate_limit": rate_limit},
+                    json={"name": key_name, "rate_limit": rate_limit},headers=_auth_headers(),
                     timeout=10,
                 )
                 if res.status_code == 200:
@@ -1596,7 +1823,7 @@ with tab6:
             st.warning("Enter a key name first.")
 
     try:
-        keys_res = requests.get(f"{API_URL}/api-keys", timeout=5)
+        keys_res = requests.get(f"{API_URL}/api-keys",headers=_auth_headers(), timeout=5)
         if keys_res.status_code == 200:
             keys = keys_res.json()
             if keys:
@@ -1610,7 +1837,7 @@ with tab6:
                     c3.caption(f"{k['calls_today']}/{k['rate_limit']} calls today")
                     with c4:
                         if st.button("🗑️", key=f"revoke_{k['id']}", help="Revoke key"):
-                            requests.delete(f"{API_URL}/api-keys/{k['id']}", timeout=5)
+                            requests.delete(f"{API_URL}/api-keys/{k['id']}",headers=_auth_headers(), timeout=5)
                             st.rerun()
     except Exception:
         pass
@@ -1635,6 +1862,7 @@ with tab6:
                 res = requests.post(
                     f"{API_URL}/webhooks",
                     json={"name": wh_name, "url": wh_url, "events": wh_events, "secret": wh_secret or None},
+                    headers=_auth_headers(),
                     timeout=10,
                 )
                 if res.status_code == 200:
@@ -1648,7 +1876,7 @@ with tab6:
             st.warning("Enter webhook name and URL.")
 
     try:
-        wh_res = requests.get(f"{API_URL}/webhooks", timeout=5)
+        wh_res = requests.get(f"{API_URL}/webhooks", headers=_auth_headers(),timeout=5)
         if wh_res.status_code == 200:
             webhooks = wh_res.json()
             if webhooks:
@@ -1665,19 +1893,19 @@ with tab6:
                     c3.caption(f"Events: {', '.join(wh.get('events', []))}")
                     with c4:
                         if st.button("🧪", key=f"test_{wh['id']}", help="Test webhook"):
-                            test_res = requests.post(f"{API_URL}/webhooks/{wh['id']}/test", timeout=15)
+                            test_res = requests.post(f"{API_URL}/webhooks/{wh['id']}/test", headers=_auth_headers(),timeout=15)
                             if test_res.status_code == 200 and test_res.json().get("success"):
                                 st.success("✅ Test sent!")
                             else:
                                 st.error("Test failed.")
                         if st.button("🗑️", key=f"del_wh_{wh['id']}", help="Delete webhook"):
-                            requests.delete(f"{API_URL}/webhooks/{wh['id']}", timeout=5)
+                            requests.delete(f"{API_URL}/webhooks/{wh['id']}", headers=_auth_headers(),timeout=5)
                             st.rerun()
 
             st.divider()
             st.markdown("**Recent Webhook Logs**")
             try:
-                logs_res = requests.get(f"{API_URL}/webhooks/logs", timeout=5)
+                logs_res = requests.get(f"{API_URL}/webhooks/logs", headers=_auth_headers(),timeout=5)
                 if logs_res.status_code == 200:
                     logs = logs_res.json()
                     if logs:

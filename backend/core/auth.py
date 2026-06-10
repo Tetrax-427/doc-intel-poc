@@ -1,8 +1,8 @@
 """
-Clerk JWT authentication for DocIntel.
+Supabase JWT authentication for DocIntel.
 
 Usage in FastAPI routes:
-    from core.auth import get_current_user, UserContext
+    from core.auth import get_current_user, get_user_id, UserContext
 
     @router.get("/my-endpoint")
     def my_endpoint(user: UserContext = Depends(get_current_user)):
@@ -10,9 +10,9 @@ Usage in FastAPI routes:
         ...
 
 Behaviour:
-- CLERK_SECRET_KEY set   → validates Bearer JWT from Clerk; 401 on invalid token
-- CLERK_SECRET_KEY unset → returns dev_user fallback so the app runs locally
-  and on Railway without auth configured yet
+- SUPABASE_JWT_SECRET set   → validates Bearer JWT from Supabase Auth; 401 on invalid
+- SUPABASE_JWT_SECRET unset → returns dev_user fallback so app runs locally
+                              without auth configured
 
 Never raises on missing env var — degrades gracefully to dev mode.
 """
@@ -22,8 +22,7 @@ from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-import jwt                         
-import requests as _requests        
+import jwt
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -31,16 +30,14 @@ _bearer = HTTPBearer(auto_error=False)
 @dataclass
 class UserContext:
     user_id: str
-    email: str | None = None
-    is_dev: bool = False   # True when running without Clerk configured
+    email:   str | None = None
+    is_dev:  bool = False   # True when running without Supabase Auth configured
 
 
 def get_user_id(user) -> str:
     """
     Extract user_id from a UserContext or dict safely.
     Returns 'anonymous' for None or missing key.
- 
-    Accepts both UserContext (dataclass) and dict for flexibility.
     """
     if user is None:
         return "anonymous"
@@ -49,47 +46,38 @@ def get_user_id(user) -> str:
     if isinstance(user, dict):
         return user.get("user_id", "anonymous")
     return "anonymous"
- 
-# ── Clerk JWT verification ────────────────────────────────────────────────────
 
-def _verify_clerk_token(token: str) -> UserContext:
+
+# ── Supabase JWT verification ─────────────────────────────────────────────────
+
+def _verify_supabase_token(token: str) -> UserContext:
     """
-    Decode and verify a Clerk-issued JWT.
+    Decode and verify a Supabase-issued JWT.
 
-    Clerk tokens are standard JWTs signed with RS256.
-    We use PyJWT + Clerk's JWKS endpoint to verify the signature.
+    Supabase tokens are signed with HS256 using the project's JWT secret.
+    Found in: Supabase Dashboard → Project Settings → API → JWT Secret
 
-    Raises HTTPException(401) on any verification failure so the
-    caller can return immediately without extra error handling.
+    Raises HTTPException(401) on any verification failure.
     """
+    jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "").strip()
 
-    jwks_url = "https://api.clerk.dev/v1/jwks"
-
-    try:
-        # Fetch JWKS — 
-        jwks_resp = _requests.get(jwks_url, timeout=5)
-        jwks_resp.raise_for_status()
-        
-    except Exception as exc:
+    if not jwt_secret:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Could not fetch Clerk JWKS: {exc}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="SUPABASE_JWT_SECRET not configured on server.",
         )
 
     try:
-        # Let PyJWT pick the right key from the JWKS set
-        jwks_client = jwt.PyJWKClient(jwks_url)
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
         payload = jwt.decode(
             token,
-            signing_key.key,
-            algorithms=["RS256"],
-            options={"verify_aud": False},   # Clerk doesn't always set aud
+            jwt_secret,
+            algorithms=["HS256"],
+            options={"verify_aud": False},  # Supabase sets aud="authenticated"
         )
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired.",
+            detail="Session expired. Please log in again.",
         )
     except jwt.InvalidTokenError as exc:
         raise HTTPException(
@@ -119,23 +107,23 @@ def get_current_user(
     """
     FastAPI dependency — inject into any route that needs the current user.
 
-    - No CLERK_SECRET_KEY configured → dev_user (local / pre-auth deploy)
-    - CLERK_SECRET_KEY configured, no token → 401
-    - CLERK_SECRET_KEY configured, valid token → UserContext with Clerk user_id
-    - CLERK_SECRET_KEY configured, invalid token → 401
+    - No SUPABASE_JWT_SECRET configured → dev_user (local / pre-auth deploy)
+    - SUPABASE_JWT_SECRET set, no token  → 401
+    - SUPABASE_JWT_SECRET set, valid token → UserContext with Supabase user_id
+    - SUPABASE_JWT_SECRET set, invalid/expired → 401
     """
-    clerk_secret = os.getenv("CLERK_SECRET_KEY", "").strip()
+    jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "").strip()
 
-    # Dev mode — Clerk not configured yet
-    if not clerk_secret:
+    # Dev mode — auth not configured yet
+    if not jwt_secret:
         return UserContext(user_id="dev_user", is_dev=True)
 
     # Auth required — no token provided
     if not credentials or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required. Provide a Bearer token.",
+            detail="Authentication required. Please log in.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return _verify_clerk_token(credentials.credentials)
+    return _verify_supabase_token(credentials.credentials)

@@ -1,24 +1,21 @@
-# backend/ingestion.py
-
 import os
 import threading
 
 from dotenv import load_dotenv
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core import Document as LlamaIndexDocument
-
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+                
 from db import insert_document, insert_chunks
 from core.config import config
 from core.logger import get_logger
 from core.errors import ParseError, UnsupportedFileTypeError
 from core.document import ImageElement
+from parsers.router import AutoRouter
 from core.cache import get_embedding, set_embedding
 from vision.triggers import should_use_vision
 from vision.engine import describe_image, describe_pdf_page
-from parsers.router import AutoRouter
 
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-             
 load_dotenv()
 
 logger = get_logger("ingestion")
@@ -104,7 +101,7 @@ def _run_vision_for_page(
     Never raises.
     """
     try:
-
+        
         if not should_use_vision(file_path, page.text, is_scanned, doc_type, config):
             return page.images  # vision not needed — return existing (empty) list
 
@@ -116,7 +113,7 @@ def _run_vision_for_page(
             # Case A — parser found embedded images; describe each
             for img in page.images:
                 if img.description:
-                    # Already has a description.
+                    # Already has a description (shouldn't happen in Phase 2, but safe)
                     updated_images.append(img)
                     continue
 
@@ -175,6 +172,7 @@ def ingest_file(
     file_path: str,
     use_llamaparse: bool = True,
     doc_type: str = "general",
+    user_id: str = "anonymous",
 ) -> dict:
     """
     Ingest a file into the vector store.
@@ -184,7 +182,8 @@ def ingest_file(
         use_llamaparse: Use LlamaParse for PDF parsing (falls back to pypdf).
         doc_type:       Pre-classified document type — used to select the right
                         vision prompt. Pass "general" if classification hasn't
-                        run yet.
+                        run yet. Dev 2 passes the classified type from the
+                        upload endpoint after quick keyword classification.
 
     Returns:
         Dict with document_id, chunk counts, parser used, vision_used flag.
@@ -228,7 +227,7 @@ def ingest_file(
             return {"error": "Could not extract text. File may be empty or image-only."}
 
     is_scanned = document.is_scanned
-    doc_id = insert_document(file_name)
+    doc_id = insert_document(file_name, user_id=user_id)
     chunk_rows = []
     vision_used = False
 
@@ -303,7 +302,7 @@ def ingest_file(
                 "metadata": {
                     "page": str(page.page_num),
                     "file": file_name,
-                    "chunk_type": "description",       
+                    "chunk_type": "description",        # Contract 1 & 2
                     "image_ref": img.image_ref,
                     "vision_prompt_used": img.vision_prompt_used,
                 }
@@ -347,7 +346,7 @@ def ingest_file(
 
 
 # ---------------------------------------------------------------------------
-# URL ingestion —
+# URL ingestion — unchanged from Phase 1
 # ---------------------------------------------------------------------------
 
 def ingest_url(url: str) -> dict:

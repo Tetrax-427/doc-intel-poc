@@ -18,7 +18,7 @@ from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from core.queue import task_queue
 from ingestion import get_embed_model
-    
+from routers.auth import router as auth_router
 from routers import system, documents, query, extraction, export, integration
 
 load_dotenv()
@@ -91,3 +91,4 @@ app.include_router(query.router)
 app.include_router(extraction.router)
 app.include_router(export.router)
 app.include_router(integration.router)
+app.include_router(auth_router)
