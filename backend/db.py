@@ -36,7 +36,7 @@ def get_all_documents(user_id: str = "anonymous") -> list[dict]:
     result = (
         supabase.table("documents")
         .select("id, name, summary_short, doc_type, classification_confidence, requires_review, created_at")
-        .eq("user_id", user_id)
+        #.eq("user_id", user_id)
         .order("created_at", desc=True)
         .execute()
     )
