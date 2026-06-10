@@ -1,5 +1,3 @@
-# backend/vision/null.py
-
 from vision.base import BaseVisionModel
 from core.config import Config
 

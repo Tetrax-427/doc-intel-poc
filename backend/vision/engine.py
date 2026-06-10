@@ -1,13 +1,17 @@
-# backend/vision/engine.py
-
 import os
 import tempfile
-
+import fitz  
 from core.config import Config
 from core.logger import get_logger
 from vision.base import BaseVisionModel
 from vision.null import NoVisionModel
-
+from core.cache import get_vision_description, set_vision_description
+from core.config import config as _config
+from vision.openai import OpenAIVisionModel
+from vision.anthropic import AnthropicVisionModel
+from core.config import config
+from schemas.templates import get_vision_prompt
+ 
 logger = get_logger("vision.engine")
 
 # Module-level singleton — initialised once, reused for all requests.
@@ -33,7 +37,6 @@ def get_vision_model(config: Config = None) -> BaseVisionModel:
         return _vision_model
 
     if config is None:
-        from core.config import config as _config
         config = _config
 
     if not config.vision_provider:
@@ -44,10 +47,8 @@ def get_vision_model(config: Config = None) -> BaseVisionModel:
     provider = config.vision_provider.lower()
 
     if provider == "openai":
-        from vision.openai import OpenAIVisionModel
         model: BaseVisionModel = OpenAIVisionModel()
     elif provider == "anthropic":
-        from vision.anthropic import AnthropicVisionModel
         model = AnthropicVisionModel()
     else:
         logger.warning("Unknown VISION_PROVIDER — falling back to NoVision",
@@ -83,17 +84,14 @@ def describe_image(image_path: str, doc_type: str = "general") -> str:
     Never raises.
     """
     try:
-        from core.cache import get_vision_description, set_vision_description
-
+        
         # Cache check — images don't change, 7-day TTL
         cached = get_vision_description(image_path, doc_type)
         if cached is not None:
             logger.debug("Vision cache hit", path=os.path.basename(image_path))
             return cached
 
-        from core.config import config
-        from schemas.templates import get_vision_prompt
-
+        
         prompt = get_vision_prompt(doc_type)
         model = get_vision_model(config)
         description = model.describe(image_path, prompt)
@@ -120,8 +118,6 @@ def describe_pdf_page(file_path: str, page_num: int, doc_type: str = "general") 
     Never raises.
     """
     try:
-        import fitz  # PyMuPDF
-
         doc = fitz.open(file_path)
 
         if page_num >= len(doc):

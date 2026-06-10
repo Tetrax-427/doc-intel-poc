@@ -1,5 +1,3 @@
-# backend/vision/openai.py
-
 import os
 import base64
 import time
@@ -7,6 +5,9 @@ import time
 from vision.base import BaseVisionModel
 from core.config import Config
 from core.logger import get_logger
+from openai import OpenAI
+from core.config import config
+from llm.usage import log_usage
 
 logger = get_logger("vision.openai")
 
@@ -38,9 +39,7 @@ class OpenAIVisionModel(BaseVisionModel):
 
     def describe(self, image_path: str, prompt: str) -> str:
         try:
-            from openai import OpenAI
-            from core.config import config
-
+            
             if not os.path.exists(image_path):
                 logger.warning("Vision image file not found", path=image_path)
                 return ""
@@ -75,7 +74,6 @@ class OpenAIVisionModel(BaseVisionModel):
 
             # Log token usage if usage tracking is available
             try:
-                from llm.usage import log_usage
                 log_usage(
                     "vision", config.vision_model,
                     len(prompt), len(description),

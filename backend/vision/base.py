@@ -1,5 +1,3 @@
-# backend/vision/base.py
-
 from abc import ABC, abstractmethod
 from core.config import Config
 
