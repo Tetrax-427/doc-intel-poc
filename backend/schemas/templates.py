@@ -1,5 +1,4 @@
 """
-schemas/templates.py
 Extraction template definitions + doc-type → template mapping.
 
 Public API (used by routers and retrieval):
