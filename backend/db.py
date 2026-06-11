@@ -93,8 +93,17 @@ def get_classification(document_id: str) -> dict | None:
 def insert_chunks(chunks: list[dict]):
     supabase.table("chunks").insert(chunks).execute()
 
+def get_chunks_by_document(document_id: str) -> list[dict]:
+    """Fetch chunks for a specific document — no user_id needed."""
+    result = (
+        supabase.table("chunks")
+        .select("*")
+        .eq("document_id", document_id)
+        .execute()
+    )
+    return result.data or []
 
-def get_all_chunks(user_id: str = "anonymous") -> list[dict]:
+def get_all_chunks(user_id: str) -> list[dict]:
     """
     Return all chunks belonging to documents owned by user_id.
     Automatically scoped — users cannot access each other's chunks.

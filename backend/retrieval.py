@@ -6,7 +6,7 @@ import numpy as np
 from typing import Generator
 from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
-from db import get_all_chunks
+from db import get_chunks_by_document
 from ingestion import get_embed_model
 from prompts import (
     QA_PROMPT, QA_PROMPT_MULTI, GENERAL_PROMPT,
@@ -21,6 +21,7 @@ from core.logger import get_logger as _get_logger
 from schemas.templates import get_template_for_doc_type
 from core.config import config as app_config
 from core.cache import get_classification, set_classification, make_text_hash
+from db import get_chunks_by_document
 
 import cohere
 co = cohere.Client(os.getenv("COHERE_API_KEY"))
@@ -132,20 +133,19 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = 5) -> list[dic
 # Hybrid search
 # ---------------------------------------------------------------------------
 
-def hybrid_search(
-    question: str,
-    document_ids: list[str] = None,
-    top_k: int = 10
-) -> list[dict]:
+def hybrid_search(question, document_ids=None, top_k=10):
     embed_model = get_embed_model()
-    all_chunks = get_all_chunks()
-
     if document_ids:
-        all_chunks = [c for c in all_chunks if c["document_id"] in document_ids]
+        all_chunks = []
+        for doc_id in document_ids:
+            chunks = get_chunks_by_document(doc_id)
+            print(f"[DEBUG] doc_id={doc_id} chunks={len(chunks)}")
+            all_chunks.extend(chunks)
+    else:
+        all_chunks = []
 
-    if not all_chunks:
+    if not all_chunks: 
         return []
-
     expanded_question = expand_query(question)
     print(f"Expanded query: {expanded_question}")
 
@@ -480,8 +480,7 @@ def extract_fields(
         except Exception:
             pass  # classification unavailable — proceed with "general"
 
-    all_chunks = get_all_chunks()
-    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+    doc_chunks = get_chunks_by_document(document_id)
     context    = "\n\n".join([c["content"] for c in doc_chunks[:10]])
 
     fields_with_desc = "\n".join([
@@ -538,8 +537,8 @@ def extract_fields(
 # ---------------------------------------------------------------------------
 
 def extract_tables(document_id: str) -> list[dict]:
-    all_chunks = get_all_chunks()
-    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+    
+    doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return []
 
@@ -577,8 +576,7 @@ JSON array:""",
 # ---------------------------------------------------------------------------
 
 def generate_summary(document_id: str) -> dict:
-    all_chunks = get_all_chunks()
-    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
+    doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return {"summary": "", "summary_short": ""}
 
@@ -732,9 +730,7 @@ def classify_document(document_id: str) -> dict:
     Checks classification cache first — LLM only called on cache miss.
     Never raises — always returns a safe default on failure.
     """
-    all_chunks = get_all_chunks()
-    doc_chunks = [c for c in all_chunks if c["document_id"] == document_id]
-
+    doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         _clf_logger.warning("No chunks found for classification", document_id=document_id)
         return {

@@ -17,6 +17,7 @@ from core.responses import bad_request, error_response, internal_error, not_foun
 from retrieval import extract_fields,nl_to_schema, extract_nl,extract_tables
 from webhooks import trigger_webhooks, trigger_webhooks
 from schemas.templates import list_templates
+from schemas.templates import get_template as _get_template
 from db import get_classification, save_correction,supabase
 
 router = APIRouter(tags=["Extraction"])
@@ -198,7 +199,7 @@ def get_templates():
 @router.get("/templates/{template_id}")
 def get_template(template_id: str):
     """Return a single extraction template by ID."""
-    template = get_template(template_id)
+    template = _get_template(template_id)
     if not template:
         return not_found(f"Template '{template_id}'")
     return template
