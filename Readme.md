@@ -40,6 +40,13 @@ A production-ready RAG-powered document intelligence platform. Upload any docume
 - **Table extraction** — renders as interactive bar/line/pie charts
 - **Human review** — approve, correct, or reject extracted fields with evidence
 
+### Auth & Multi-User
+- **Supabase Auth** — email/password signup and login, JWT-based sessions
+- **Full user isolation** — each user sees only their own documents
+- **Auto-confirmed signup** — no email verification required, users log in immediately
+- **Dev mode** — skip auth entirely by leaving `SUPABASE_JWT_SECRET` unset
+- **24-hour sessions** — tokens expire after 24 hours, user logs in again
+
 ### Export & Reporting
 - **Chat export** — full conversation as PDF or Word report
 - **JSON export** — extracted fields with validation summary
@@ -71,6 +78,7 @@ A production-ready RAG-powered document intelligence platform. Upload any docume
 | Embeddings | HuggingFace `BAAI/bge-small-en-v1.5` |
 | Reranking | Cohere rerank-english-v3.0 |
 | Vector DB | Supabase pgvector |
+| Auth | Supabase Auth (JWT, ES256) |
 | PDF/Image Parsing | LlamaParse + pypdf fallback |
 | Vision | GPT-4o Vision / Claude Vision (optional) |
 | Validation | Custom rules engine (arithmetic, logic, cross-field) |
@@ -94,6 +102,7 @@ doc-intel/
 │   ├── api_keys.py              # API key generation and validation
 │   ├── db.py                    # Supabase client and table helpers
 │   ├── routers/
+│   │   ├── auth.py              # Login, signup, logout, /me
 │   │   ├── documents.py         # Upload, list, delete, summary, classification
 │   │   ├── query.py             # Query, stream, chat history
 │   │   ├── extraction.py        # Extract, NL extract, templates, review
@@ -107,7 +116,7 @@ doc-intel/
 │   │   ├── document.py          # Document model dataclasses
 │   │   ├── cache.py             # TTL cache for embeddings/vision/classification
 │   │   ├── queue.py             # Async task queue
-│   │   └── auth.py              # Clerk JWT + API key auth
+│   │   └── auth.py              # Supabase JWT verification + dev mode
 │   ├── parsers/
 │   │   ├── base.py              # BaseParser abstract class
 │   │   ├── router.py            # AutoRouter — selects best parser
@@ -134,8 +143,8 @@ doc-intel/
 │   ├── Procfile                 # Railway start command
 │   └── railway.json             # Railway deploy config
 ├── frontend/
-│   └── app.py                   # Streamlit UI (6 tabs)
-├── tests/                       # 169 tests passing
+│   └── app.py                   # Streamlit UI (6 tabs + auth gate)
+├── tests/                       # 169+ tests passing
 ├── CONTRACTS.md                 # Shared data format contracts
 ├── .env                         # API keys — never commit
 ├── .gitignore
@@ -274,7 +283,7 @@ create index on documents(doc_type);
 create index on documents(user_id);
 create index on review_corrections(doc_type, field_name);
 
--- RLS Policies (allow all for now — tighten with Clerk auth later)
+-- RLS Policies
 alter table documents enable row level security;
 create policy "allow_all" on documents for all using (true) with check (true);
 
@@ -300,7 +309,15 @@ alter table review_corrections enable row level security;
 create policy "allow_all" on review_corrections for all using (true) with check (true);
 ```
 
-### 5. Configure environment variables
+### 5. Configure Supabase Auth settings
+
+In Supabase → **Authentication → JWT Settings:**
+- Set JWT expiry to `86400` (24 hours)
+
+In Supabase → **Authentication → URL Configuration:**
+- Set Site URL to your deployed Streamlit URL
+
+### 6. Configure environment variables
 
 Create a `.env` file in the project root:
 
@@ -324,6 +341,11 @@ LLAMA_CLOUD_API_KEY=your_llamaparse_key
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_KEY=your_supabase_anon_key
 
+# Supabase Auth (required for multi-user mode)
+# Found in: Supabase → Settings → API
+SUPABASE_JWT_SECRET=your_jwt_secret       # JWT Secret (legacy HS256 — leave blank for dev mode)
+SUPABASE_SERVICE_KEY=your_service_role_key # service_role key (enables auto-confirmed signup)
+
 # System
 UPLOAD_DIR=uploads
 MAX_FILE_SIZE_MB=50
@@ -332,20 +354,21 @@ CHUNK_OVERLAP=64
 COMPRESSION_THRESHOLD=10
 VISION_MIN_WORDS=50
 CLASSIFICATION_CONFIDENCE_THRESHOLD=0.7
-
-# Auth (Phase 3 — leave empty for now)
-CLERK_SECRET_KEY=
-CLERK_PUBLISHABLE_KEY=
 ```
 
-**Minimum required:** `GROQ_API_KEY` + `SUPABASE_URL` + `SUPABASE_KEY`
+**Minimum required (dev mode):** `GROQ_API_KEY` + `SUPABASE_URL` + `SUPABASE_KEY`
 
-### 6. Run locally
+**For production with auth:** also add `SUPABASE_JWT_SECRET` + `SUPABASE_SERVICE_KEY`
+
+> **Dev mode:** If `SUPABASE_JWT_SECRET` is not set, the app runs without login —
+> all requests use `user_id = "dev_user"`. Useful for local development.
+
+### 7. Run locally
 
 **Terminal 1 — Backend:**
 ```bash
 cd backend
-uvicorn main:app --host 127.0.0.1 --port 8000
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 **Terminal 2 — Frontend:**
@@ -355,6 +378,52 @@ streamlit run frontend/app.py
 
 - UI: `http://localhost:8501`
 - API docs: `http://127.0.0.1:8000/docs`
+
+---
+
+## Authentication
+
+DocIntel uses **Supabase Auth** for user management. Each user has a private workspace — they can only see and query their own documents.
+
+### How it works
+
+```
+User signs up / logs in via Streamlit UI
+        ↓
+POST /auth/login or /auth/signup → FastAPI → Supabase Auth
+        ↓
+Supabase returns JWT token
+        ↓
+Streamlit stores token in session state
+        ↓
+Every API call sends: Authorization: Bearer <JWT>
+        ↓
+FastAPI verifies token via supabase.auth.get_user(token)
+        ↓
+All DB queries filter by user_id — complete data isolation
+```
+
+### Auth endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/auth/signup` | Create account — auto-confirmed, no email needed |
+| POST | `/auth/login` | Email + password → returns JWT |
+| POST | `/auth/logout` | Invalidate session |
+| GET | `/auth/me` | Return current user from JWT |
+
+### Auth modes
+
+| Mode | When | Behaviour |
+|---|---|---|
+| **Auth enabled** | `SUPABASE_JWT_SECRET` is set | Login page shown, full user isolation |
+| **Dev mode** | `SUPABASE_JWT_SECRET` not set | No login, `user_id = "dev_user"` |
+
+### Known limitations
+
+- Password reset — manual via Supabase Dashboard for now
+- Account deletion — manual via Supabase Dashboard for now
+- Session refresh — tokens expire after 24 hours, user must log in again
 
 ---
 
@@ -384,7 +453,7 @@ LLM_MODEL=gpt-4o
 
 1. Connect GitHub repo at [railway.app](https://railway.app)
 2. Set root directory: `backend`
-3. Add all env variables in Railway Variables tab
+3. Add all env variables in Railway Variables tab — including `SUPABASE_JWT_SECRET` and `SUPABASE_SERVICE_KEY`
 4. Deploy — auto-deploys on every push to `main`
 
 ### Frontend — Streamlit Cloud
@@ -395,20 +464,32 @@ LLM_MODEL=gpt-4o
 
 ```toml
 API_URL = "https://your-app.up.railway.app"
-
-[auth]
-username = "admin"
-password = "your_password"
 ```
+
+> **Note:** With Supabase Auth enabled, no credentials are needed in Streamlit secrets —
+> login is handled by the backend. Users sign up and log in via the app itself.
 
 ---
 
 ## API Reference
 
-### Authentication
+### Authentication header
 ```
-X-API-Key: your_api_key
+Authorization: Bearer <jwt_token>
 ```
+Or for API key access:
+```
+X-API-Key: di_your_api_key
+```
+
+### Auth Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/auth/signup` | Create account |
+| POST | `/auth/login` | Login, returns JWT |
+| POST | `/auth/logout` | Invalidate session |
+| GET | `/auth/me` | Current user info |
 
 ### Core Endpoints
 
@@ -417,7 +498,7 @@ X-API-Key: your_api_key
 | GET | `/health` | System health check |
 | POST | `/upload` | Upload a document |
 | POST | `/ingest-url` | Ingest from URL |
-| GET | `/documents` | List all documents |
+| GET | `/documents` | List user's documents |
 | DELETE | `/documents/{id}` | Delete a document |
 | GET | `/summary/{id}` | Get document summary |
 | GET | `/documents/{id}/classification` | Get classification result |
@@ -435,25 +516,25 @@ X-API-Key: your_api_key
 | GET | `/usage` | Session usage stats |
 | GET | `/tasks/{id}` | Poll async task status |
 
-### Example — Upload and query
+### Example — Sign up and upload
 
 ```bash
-# Upload
+# Sign up
+curl -X POST https://your-app.up.railway.app/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "securepassword"}'
+# Returns: {"token": "eyJ...", "user_id": "uuid", "email": "user@example.com"}
+
+# Upload using JWT
 curl -X POST https://your-app.up.railway.app/upload \
-  -H "X-API-Key: di_your_key" \
+  -H "Authorization: Bearer eyJ..." \
   -F "file=@invoice.pdf"
 
 # Query
 curl -X POST https://your-app.up.railway.app/query \
-  -H "X-API-Key: di_your_key" \
+  -H "Authorization: Bearer eyJ..." \
   -H "Content-Type: application/json" \
   -d '{"document_id": "abc-123", "question": "What is the total amount?"}'
-
-# Natural language extraction
-curl -X POST https://your-app.up.railway.app/extract/nl \
-  -H "X-API-Key: di_your_key" \
-  -H "Content-Type: application/json" \
-  -d '{"document_id": "abc-123", "instruction": "extract vendor name and total amount"}'
 ```
 
 ---
@@ -522,8 +603,10 @@ curl -X POST https://your-app.up.railway.app/extract/nl \
 - [x] Chat export (PDF + Word)
 - [x] Webhook integration + API keys
 - [x] Usage tracking
+- [x] Supabase Auth — full multi-user isolation
 - [x] Deployed (Railway + Streamlit Cloud)
-- [ ] Full Clerk auth + multi-tenant
+- [ ] Password reset flow
+- [ ] Session refresh (auto-renew JWT)
 - [ ] Workflow engine per vertical
 - [ ] Document comparison
 - [ ] Vertical wrappers (CA Helper, CV Screener, Loan Processor)
