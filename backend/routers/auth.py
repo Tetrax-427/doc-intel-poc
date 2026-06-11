@@ -1,29 +1,17 @@
 """
-routers/auth.py
 Authentication endpoints — login, signup, logout, me.
-
-All Supabase Auth calls happen here on the backend.
-The frontend (Streamlit) never touches Supabase directly.
-
-Endpoints:
-    POST /auth/login    → returns JWT + user info
-    POST /auth/signup   → creates account + returns JWT
-    POST /auth/logout   → invalidates session
-    GET  /auth/me       → returns current user info from JWT
 """
 
 import os
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
-
+from pydantic import BaseModel
 from core.auth import get_current_user, UserContext
 from core.logger import get_logger
-
+from supabase import create_client
+    
 logger = get_logger("auth")
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
-
-# ── Input models ──────────────────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
     email:    str
@@ -35,46 +23,38 @@ class SignupRequest(BaseModel):
     password: str
 
 
-# ── Supabase Auth client ──────────────────────────────────────────────────────
-
 def _get_supabase():
-    """
-    Return a Supabase client using the service role key for auth operations.
-    Uses SUPABASE_KEY (anon key) — sufficient for auth.sign_in / sign_up.
-    """
-    from supabase import create_client
+    """Supabase client using anon key — for login."""
     url = os.getenv("SUPABASE_URL", "")
     key = os.getenv("SUPABASE_KEY", "")
     if not url or not key:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Supabase not configured on server.",
-        )
+        raise HTTPException(status_code=503, detail="Supabase not configured.")
     return create_client(url, key)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+def _get_supabase_admin():
+    """
+    Supabase admin client using service role key.
+    Used for signup so we can auto-confirm emails without
+    requiring users to click a verification link.
+    """
+    url         = os.getenv("SUPABASE_URL", "")
+    service_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not url or not service_key:
+        return None  # fall back to regular client if not configured
+    return create_client(url, service_key)
+
 
 @router.post("/login")
 def login(req: LoginRequest):
-    """
-    Sign in with email + password.
-    Returns JWT access token and user info on success.
-    Returns 401 on invalid credentials.
-    """
-    # Dev mode — no Supabase JWT secret configured
     jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "").strip()
     if not jwt_secret:
         logger.info("Auth in dev mode — returning dev_user token")
         return {
             "access_token": "dev_token",
             "token_type":   "bearer",
-            "user": {
-                "id":    "dev_user",
-                "email": req.email or "dev@local",
-            }
+            "user": {"id": "dev_user", "email": req.email or "dev@local"}
         }
-
     try:
         sb  = _get_supabase()
         res = sb.auth.sign_in_with_password({
@@ -85,72 +65,67 @@ def login(req: LoginRequest):
         return {
             "access_token": res.session.access_token,
             "token_type":   "bearer",
-            "user": {
-                "id":    res.user.id,
-                "email": res.user.email,
-            }
+            "user": {"id": res.user.id, "email": res.user.email}
         }
     except Exception as e:
         logger.warning("Login failed", email=req.email, error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
-        )
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
 
 
 @router.post("/signup")
 def signup(req: SignupRequest):
-    """
-    Create a new account with email + password.
-    Automatically signs in after successful signup.
-    Returns JWT access token and user info.
-    Returns 400 if email already registered or password too weak.
-    """
     jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "").strip()
     if not jwt_secret:
-        # Dev mode
         return {
             "access_token": "dev_token",
             "token_type":   "bearer",
-            "user": {
-                "id":    "dev_user",
-                "email": req.email or "dev@local",
-            }
+            "user": {"id": "dev_user", "email": req.email or "dev@local"}
         }
 
     if len(req.password) < 8:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 8 characters.",
+            status_code=400,
+            detail="Password must be at least 8 characters."
         )
 
+    email = req.email.strip()
+
     try:
-        sb  = _get_supabase()
-        res = sb.auth.sign_up({
-            "email":    req.email.strip(),
-            "password": req.password,
-        })
+        # Use admin client to create user with email already confirmed
+        admin_sb = _get_supabase_admin()
 
-        if not res.user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Signup failed. Please try again.",
-            )
+        if admin_sb:
+            # Admin signup — auto-confirms email, no verification link needed
+            res = admin_sb.auth.admin.create_user({
+                "email":            email,
+                "password":         req.password,
+                "email_confirm":    True,   # ← skip email verification
+            })
 
-        logger.info("New user signed up", email=req.email)
+            if not res.user:
+                raise HTTPException(status_code=400, detail="Signup failed.")
 
-        # Auto sign-in after signup to get a valid session
+            logger.info("New user created (admin, auto-confirmed)", email=email)
+
+        else:
+            # Fallback — regular signup (will send verification email)
+            logger.warning("SUPABASE_SERVICE_KEY not set — falling back to regular signup")
+            sb  = _get_supabase()
+            res = sb.auth.sign_up({"email": email, "password": req.password})
+            if not res.user:
+                raise HTTPException(status_code=400, detail="Signup failed.")
+            logger.info("New user signed up (email confirmation required)", email=email)
+
+        # Sign in immediately to get session token
+        sb       = _get_supabase()
         login_res = sb.auth.sign_in_with_password({
-            "email":    req.email.strip(),
+            "email":    email,
             "password": req.password,
         })
         return {
             "access_token": login_res.session.access_token,
             "token_type":   "bearer",
-            "user": {
-                "id":    login_res.user.id,
-                "email": login_res.user.email,
-            }
+            "user": {"id": login_res.user.id, "email": login_res.user.email}
         }
 
     except HTTPException:
@@ -159,32 +134,21 @@ def signup(req: SignupRequest):
         err = str(e).lower()
         if "already registered" in err or "already exists" in err:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="An account with this email already exists.",
+                status_code=400,
+                detail="An account with this email already exists."
             )
-        logger.error("Signup error", email=req.email, error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not create account. Please try again.",
-        )
+        logger.error("Signup error", email=email, error=str(e))
+        raise HTTPException(status_code=400, detail="Could not create account. Please try again.")
 
 
 @router.post("/logout")
 def logout(user: UserContext = Depends(get_current_user)):
-    """
-    Sign out. In dev mode this is a no-op.
-    The frontend should clear its stored token regardless.
-    """
     logger.info("User logged out", user_id=user.user_id)
     return {"status": "logged_out"}
 
 
 @router.get("/me")
 def me(user: UserContext = Depends(get_current_user)):
-    """
-    Return current user info extracted from the JWT.
-    Useful for the frontend to verify the session is still valid.
-    """
     return {
         "user_id": user.user_id,
         "email":   user.email,

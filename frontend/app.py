@@ -348,7 +348,7 @@ def _do_login(email: str, password: str) -> str | None:
     try:
         res = requests.post(
             f"{API_URL}/auth/login",
-            json={"email": email, "password": password},headers=_auth_headers(),
+            json={"email": email, "password": password},
             timeout=15,
         )
         if res.status_code == 200:
@@ -362,14 +362,10 @@ def _do_login(email: str, password: str) -> str | None:
  
  
 def _do_signup(email: str, password: str) -> str | None:
-    """
-    Call POST /auth/signup on the backend.
-    Returns None on success, error message string on failure.
-    """
     try:
         res = requests.post(
             f"{API_URL}/auth/signup",
-            json={"email": email, "password": password},headers=_auth_headers(),
+            json={"email": email, "password": password},
             timeout=15,
         )
         if res.status_code == 200:
@@ -503,7 +499,7 @@ def _render_auth_page():
                         st.rerun()
  
         st.markdown(
-            '<div class="auth-foot">Secure · Each user sees only their own documents</div>',
+            '<div class="auth-foot"> Welcome....</div>',
             unsafe_allow_html=True
         )
  
@@ -514,22 +510,66 @@ def _render_auth_page():
 # Check if auth is enforced (SUPABASE_JWT_SECRET set on backend)
 # We detect this by trying /auth/me — if it returns 401, auth is required
  
-@st.cache_data(ttl=60)
-def _auth_required() -> bool:
-    """Returns True if the backend has auth enabled."""
+# @st.cache_data(ttl=60)
+# def _auth_required() -> bool:
+#     """Returns True if the backend has auth enabled."""
+#     try:
+#         res = requests.get(f"{API_URL}/auth/me",headers=_auth_headers(), timeout=5)
+#         # 200 = dev mode (no auth required, dev_user returned)
+#         # 401 = auth required
+#         return res.status_code == 401
+#     except Exception:
+#         return False
+ 
+
+def _check_backend() -> str:
+    """
+    Returns:
+        "online_auth"   — backend up, auth required (JWT secret set)
+        "online_noauth" — backend up, no auth (dev mode)
+        "offline"       — backend unreachable
+    """
     try:
-        res = requests.get(f"{API_URL}/auth/me",headers=_auth_headers(), timeout=5)
-        # 200 = dev mode (no auth required, dev_user returned)
-        # 401 = auth required
-        return res.status_code == 401
+        res = requests.get(f"{API_URL}/auth/me", timeout=5)
+        if res.status_code == 401:
+            return "online_auth"
+        if res.status_code == 200:
+            return "online_noauth"
+        return "offline"
     except Exception:
-        return False
- 
-# On every page load — verify existing token or show login
-if _auth_required():
-    if not st.session_state.auth_token or not _verify_session():
+        return "offline"
+
+
+# ── Gate — runs on every page load ───────────────────────────────────────────
+if st.session_state.auth_token:
+    pass  # already logged in — go straight to app
+else:
+    _backend_status = _check_backend()
+
+    if _backend_status == "offline":
+        st.markdown("""
+        <div style="text-align:center; padding:100px 20px;">
+            <div style="font-size:52px; margin-bottom:16px">⚠️</div>
+            <div style="font-size:22px; font-weight:700; color:#f1f5f9; margin-bottom:8px">
+                Backend Offline
+            </div>
+            <div style="font-size:14px; color:#64748b; margin-bottom:24px">
+                The DocIntel API server is not running.<br>
+                Please start the backend and refresh this page.
+            </div>
+            <div style="display:inline-block; background:#1e2130; border:1px solid #2a2d3e;
+                        border-radius:8px; padding:12px 24px; font-family:monospace;
+                        font-size:13px; color:#93c5fd;">
+                Connect with dev for restart
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+    elif _backend_status == "online_auth":
         _render_auth_page()
- 
+
+# online_noauth → dev mode, skip login, continue to main app
 # ══════════════════════════════════════════════════════════════════════════════
 # END OF AUTH BLOCK — main app continues below
 # ══════════════════════════════════════════════════════════════════════════════
@@ -742,11 +782,10 @@ def show_upload_success(data: dict):
 @st.cache_data(ttl=10)
 def check_api() -> bool:
     try:
-        res = requests.get(f"{API_URL}/", headers=_auth_headers(),timeout=5)
+        res = requests.get(f"{API_URL}/",timeout=5)
         return res.status_code == 200
     except Exception:
         return False
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
@@ -805,9 +844,11 @@ with st.sidebar:
                     response  = requests.post(
                         f"{API_URL}/upload",
                         files={"file": (uploaded_file.name, uploaded_file, mime_type)},
-                        data={"use_llamaparse": str(use_llamaparse), "vision_template": vision_template},headers=_auth_headers(),
+                        data={"use_llamaparse": str(use_llamaparse), "vision_template": vision_template},
+                        headers=_auth_headers(),
                         timeout=120,
                     )
+                    
                     if response.status_code == 200:
                         data = response.json()
 
@@ -900,6 +941,7 @@ with st.sidebar:
         )
 
     try:
+        # st.write("headers:", _auth_headers())
         docs_res = requests.get(f"{API_URL}/documents",headers=_auth_headers(), timeout=5)
         if docs_res.status_code == 200:
             docs = docs_res.json()

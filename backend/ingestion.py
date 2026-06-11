@@ -349,7 +349,7 @@ def ingest_file(
 # URL ingestion — unchanged from Phase 1
 # ---------------------------------------------------------------------------
 
-def ingest_url(url: str) -> dict:
+def ingest_url(url: str, user_id: str = "anonymous") -> dict:
     model = get_embed_model()
 
     logger.info("Starting URL ingestion", url=url)
@@ -366,7 +366,7 @@ def ingest_url(url: str) -> dict:
     if not document.full_text.strip():
         return {"error": "Could not extract text from this URL."}
 
-    doc_id = insert_document(document.file_name)
+    doc_id = insert_document(document.file_name, user_id=user_id)
     chunk_rows = []
 
     for page in document.pages:
