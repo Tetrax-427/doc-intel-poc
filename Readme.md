@@ -2,11 +2,10 @@
 
 A production-ready RAG-powered document intelligence platform. Upload any document, ask questions in natural language, extract structured data with confidence scoring, and integrate with external systems via API and webhooks.
 
-**Live Demo:** [your-app.streamlit.app](https://your-app.streamlit.app)
-**API:** [your-app.up.railway.app](https://your-app.up.railway.app/docs)
+**Live Demo:** https://doc-intel-poc.streamlit.app
+**API:** NA
 
 ---
-
 ## Features
 
 ### Document Ingestion
