@@ -25,6 +25,34 @@ def insert_document(name: str, user_id: str = "anonymous") -> str:
     }).execute()
     return result.data[0]["id"]
 
+def get_document(document_id: str, user_id: str = "anonymous") -> dict | None:
+    """
+    Return a single document record by ID, scoped to the requesting user.
+
+    Returns None if:
+      - document not found
+      - document belongs to a different user
+      - any DB error occurs
+
+    Note: file_path is NOT stored in the DB. Callers that need the file on
+    disk must reconstruct it from the 'name' field:
+        file_path = os.path.join(UPLOAD_DIR, doc["name"])
+    """
+    try:
+        result = (
+            supabase.table("documents")
+            .select("id, name, summary_short, doc_type, classification_confidence, requires_review, created_at, user_id")
+            .eq("id", document_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        data = result.data
+        if not data:
+            return None
+        return data[0]
+    except Exception:
+        return None
 
 def get_all_documents(user_id: str = "anonymous") -> list[dict]:
     """

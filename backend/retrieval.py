@@ -55,6 +55,65 @@ def get_history_context(messages: list[dict], summary: str = "", window: int = 4
 
 
 # ---------------------------------------------------------------------------
+# Source formatting (B3)
+# ---------------------------------------------------------------------------
+
+def format_source(chunk: dict) -> dict:
+    """
+    Build a standardised source entry from a retrieval chunk.
+
+    Handles four chunk_type values:
+      "text"        — standard text source
+      "table"       — table source
+      "description" — vision description (image-level, no specific figure ref)
+      "figure"      — B3: figure/chart with caption + bbox in metadata
+
+    The returned dict is the contract between retrieval and the frontend.
+    Fields present on ALL types:
+      chunk, page, file, preview, chunk_type, exact_sentence
+
+    Additional fields for "figure":
+      image_ref, caption, bbox
+
+    Additional fields for "description":
+      image_ref
+
+    Never raises — falls back to a basic source dict on any error.
+    """
+    try:
+        chunk_type = chunk.get("chunk_type", "text")
+        base = {
+            "chunk":          chunk.get("chunk_num"),
+            "page":           chunk.get("page"),
+            "file":           chunk.get("file"),
+            "preview":        chunk.get("content", "")[:150],
+            "chunk_type":     chunk_type,
+            "exact_sentence": "",   # filled by caller after get_exact_sentence()
+        }
+
+        if chunk_type == "figure":
+            base["image_ref"] = chunk.get("image_ref")
+            base["caption"]   = chunk.get("caption", "")
+            base["bbox"]      = chunk.get("bbox")          # B1 — normalized coords
+
+        elif chunk_type in ("description", "table"):
+            base["image_ref"] = chunk.get("image_ref")
+
+        return base
+
+    except Exception:
+        # Safe fallback — never let source formatting break a query response
+        return {
+            "chunk":          chunk.get("chunk_num"),
+            "page":           chunk.get("page"),
+            "file":           chunk.get("file"),
+            "preview":        chunk.get("content", "")[:150],
+            "chunk_type":     chunk.get("chunk_type", "text"),
+            "exact_sentence": "",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
@@ -144,8 +203,9 @@ def hybrid_search(question, document_ids=None, top_k=10):
     else:
         all_chunks = []
 
-    if not all_chunks: 
+    if not all_chunks:
         return []
+
     expanded_question = expand_query(question)
     print(f"Expanded query: {expanded_question}")
 
@@ -182,13 +242,15 @@ def hybrid_search(question, document_ids=None, top_k=10):
 
     candidates = [
         {
-            "chunk_num":  i + 1,
-            "content":    all_chunks[idx]["content"],
-            "page":       all_chunks[idx]["metadata"].get("page", "?"),
-            "file":       all_chunks[idx]["metadata"].get("file", "?"),
-            "chunk_type": all_chunks[idx]["metadata"].get("chunk_type", "text"),
-            "image_ref":  all_chunks[idx]["metadata"].get("image_ref"),
-            "score":      rrf[idx],
+            "chunk_num":    i + 1,
+            "content":      all_chunks[idx]["content"],
+            "page":         all_chunks[idx]["metadata"].get("page", "?"),
+            "file":         all_chunks[idx]["metadata"].get("file", "?"),
+            "chunk_type":   all_chunks[idx]["metadata"].get("chunk_type", "text"),
+            "image_ref":    all_chunks[idx]["metadata"].get("image_ref"),
+            "caption":      all_chunks[idx]["metadata"].get("caption", ""),   # B3
+            "bbox":         all_chunks[idx]["metadata"].get("bbox"),           # B1
+            "score":        rrf[idx],
         }
         for i, idx in enumerate(top_indices)
     ]
@@ -246,14 +308,6 @@ Summary:""",
 def get_exact_sentence(chunk_content: str, question: str) -> str:
     """
     Find the single most relevant sentence from a chunk for a given question.
-
-    Strategy:
-    - Split chunk into sentences on "."
-    - If only one sentence (or very short chunk), return it directly
-    - Otherwise ask the LLM to pick the most relevant one
-    - Falls back to first 200 chars if LLM call fails
-
-    This matches Contract 3 in CONTRACTS.md — exact_sentence field in sources.
     Never raises.
     """
     try:
@@ -331,21 +385,17 @@ def query_document(
 
     answer = call_llm(prompt, temperature=0.2, call_type="query")
 
+    # Build sources using format_source() — handles figure/description/text uniformly
+    sources = []
+    for c in chunks:
+        source = format_source(c)
+        source["exact_sentence"] = get_exact_sentence(c["content"], question)
+        sources.append(source)
+
     return {
-        "answer": answer,
-        "sources": [
-            {
-                "chunk":          c["chunk_num"],
-                "page":           c["page"],
-                "file":           c["file"],
-                "preview":        c["content"][:150],
-                "chunk_type":     c.get("chunk_type", "text"),
-                "image_ref":      c.get("image_ref"),
-                "exact_sentence": get_exact_sentence(c["content"], question),
-            }
-            for c in chunks
-        ],
-        "type": "document",
+        "answer":  answer,
+        "sources": sources,
+        "type":    "document",
     }
 
 
@@ -392,35 +442,20 @@ def query_document_stream(
 
 
 # ---------------------------------------------------------------------------
-# Correction feedback loop (Phase 2)
+# Correction feedback loop
 # ---------------------------------------------------------------------------
 
 def build_correction_examples(doc_type: str, fields: dict) -> str:
-    """
-    Build few-shot correction examples from past human review decisions.
-
-    Queries review_corrections for recent "correct" actions on this
-    (doc_type, field_name) pair and formats them as natural language
-    examples for the extraction prompt.
-
-    Returns an empty string when no corrections exist, so the prompt
-    is unchanged for documents that haven't been reviewed yet.
-    Never raises — DB failures return empty string silently.
-    """
-    
     examples = []
-    # Cap field iteration — no point looking up corrections for every field
-    # in a very large schema; first 5 cover the most common extraction targets
     for field_name in list(fields.keys())[:5]:
         try:
             corrections = get_corrections_for_doc_type(doc_type, field_name, limit=3)
         except Exception:
-            continue  # DB unavailable for this field — skip silently
+            continue
 
         for c in corrections:
             orig = c.get("original_value", "")
             corr = c.get("corrected_value", "")
-            # Only emit examples where the value actually changed
             if orig and corr and orig != corr:
                 examples.append(
                     f"- '{field_name}': was incorrectly extracted as "
@@ -430,13 +465,12 @@ def build_correction_examples(doc_type: str, fields: dict) -> str:
     if not examples:
         return ""
 
-    # Cap total examples injected — keeps prompt size predictable
     lines = examples[:5]
     return "Learn from these past corrections:\n" + "\n".join(lines) + "\n\n"
 
 
 # ---------------------------------------------------------------------------
-# Field extraction with correction feedback loop + business validation
+# Field extraction
 # ---------------------------------------------------------------------------
 
 def extract_fields(
@@ -444,31 +478,6 @@ def extract_fields(
     fields: dict,
     doc_type: str = "general",
 ) -> dict:
-    """
-    Extract fields from a document.
-
-    Pipeline:
-    1. Auto-detect doc_type from stored classification if not passed explicitly
-    2. Build few-shot correction examples from past human review decisions
-    3. Format and run the extraction prompt with corrections injected
-    4. Run confidence scoring (existing Phase 1 behaviour)
-    5. Run business logic validation (Phase 2 — skipped silently if Dev 1's
-       ValidationEngine isn't available yet)
-
-    Args:
-        document_id: UUID of the document to extract from.
-        fields:      Schema dict of {field_name: description}.
-        doc_type:    Document type for ruleset selection. Auto-detected if "general".
-
-    Returns:
-        {
-            "extracted":           dict of extracted values,
-            "validation":          confidence scoring result,
-            "business_validation": Contract 4 shaped result, or {} if not available,
-        }
-    """
-    
-    # 1. Auto-detect doc_type from stored classification if not explicitly passed
     if doc_type == "general":
         try:
             from db import get_classification
@@ -478,7 +487,7 @@ def extract_fields(
                 if detected and detected != "general":
                     doc_type = detected
         except Exception:
-            pass  # classification unavailable — proceed with "general"
+            pass
 
     doc_chunks = get_chunks_by_document(document_id)
     context    = "\n\n".join([c["content"] for c in doc_chunks[:10]])
@@ -488,10 +497,8 @@ def extract_fields(
         for key, value in fields.items()
     ])
 
-    # 2. Build correction examples from past human review — empty string if none exist
     correction_examples = build_correction_examples(doc_type, fields)
 
-    # 3. Format prompt with corrections injected
     prompt = EXTRACTION_PROMPT.format(
         correction_examples=correction_examples,
         fields_with_descriptions=fields_with_desc,
@@ -512,18 +519,16 @@ def extract_fields(
             "business_validation": {},
         }
 
-    # 4. Confidence scoring (Phase 1 behaviour — unchanged)
     validation = validate_extraction(extracted, fields)
 
-    # 5. Business logic validation — guarded import, never breaks extraction
     business_validation = {}
     try:
         engine = ValidationEngine()
         business_validation = engine.validate(extracted, doc_type)
     except ImportError:
-        pass  # Dev 1 hasn't delivered ValidationEngine yet — skip silently
+        pass
     except Exception:
-        pass  # never break extraction over a validation failure
+        pass
 
     return {
         "extracted":           extracted,
@@ -537,7 +542,6 @@ def extract_fields(
 # ---------------------------------------------------------------------------
 
 def extract_tables(document_id: str) -> list[dict]:
-    
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return []
@@ -616,7 +620,6 @@ JSON:""",
 # ---------------------------------------------------------------------------
 
 def nl_to_schema(instruction: str) -> dict:
-    """Convert plain English instruction to extraction schema."""
     result = call_llm(
         f"""Convert the following extraction instruction into a JSON schema for document extraction.
 
@@ -640,12 +643,6 @@ JSON schema:""",
 
 
 def extract_nl(document_id: str, instruction: str) -> dict:
-    """
-    Natural language extraction pipeline:
-    1. Convert instruction to schema
-    2. Run extraction with feedback loop + validation
-    3. Return schema + extracted + validation + business_validation
-    """
     schema = nl_to_schema(instruction)
 
     if "error" in schema:
@@ -670,9 +667,8 @@ def extract_nl(document_id: str, instruction: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Document classification 
+# Document classification
 # ---------------------------------------------------------------------------
-
 
 DOCUMENT_CLASSIFIER_PROMPT = """You are a document classification expert.
 
@@ -727,8 +723,7 @@ def _get_confidence_threshold() -> float:
 def classify_document(document_id: str) -> dict:
     """
     Classify a document into a known type using LLM + confidence scoring.
-    Checks classification cache first — LLM only called on cache miss.
-    Never raises — always returns a safe default on failure.
+    Checks classification cache first. Never raises.
     """
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:

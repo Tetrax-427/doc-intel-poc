@@ -2,15 +2,24 @@
 AutoRouter selects the best available parser for a given file.
 Falls back gracefully when the preferred parser is unavailable.
 
-Routing logic:
-  - Image files (.png, .jpg, .jpeg, .webp, .tiff) → LlamaParse
-  - Scanned PDF (avg words/page < vision_min_words)  → LlamaParse → pypdf fallback
-  - Complex PDF (tables detected in first pass)       → LlamaParse → pypdf fallback
-  - Simple text PDF                                   → pypdf (faster, cheaper)
-  - DOCX                                              → DocxParser
-  - CSV / XLSX                                        → CsvParser
-  - TXT / MD / RTF                                    → TextParser
-  - URL                                               → UrlParser
+Routing logic (in priority order):
+  Image files (.png/.jpg/.jpeg/.webp/.tiff)
+      → LlamaParse → Docling → pypdf fallback
+
+  Scanned PDF (avg words/page < vision_min_words)
+      → LlamaParse → Docling (OCR) → pypdf fallback
+
+  Regular PDF
+      → LlamaParse (best, paid) → Docling (free, local) → pypdf (fast fallback)
+
+  DOCX                → DocxParser
+  CSV / XLSX          → CsvParser
+  TXT / MD / RTF      → TextParser
+  URL                 → UrlParser
+
+DoclingParser is skipped transparently if docling is not installed —
+is_available() returns False and _get_parser() returns None, so the
+chain falls through to pypdf automatically.
 """
 
 import os
@@ -20,12 +29,13 @@ from core.logger import get_logger
 from core.errors import ParseError, UnsupportedFileTypeError
 from parsers.base import BaseParser
 from parsers.llamaparse import LlamaParseParser
+from parsers.docling_parser import DoclingParser
 from parsers.pypdf_parser import PyPDFParser
 from parsers.docx_parser import DocxParser
 from parsers.csv_parser import CsvParser
 from parsers.text_parser import TextParser
 from parsers.url_parser import UrlParser
-        
+
 logger = get_logger("router")
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tiff"}
@@ -43,10 +53,10 @@ class AutoRouter:
         self._register_parsers()
 
     def _register_parsers(self):
-        """register all available parsers."""
-       
+        """Register all parsers in priority order."""
         self._parsers = [
             LlamaParseParser(),
+            DoclingParser(),   
             PyPDFParser(),
             DocxParser(),
             CsvParser(),
@@ -58,36 +68,50 @@ class AutoRouter:
 
     def route(self, file_path: str) -> BaseParser:
         """
-        Return the best parser for this file.
+        Return the best available parser for this file.
         Raises UnsupportedFileTypeError if no parser can handle it.
         """
         ext = os.path.splitext(file_path)[1].lower()
 
-        # Images always go to LlamaParse (needs OCR + vision)
+        # Images —
         if ext in IMAGE_EXTENSIONS:
-            parser = self._get_parser("llamaparse") or self._get_parser("pypdf")
+            parser = (
+                self._get_parser("llamaparse") or
+                self._get_parser("docling") or
+                self._get_parser("pypdf")
+            )
             if parser:
-                logger.info("Routing image to parser", file=os.path.basename(file_path), parser=parser.get_name())
+                logger.info("Routing image", file=os.path.basename(file_path),
+                            parser=parser.get_name())
                 return parser
 
-        # PDF routing — check if scanned, prefer LlamaParse, fall back to pypdf
         if ext == ".pdf":
             if self._is_scanned(file_path):
-                logger.info("Scanned PDF detected — routing to LlamaParse", file=os.path.basename(file_path))
-                parser = self._get_parser("llamaparse") or self._get_parser("pypdf")
-                if parser:
-                    return parser
+                # Scanned PDFs need OCR — LlamaParse or Docling (both support it)
+                logger.info("Scanned PDF detected", file=os.path.basename(file_path))
+                parser = (
+                    self._get_parser("llamaparse") or
+                    self._get_parser("docling") or
+                    self._get_parser("pypdf")
+                )
             else:
-                # Text PDF — pypdf is faster and cheaper, LlamaParse if tables needed
-                parser = self._get_parser("pypdf") or self._get_parser("llamaparse")
-                if parser:
-                    logger.info("Text PDF — routing to parser", file=os.path.basename(file_path), parser=parser.get_name())
-                    return parser
+                # Text PDF — full priority chain
+                parser = (
+                    self._get_parser("llamaparse") or
+                    self._get_parser("docling") or
+                    self._get_parser("pypdf")
+                )
 
-        # All other types — first parser that can_handle and is_available wins
+            if parser:
+                logger.info("Routing PDF", file=os.path.basename(file_path),
+                            parser=parser.get_name())
+                return parser
+
+        # All other types — first parser that can_handle + is_available wins
         for parser in self._parsers:
             if parser.can_handle(file_path) and parser.is_available(self.config):
-                logger.info("Routing file", file=os.path.basename(file_path), parser=parser.get_name())
+                logger.info("Routing file", file=os.path.basename(file_path),
+                            parser=parser.get_name())
                 return parser
 
         raise UnsupportedFileTypeError(os.path.basename(file_path), ext)
@@ -119,17 +143,19 @@ class AutoRouter:
             pages_to_check = min(3, len(reader.pages))
             if pages_to_check == 0:
                 return True
-            total_words = 0
-            for i in range(pages_to_check):
-                text = reader.pages[i].extract_text() or ""
-                total_words += len(text.split())
+            total_words = sum(
+                len((reader.pages[i].extract_text() or "").split())
+                for i in range(pages_to_check)
+            )
             avg_words = total_words / pages_to_check
             is_scanned = avg_words < self.config.vision_min_words
             if is_scanned:
-                logger.info("Scanned PDF heuristic triggered",
-                            file=os.path.basename(file_path),
-                            avg_words_per_page=round(avg_words, 1),
-                            threshold=self.config.vision_min_words)
+                logger.info(
+                    "Scanned PDF heuristic triggered",
+                    file=os.path.basename(file_path),
+                    avg_words_per_page=round(avg_words, 1),
+                    threshold=self.config.vision_min_words,
+                )
             return is_scanned
         except Exception as e:
             logger.warning("Scanned PDF check failed — assuming text PDF",
