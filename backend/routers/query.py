@@ -7,9 +7,8 @@ from pydantic import BaseModel, validator
 from core.responses import bad_request, internal_error
 from core.logger import get_logger
 from retrieval import query_document, query_document_stream, compress_history
-from db import get_chat_history, save_message 
+from db import get_chat_history, save_message
 
- 
 logger = get_logger("routers.query")
 
 router = APIRouter(tags=["Query"])
@@ -23,12 +22,26 @@ class QueryRequest(BaseModel):
     document_ids: list[str] | None = None
     history: list[dict] = []
     history_summary: str = ""
+    # When supplied, the engine uses this provider/model directly (no fallback).
+    # Both must be set together; supplying only one raises a 400.
+    provider: str | None = None
+    model: str | None = None
 
     @validator("question")
     def question_not_empty(cls, v):
         if not v.strip():
             raise ValueError("Question cannot be empty")
         return v.strip()
+
+    @validator("model", always=True)
+    def provider_and_model_must_be_paired(cls, model, values):
+        provider = values.get("provider")
+        if bool(provider) != bool(model):
+            raise ValueError(
+                "provider and model must be supplied together — "
+                "set both or neither for a per-call override."
+            )
+        return model
 
 
 class SaveChatRequest(BaseModel):
@@ -66,7 +79,9 @@ def query(req: QueryRequest):
     """
     Answer a question, optionally grounded in one or more documents.
     Uses hybrid search + Cohere reranking + LLM generation.
-    Returns answer text and source chunk references.
+
+    Optional fields: provider + model override the fallback chain for
+    this single request. Both must be supplied together or not at all.
     """
     try:
         return query_document(
@@ -75,6 +90,8 @@ def query(req: QueryRequest):
             req.document_ids,
             req.history,
             req.history_summary,
+            provider=req.provider,
+            model=req.model,
         )
     except Exception as exc:
         return internal_error(f"Query failed: {exc}")
@@ -85,6 +102,7 @@ def query_stream(req: QueryRequest):
     """
     Streaming version of /query.
     Tokens are base64-encoded SSE events; ends with data: [DONE].
+    Provider/model override is forwarded to the stream path.
     """
     def event_stream():
         try:
@@ -94,6 +112,8 @@ def query_stream(req: QueryRequest):
                 req.document_ids,
                 req.history,
                 req.history_summary,
+                provider=req.provider,
+                model=req.model,
             ):
                 encoded = base64.b64encode(token.encode()).decode()
                 yield f"data: {encoded}\n\n"

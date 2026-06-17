@@ -26,6 +26,7 @@ Detection strategy:
 
 import uuid
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field
 
 from core.document import Document, DocumentPage
 from core.logger import get_logger
@@ -58,6 +59,32 @@ BOUNDARY_SIGNALS = [
 # Minimum number of pages between two consecutive boundaries.
 # Prevents splitting a 3-page document into [1], [2], [3].
 MIN_PAGE_GAP = 2
+
+
+# ---------------------------------------------------------------------------
+# Instructor response model
+# ---------------------------------------------------------------------------
+
+class SplitBoundaries(BaseModel):
+    """
+    Structured response model for LLM boundary refinement.
+
+    Using Instructor here instead of json_mode=True gives us:
+    - Automatic retry if the LLM returns malformed output
+    - Type-validated page_numbers (list of ints, never strings or nulls)
+    - No manual json.loads() or isinstance() checks needed
+
+    page_numbers must always include 1 (page 1 is always a boundary).
+    The LLM is instructed to include it; Pydantic default guarantees it
+    even if the LLM omits it.
+    """
+    page_numbers: list[int] = Field(
+        default_factory=lambda: [1],
+        description=(
+            "Confirmed page numbers that start a new document. "
+            "Must always include 1. Example: [1, 5, 12]"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +139,15 @@ def detect_boundaries_fast(document: Document) -> list[int]:
 
 def detect_boundaries_llm(document: Document, fast_boundaries: list[int]) -> list[int]:
     """
-    LLM-based boundary refinement.
+    LLM-based boundary refinement using Instructor structured output.
 
     Only called when fast detection already found candidate boundaries.
     Sends the first 200 chars of each candidate page to the LLM and asks
     it to confirm or reject. Keeps page 1 unconditionally.
+
+    Uses SplitBoundaries (Pydantic model) via Instructor instead of
+    json_mode=True — eliminates manual JSON parsing and gives automatic
+    retry on malformed LLM output.
 
     Args:
         document:        The parsed Document.
@@ -146,37 +177,34 @@ def detect_boundaries_llm(document: Document, fast_boundaries: list[int]) -> lis
         "Do NOT mark boundaries for section headings within a single document.\n\n"
         "Candidate pages:\n"
         + "\n".join(candidate_pages)
-        + "\n\nReturn ONLY a JSON array of confirmed page numbers that start a new document.\n"
-        "Always include page 1. Example: [1, 5, 12]\n"
-        "JSON:"
+        + "\n\nReturn the confirmed page numbers that start a new document. "
+        "Always include page 1."
     )
 
     try:
-        result = call_llm(
+        result: SplitBoundaries = call_llm(
             prompt,
             temperature=0.0,
-            json_mode=True,
             call_type="split_detection",
+            response_model=SplitBoundaries,
         )
 
-        if isinstance(result, list):
-            confirmed = sorted(set([1] + [int(p) for p in result if isinstance(p, (int, float))]))
-            logger.info(
-                "LLM boundary refinement complete",
-                file=document.file_name,
-                fast=fast_boundaries,
-                confirmed=confirmed,
-            )
-            return confirmed
+        # Guarantee page 1 is always present, sort, deduplicate
+        confirmed = sorted(set([1] + [p for p in result.page_numbers if isinstance(p, int)]))
 
-        # LLM returned a dict (e.g. {"error": ...}) — fall back to fast results
-        logger.warning("LLM returned unexpected format — using fast boundaries",
-                       result=result)
-        return fast_boundaries
+        logger.info(
+            "LLM boundary refinement complete",
+            file=document.file_name,
+            fast=fast_boundaries,
+            confirmed=confirmed,
+        )
+        return confirmed
 
     except Exception as e:
-        logger.warning("LLM boundary detection failed — using fast boundaries",
-                       error=str(e))
+        logger.warning(
+            "LLM boundary detection failed — using fast boundaries",
+            error=str(e),
+        )
         return fast_boundaries
 
 

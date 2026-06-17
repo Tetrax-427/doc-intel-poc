@@ -1,6 +1,6 @@
 import os
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,12 +8,18 @@ load_dotenv()
 
 @dataclass
 class Config:
-    # LLM
+    # LLM — primary provider (used as first entry if fallback chain is empty)
     llm_provider: str
     llm_model: str
     groq_api_key: str
     openai_api_key: str
     anthropic_api_key: str
+
+    # LLM fallback chain — ordered list of "provider:model" strings.
+    # Example: ["groq:llama-3.3-70b-versatile", "openai:gpt-4o-mini", "anthropic:claude-3-5-haiku-20241022"]
+    # call_llm() walks this list in order; first success wins.
+    # If empty, falls back to a single-entry chain built from llm_provider + llm_model.
+    llm_fallback_chain: list[str]
 
     # Vision (optional)
     vision_provider: str
@@ -23,7 +29,7 @@ class Config:
     llama_cloud_api_key: str
     cohere_api_key: str
 
-    # Supabase 
+    # Supabase
     supabase_url: str
     supabase_key: str
 
@@ -35,6 +41,56 @@ class Config:
     compression_threshold: int       # messages before history compression
     vision_min_words: int            # pages with fewer words trigger vision
     classification_confidence_threshold: float  # below this = flag for review
+
+
+def _parse_fallback_chain(raw: str, default_provider: str, default_model: str) -> list[str]:
+    """
+    Parse LLM_FALLBACK_CHAIN env var into a list of "provider:model" strings.
+
+    Expected format (comma-separated):
+        groq:llama-3.3-70b-versatile,openai:gpt-4o-mini,anthropic:claude-3-5-haiku-20241022
+
+    Rules:
+    - Whitespace around entries is stripped.
+    - Empty entries are skipped.
+    - If the env var is absent or blank, a single-entry chain is built from
+      LLM_PROVIDER + LLM_MODEL so existing single-provider deployments work
+      without any .env changes.
+    - Invalid entries (no colon, empty provider/model) are skipped with a warning.
+    """
+    if not raw or not raw.strip():
+        # No chain configured — build a single-entry chain from primary provider
+        return [f"{default_provider}:{default_model}"]
+
+    entries = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            logging.warning(
+                f"[config] Skipping invalid LLM_FALLBACK_CHAIN entry '{part}' "
+                f"— expected format 'provider:model'"
+            )
+            continue
+        provider, model = part.split(":", 1)
+        provider, model = provider.strip(), model.strip()
+        if not provider or not model:
+            logging.warning(
+                f"[config] Skipping malformed LLM_FALLBACK_CHAIN entry '{part}' "
+                f"— provider or model is empty"
+            )
+            continue
+        entries.append(f"{provider}:{model}")
+
+    if not entries:
+        logging.warning(
+            "[config] LLM_FALLBACK_CHAIN was set but produced no valid entries "
+            f"— falling back to {default_provider}:{default_model}"
+        )
+        return [f"{default_provider}:{default_model}"]
+
+    return entries
 
 
 def load_config() -> Config:
@@ -60,12 +116,20 @@ def load_config() -> Config:
         if not os.getenv(key):
             logging.warning(f"[config] {key} not set — {warning_msg}")
 
+    default_provider = os.getenv("LLM_PROVIDER", "groq")
+    default_model    = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+
     return Config(
-        llm_provider=os.getenv("LLM_PROVIDER", "groq"),
-        llm_model=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+        llm_provider=default_provider,
+        llm_model=default_model,
         groq_api_key=os.getenv("GROQ_API_KEY", ""),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        llm_fallback_chain=_parse_fallback_chain(
+            os.getenv("LLM_FALLBACK_CHAIN", ""),
+            default_provider,
+            default_model,
+        ),
         vision_provider=os.getenv("VISION_PROVIDER", ""),
         vision_model=os.getenv("VISION_MODEL", ""),
         llama_cloud_api_key=os.getenv("LLAMA_CLOUD_API_KEY", ""),

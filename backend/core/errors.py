@@ -10,6 +10,7 @@ Error code namespaces:
     VALID_0xx   — validation
     VISION_0xx  — vision model calls
     CONFIG_0xx  — configuration
+    LLM_0xx     — LLM engine, fallback chain, structured outputs
 """
 
 
@@ -175,4 +176,109 @@ class ConfigError(DocIntelError):
             code="CONFIG_001",
             severity="ERROR",
             retryable=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# LLM engine errors (LLM_0xx)
+# ---------------------------------------------------------------------------
+
+class LLMError(DocIntelError):
+    """
+    Raised when a single LLM provider call fails.
+    Carries the provider/model that failed for logging in the fallback loop.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        provider: str = "",
+        model: str = "",
+        retryable: bool = True,
+    ):
+        super().__init__(
+            message,
+            code="LLM_001",
+            severity="ERROR",
+            retryable=retryable,
+            context={"provider": provider, "model": model},
+        )
+
+
+class LLMFallbackExhaustedError(DocIntelError):
+    """
+    Raised when every provider in the fallback chain has failed.
+    The `providers_tried` context field lists each (provider, model) pair
+    that was attempted, in order, for post-mortem logging.
+    """
+
+    def __init__(self, providers_tried: list[tuple[str, str]]):
+        tried_str = ", ".join(f"{p}:{m}" for p, m in providers_tried)
+        super().__init__(
+            f"All LLM providers in fallback chain failed. Tried: {tried_str}",
+            code="LLM_002",
+            severity="ERROR",
+            retryable=False,
+            context={"providers_tried": providers_tried},
+        )
+
+
+class LLMProviderOverrideError(DocIntelError):
+    """
+    Raised when a per-call provider/model override fails and no fallback
+    is attempted (override calls are single-shot by design — C3).
+    """
+
+    def __init__(self, provider: str, model: str, reason: str = ""):
+        super().__init__(
+            f"Provider override failed for {provider}:{model}. {reason}".strip(),
+            code="LLM_003",
+            severity="ERROR",
+            retryable=False,
+            context={"provider": provider, "model": model, "reason": reason},
+        )
+
+
+class StructuredOutputError(DocIntelError):
+    """
+    Raised when Instructor fails to coerce an LLM response into the
+    requested Pydantic model after exhausting its internal retries.
+    Carries the response_model name and the provider/model involved.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        response_model_name: str = "",
+        provider: str = "",
+        model: str = "",
+    ):
+        super().__init__(
+            message,
+            code="LLM_004",
+            severity="ERROR",
+            retryable=True,   # outer fallback chain may succeed on next provider
+            context={
+                "response_model": response_model_name,
+                "provider": provider,
+                "model": model,
+            },
+        )
+
+
+class LLMConfigError(DocIntelError):
+    """
+    Raised for LLM-specific configuration problems:
+    - unsupported provider name in fallback chain
+    - missing API key for a provider that appears in the chain
+    - Instructor adapter not available for a provider
+    """
+
+    def __init__(self, message: str, provider: str = ""):
+        super().__init__(
+            message,
+            code="LLM_005",
+            severity="ERROR",
+            retryable=False,
+            context={"provider": provider},
         )
