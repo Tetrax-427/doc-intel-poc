@@ -7,14 +7,15 @@ from llama_index.core import Document as LlamaIndexDocument
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from db import insert_document, insert_chunks
-from core.config import config
+from core.config import config, uses_hierarchical_chunking
 from core.logger import get_logger
 from core.errors import ParseError, UnsupportedFileTypeError
-from core.document import Document, ImageElement
+from core.document import ImageElement
 from parsers.router import AutoRouter
 from core.cache import get_embedding, set_embedding
 from vision.triggers import should_use_vision
 from vision.engine import describe_image, describe_pdf_page
+from hierarchical import build_hierarchical_chunks, make_flat_chunk_metadata
 
 load_dotenv()
 
@@ -53,7 +54,7 @@ _router = AutoRouter(config)
 
 
 # ---------------------------------------------------------------------------
-# Embedding helper
+# Embedding helper — cache-aware
 # ---------------------------------------------------------------------------
 
 def _get_embedding(text: str, model) -> list[float]:
@@ -81,244 +82,60 @@ def _run_vision_for_page(
     doc_type: str,
     is_scanned: bool,
 ) -> list[ImageElement]:
-    """
-    Run the vision engine for a single page. Returns ImageElements with
-    descriptions populated.
-
-    For figure-type ImageElements (chunk_type='figure'), vision always runs
-    if a vision model is configured — figures are the primary signal.
-    For other elements, should_use_vision() gates the call as before.
-
-    Never raises.
-    """
     try:
-        ext = os.path.splitext(file_path)[1].lower()
-        is_image_file = ext in _IMAGE_EXTENSIONS
+        if not should_use_vision(file_path, page.text, is_scanned, doc_type, config):
+            return page.images
 
-        if not page.images:
-            # No images at all — check whether we should synthesize one
-            if not should_use_vision(file_path, page.text, is_scanned, doc_type, config):
-                return []
+        ext          = os.path.splitext(file_path)[1].lower()
+        is_image_file = ext in _IMAGE_EXTENSIONS
+        updated_images: list[ImageElement] = []
+
+        if page.images:
+            for img in page.images:
+                if img.description:
+                    updated_images.append(img)
+                    continue
+                description = (
+                    describe_image(file_path, doc_type)
+                    if is_image_file
+                    else describe_pdf_page(file_path, page.page_num - 1, doc_type)
+                )
+                updated_images.append(ImageElement(
+                    page_num=img.page_num,
+                    image_ref=img.image_ref or f"page_{page.page_num}",
+                    ocr_text=img.ocr_text,
+                    description=description,
+                    chunk_type="description" if description else img.chunk_type,
+                    vision_prompt_used=doc_type,
+                ))
+        else:
             description = (
                 describe_image(file_path, doc_type)
                 if is_image_file
                 else describe_pdf_page(file_path, page.page_num - 1, doc_type)
             )
             if description:
-                return [ImageElement(
+                updated_images.append(ImageElement(
                     page_num=page.page_num,
                     image_ref=f"page_{page.page_num}",
                     ocr_text="",
                     description=description,
                     chunk_type="description",
                     vision_prompt_used=doc_type,
-                )]
-            return []
-
-        updated_images: list[ImageElement] = []
-
-        for img in page.images:
-            # Always describe figures if vision model is configured;
-            # for other chunk types, gate on should_use_vision()
-            is_figure = img.chunk_type == "figure"
-
-            if img.description:
-                updated_images.append(img)
-                continue
-
-            if not is_figure and not should_use_vision(
-                file_path, page.text, is_scanned, doc_type, config
-            ):
-                updated_images.append(img)
-                continue
-
-            description = (
-                describe_image(file_path, doc_type)
-                if is_image_file
-                else describe_pdf_page(file_path, page.page_num - 1, doc_type)
-            )
-
-            updated_images.append(ImageElement(
-                page_num=img.page_num,
-                image_ref=img.image_ref or f"page_{page.page_num}",
-                ocr_text=img.ocr_text,
-                description=description,
-                chunk_type=img.chunk_type,          # preserves "figure"
-                vision_prompt_used=doc_type,
-                bbox=img.bbox,                      # B1 — preserve bbox
-                caption=img.caption,                # B3 — preserve caption
-                element_type=img.element_type,      # B3 — preserve element_type
-            ))
+                ))
 
         return updated_images
 
     except Exception as e:
-        logger.error("Vision page processing failed", page=page.page_num, error=str(e))
+        logger.error(
+            "Vision page processing failed — skipping vision for this page",
+            page=page.page_num, error=str(e),
+        )
         return page.images
 
 
 # ---------------------------------------------------------------------------
-# Reusable chunk builder (extracted in Group A, extended in Group B)
-# ---------------------------------------------------------------------------
-
-def build_chunks_for_document(
-    document: Document,
-    doc_id: str,
-    file_path: str,
-    doc_type: str = "general",
-    model=None,
-) -> tuple[list[dict], bool]:
-    """
-    Build all chunk rows for a Document.
-
-    Chunk types:
-      "text"        — text segments (reading_order if Docling, else raw page text)
-      "table"       — one chunk per table
-      "description" — vision description for scanned/image pages
-      "figure"      — B3: figure/chart element with caption + bbox in metadata
-
-    Returns:
-        (chunk_rows, vision_used)
-    """
-    if model is None:
-        model = get_embed_model()
-
-    file_name = document.file_name
-    is_scanned = document.is_scanned
-    chunk_rows = []
-    vision_used = False
-
-    for page in document.pages:
-
-        # ----------------------------------------------------------------
-        # 1. Text chunks — reading_order (Docling) or raw page text
-        # ----------------------------------------------------------------
-        if page.reading_order:
-            for segment_idx, segment in enumerate(page.reading_order):
-                if len(segment.strip()) < 20:
-                    continue
-
-                doc_obj = LlamaIndexDocument(text=segment)
-                nodes = splitter.get_nodes_from_documents([doc_obj])
-
-                # B1 — attach bbox if available for this segment
-                segment_bbox = None
-                if (page.reading_order_bboxes and
-                        segment_idx < len(page.reading_order_bboxes)):
-                    b = page.reading_order_bboxes[segment_idx]
-                    segment_bbox = b.to_dict() if b else None
-
-                for node in nodes:
-                    clean_text = node.text.replace("\x00", " ").strip()
-                    if not clean_text:
-                        continue
-                    embedding = _get_embedding(clean_text, model)
-                    chunk_rows.append({
-                        "document_id": doc_id,
-                        "content":     clean_text,
-                        "embedding":   embedding,
-                        "metadata": {
-                            "page":                str(page.page_num),
-                            "file":                file_name,
-                            "chunk_type":          "text",
-                            "image_ref":           None,
-                            "reading_order_index": segment_idx,
-                            "bbox":                segment_bbox,   # B1
-                        }
-                    })
-        else:
-            llama_doc = LlamaIndexDocument(text=page.text)
-            nodes = splitter.get_nodes_from_documents([llama_doc])
-
-            for node in nodes:
-                clean_text = node.text.replace("\x00", " ").strip()
-                if not clean_text:
-                    continue
-                embedding = _get_embedding(clean_text, model)
-                chunk_rows.append({
-                    "document_id": doc_id,
-                    "content":     clean_text,
-                    "embedding":   embedding,
-                    "metadata": {
-                        "page":                str(page.page_num),
-                        "file":                file_name,
-                        "chunk_type":          "text",
-                        "image_ref":           None,
-                        "reading_order_index": None,
-                        "bbox":                None,
-                    }
-                })
-
-        # ----------------------------------------------------------------
-        # 2. Table chunks
-        # ----------------------------------------------------------------
-        for table in page.tables:
-            if not table.raw_text.strip():
-                continue
-            table_text = f"[Table: {table.title or 'untitled'}]\n{table.raw_text}"
-            clean_table = table_text.replace("\x00", " ").strip()
-            embedding = _get_embedding(clean_table, model)
-            chunk_rows.append({
-                "document_id": doc_id,
-                "content":     clean_table,
-                "embedding":   embedding,
-                "metadata": {
-                    "page":       str(page.page_num),
-                    "file":       file_name,
-                    "chunk_type": "table",
-                    "image_ref":  None,
-                    "bbox":       None,
-                }
-            })
-
-        # ----------------------------------------------------------------
-        # 3. Vision + figure chunks (B3)
-        # ----------------------------------------------------------------
-        images_with_descriptions = _run_vision_for_page(
-            file_path, page, doc_type, is_scanned
-        )
-
-        for img in images_with_descriptions:
-            if not img.description:
-                continue
-            clean_desc = img.description.replace("\x00", " ").strip()
-            if not clean_desc:
-                continue
-
-            # B3 — figure chunks get their caption prepended if present
-            if img.chunk_type == "figure" and img.caption:
-                content = (
-                    f"[Figure — Page {page.page_num}]: "
-                    f"Caption: {img.caption}. {clean_desc}"
-                )
-            elif img.chunk_type == "figure":
-                content = f"[Figure — Page {page.page_num}]: {clean_desc}"
-            else:
-                content = f"[Visual Description — Page {page.page_num}]: {clean_desc}"
-
-            embedding = _get_embedding(content, model)
-            chunk_rows.append({
-                "document_id": doc_id,
-                "content":     content,
-                "embedding":   embedding,
-                "metadata": {
-                    "page":               str(page.page_num),
-                    "file":               file_name,
-                    "chunk_type":         img.chunk_type,   # "figure" or "description"
-                    "image_ref":          img.image_ref,
-                    "vision_prompt_used": img.vision_prompt_used,
-                    "caption":            img.caption,      # B3
-                    "element_type":       img.element_type, # B3
-                    "bbox":               img.bbox.to_dict() if img.bbox else None,  # B1
-                }
-            })
-            vision_used = True
-
-    return chunk_rows, vision_used
-
-
-# ---------------------------------------------------------------------------
-# Main ingestion entry point
+# Main file ingestion —
 # ---------------------------------------------------------------------------
 
 def ingest_file(
@@ -327,14 +144,34 @@ def ingest_file(
     doc_type: str = "general",
     user_id: str = "anonymous",
 ) -> dict:
+    """
+    Ingest a file into the vector store.
+
+    D1 change: classifies document from raw text BEFORE chunking so the
+    correct chunking mode (hierarchical vs flat) can be selected per page.
+    The classification result is returned in the response dict so
+    documents.py can persist it without running classification a second time.
+
+    Args:
+        file_path:      Absolute path to the uploaded file.
+        use_llamaparse: Use LlamaParse for PDF parsing (falls back to pypdf).
+        doc_type:       Hint from the upload form — used only as a fallback
+                        if our internal classification fails or returns "general".
+        user_id:        Scopes the document to this user.
+
+    Returns:
+        Dict with document_id, chunk counts, parser used, vision_used flag,
+        and classification result. Returns {"error": "..."} on failure.
+    """
     file_name = os.path.basename(file_path)
-    ext = os.path.splitext(file_path)[1].lower()
-    model = get_embed_model()
+    ext       = os.path.splitext(file_path)[1].lower()
+    model     = get_embed_model()
 
     if ext not in SUPPORTED_EXTENSIONS:
         logger.error("Unsupported file type", file=file_name, ext=ext)
         return {"error": f"Unsupported file type: {ext}"}
 
+    # --- Parse ---
     try:
         logger.info("Routing file to parser", file=file_name, doc_type=doc_type)
         document = _router.parse(file_path)
@@ -347,39 +184,158 @@ def ingest_file(
             is_scanned=document.is_scanned,
         )
     except UnsupportedFileTypeError as e:
-        logger.error("No parser available", file=file_name, error=str(e))
         return {"error": str(e), "code": e.code}
     except ParseError as e:
-        logger.error("Parse failed", file=file_name, error=str(e),
-                     code=e.code, retryable=e.retryable)
         return {"error": str(e), "code": e.code}
     except Exception as e:
-        logger.error("Unexpected parse error", file=file_name, error=str(e))
         return {"error": f"Could not process file: {str(e)}"}
 
     if not document.full_text.strip():
-        if os.path.splitext(file_path)[1].lower() not in _IMAGE_EXTENSIONS:
+        if ext not in _IMAGE_EXTENSIONS:
             return {"error": "Could not extract text. File may be empty or image-only."}
 
-    doc_id = insert_document(file_name, user_id=user_id)
+    # ----------------------------------------------------------------
+    # Classify from raw text BEFORE chunking
+    # This determines whether to use hierarchical or flat chunking.
+    # ----------------------------------------------------------------
+    detected_doc_type = doc_type   # start with caller's hint
+    classification_result = None
 
-    chunk_rows, vision_used = build_chunks_for_document(
-        document=document,
-        doc_id=doc_id,
-        file_path=file_path,
-        doc_type=doc_type,
-        model=model,
+    try:
+        from retrieval import classify_document_from_text
+        raw_text_sample = document.full_text[:3000]
+        classification_result = classify_document_from_text(
+            raw_text_sample, document_id=""
+        )
+        detected = classification_result.get("doc_type", "general")
+        if detected and detected != "general":
+            detected_doc_type = detected
+            logger.info(
+                "Pre-ingestion classification complete",
+                file=file_name,
+                doc_type=detected_doc_type,
+                confidence=classification_result.get("confidence", 0.0),
+            )
+        else:
+            logger.info(
+                "Pre-ingestion classification returned general — keeping caller hint",
+                file=file_name,
+                hint=doc_type,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Pre-ingestion classification failed — using caller hint",
+            file=file_name,
+            error=str(exc),
+            fallback_doc_type=doc_type,
+        )
+
+    use_hierarchical = uses_hierarchical_chunking(detected_doc_type)
+    logger.info(
+        "Chunking mode selected",
+        file=file_name,
+        doc_type=detected_doc_type,
+        mode="hierarchical" if use_hierarchical else "flat",
     )
+
+    is_scanned = document.is_scanned
+    doc_id     = insert_document(file_name, user_id=user_id)
+    chunk_rows = []
+    vision_used = False
+
+    def _embed(text: str) -> list[float]:
+        return _get_embedding(text, model)
+
+    for page in document.pages:
+
+        # ----------------------------------------------------------------
+        # 1. Text chunks — hierarchical or flat depending on doc type
+        # ----------------------------------------------------------------
+        if use_hierarchical:
+            hier_rows = build_hierarchical_chunks(
+                page_text=page.text,
+                page_num=page.page_num,
+                file_name=file_name,
+                document_id=doc_id,
+                embed_fn=_embed,
+            )
+            chunk_rows.extend(hier_rows)
+        else:
+            # Flat chunking — unchanged from original ingestion.py
+            llama_doc = LlamaIndexDocument(text=page.text)
+            nodes     = splitter.get_nodes_from_documents([llama_doc])
+
+            for node in nodes:
+                clean_text = node.text.replace("\x00", " ").strip()
+                if not clean_text:
+                    continue
+                embedding = _embed(clean_text)
+                chunk_rows.append({
+                    "document_id": doc_id,
+                    "content":     clean_text,
+                    "embedding":   embedding,
+                    "metadata":    make_flat_chunk_metadata(
+                        page.page_num, file_name, chunk_type="text"
+                    ),
+                })
+
+        # ----------------------------------------------------------------
+        # 2. Table chunks — always flat regardless of chunking mode
+        # ----------------------------------------------------------------
+        for table in page.tables:
+            if not table.raw_text.strip():
+                continue
+            table_text  = f"[Table: {table.title or 'untitled'}]\n{table.raw_text}"
+            clean_table = table_text.replace("\x00", " ").strip()
+            embedding   = _embed(clean_table)
+            chunk_rows.append({
+                "document_id": doc_id,
+                "content":     clean_table,
+                "embedding":   embedding,
+                "metadata":    make_flat_chunk_metadata(
+                    page.page_num, file_name, chunk_type="table"
+                ),
+            })
+
+        # ----------------------------------------------------------------
+        # 3. Vision description chunks — always flat
+        # ----------------------------------------------------------------
+        images_with_descriptions = _run_vision_for_page(
+            file_path, page, detected_doc_type, is_scanned
+        )
+
+        for img in images_with_descriptions:
+            if not img.description:
+                continue
+            clean_desc = img.description.replace("\x00", " ").strip()
+            if not clean_desc:
+                continue
+
+            content   = f"[Visual Description — Page {page.page_num}]: {clean_desc}"
+            embedding = _embed(content)
+            chunk_rows.append({
+                "document_id": doc_id,
+                "content":     content,
+                "embedding":   embedding,
+                "metadata":    make_flat_chunk_metadata(
+                    page.page_num, file_name,
+                    chunk_type="description",
+                    image_ref=img.image_ref,
+                    extra={"vision_prompt_used": img.vision_prompt_used},
+                ),
+            })
+            vision_used = True
 
     if not chunk_rows:
         return {"error": "No content could be extracted for indexing."}
 
     insert_chunks(chunk_rows)
 
-    text_chunks   = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "text")
-    table_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "table")
-    desc_chunks   = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "description")
-    figure_chunks = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "figure")
+    text_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "text"
+                       and c["metadata"].get("chunk_level") != "parent")
+    table_chunks = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "table")
+    desc_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "description")
+    parent_chunks = sum(1 for c in chunk_rows if c["metadata"].get("chunk_level") == "parent")
 
     logger.info(
         "Ingestion complete",
@@ -389,10 +345,11 @@ def ingest_file(
         text_chunks=text_chunks,
         table_chunks=table_chunks,
         desc_chunks=desc_chunks,
-        figure_chunks=figure_chunks,
+        parent_chunks=parent_chunks,
         parser=document.parser_used,
         vision_used=vision_used,
-        doc_type=doc_type,
+        doc_type=detected_doc_type,
+        chunking_mode="hierarchical" if use_hierarchical else "flat",
     )
 
     return {
@@ -402,16 +359,21 @@ def ingest_file(
         "text_chunks":      text_chunks,
         "table_chunks":     table_chunks,
         "description_chunks": desc_chunks,
-        "figure_chunks":    figure_chunks,
+        "parent_chunks":    parent_chunks,
         "parser":           document.parser_used,
         "page_count":       document.page_count,
         "table_count":      len(document.tables),
         "vision_used":      vision_used,
+        "doc_type":         detected_doc_type,
+        "chunking_mode":    "hierarchical" if use_hierarchical else "flat",
+        # Pass classification result so documents.py can persist it
+        # without running a second classify_document() call.
+        "_classification":  classification_result,
     }
 
 
 # ---------------------------------------------------------------------------
-# URL ingestion — unchanged
+# URL ingestion — flat chunking only (URLs are always flat)
 # ---------------------------------------------------------------------------
 
 def ingest_url(url: str, user_id: str = "anonymous") -> dict:
@@ -421,51 +383,50 @@ def ingest_url(url: str, user_id: str = "anonymous") -> dict:
     try:
         document = _router.parse(url)
     except ParseError as e:
-        logger.error("URL parse failed", url=url, error=str(e))
         return {"error": str(e), "code": e.code}
     except Exception as e:
-        logger.error("Unexpected URL parse error", url=url, error=str(e))
         return {"error": f"Could not fetch URL: {e}"}
 
     if not document.full_text.strip():
         return {"error": "Could not extract text from this URL."}
 
-    doc_id = insert_document(document.file_name, user_id=user_id)
+    doc_id     = insert_document(document.file_name, user_id=user_id)
     chunk_rows = []
+
+    def _embed(text: str) -> list[float]:
+        return _get_embedding(text, model)
 
     for page in document.pages:
         llama_doc = LlamaIndexDocument(text=page.text)
-        nodes = splitter.get_nodes_from_documents([llama_doc])
+        nodes     = splitter.get_nodes_from_documents([llama_doc])
 
         for node in nodes:
             clean = node.text.replace("\x00", " ").strip()
             if not clean:
                 continue
-            embedding = _get_embedding(clean, model)
             chunk_rows.append({
                 "document_id": doc_id,
                 "content":     clean,
-                "embedding":   embedding,
-                "metadata": {
-                    "page":       str(page.page_num),
-                    "file":       document.file_name,
-                    "chunk_type": "text",
-                    "image_ref":  None,
-                    "source_url": url,
-                }
+                "embedding":   _embed(clean),
+                "metadata":    make_flat_chunk_metadata(
+                    page.page_num, document.file_name,
+                    chunk_type="text",
+                    extra={"source_url": url},
+                ),
             })
 
     if not chunk_rows:
         return {"error": "No content could be extracted from this URL."}
 
     insert_chunks(chunk_rows)
+
     logger.info("URL ingestion complete", url=url, doc_id=doc_id, chunks=len(chunk_rows))
 
     return {
-        "document_id":  doc_id,
-        "file":         document.file_name,
-        "title":        document.metadata.get("title", ""),
+        "document_id":   doc_id,
+        "file":          document.file_name,
+        "title":         document.metadata.get("title", ""),
         "chunks_stored": len(chunk_rows),
-        "page_count":   document.page_count,
-        "parser":       "url",
+        "page_count":    document.page_count,
+        "parser":        "url",
     }

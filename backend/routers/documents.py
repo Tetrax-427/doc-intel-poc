@@ -8,6 +8,12 @@ Endpoints:
     GET    /summary/{document_id}
     GET    /documents/{document_id}/classification
     POST   /documents/{document_id}/classification
+
+ _run_post_ingest() now accepts an optional pre-computed
+classification result from ingest_file() (stored in result["_classification"]).
+If present, it is persisted directly without running classify_document() again.
+classify_document() is only called as a fallback when the key is absent
+(URL ingestion, old code paths).
 """
 
 import os
@@ -57,7 +63,17 @@ class ClassificationOverrideRequest(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _run_post_ingest(document_id: str, result: dict) -> dict:
-    """Run summary + classification after ingestion. Non-blocking."""
+    """
+    Run summary + classification after ingestion.
+
+    D1 change: if ingest_file() already ran pre-ingestion classification
+    (stored in result["_classification"]), persist it directly and skip the
+    second classify_document() call. This avoids a redundant LLM call.
+
+    Falls back to classify_document() if _classification is absent or None
+    (URL ingestion path, old callers).
+    """
+    # Summary
     try:
         summary_data = generate_summary(document_id)
         save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
@@ -65,13 +81,25 @@ def _run_post_ingest(document_id: str, result: dict) -> dict:
     except Exception as exc:
         print(f"[documents] Summary generation failed (non-blocking): {exc}")
 
-    try:
-        classification = classify_document(document_id)
-        save_classification(document_id, classification)
-        result["classification"] = classification
-    except Exception as exc:
-        print(f"[documents] Classification failed (non-blocking): {exc}")
-        result["classification"] = {"doc_type": "general", "confidence": 0.0}
+    # Classification — use pre-computed result if available
+    pre_classification = result.pop("_classification", None)
+
+    if pre_classification and pre_classification.get("doc_type"):
+        try:
+            save_classification(document_id, pre_classification)
+            result["classification"] = pre_classification
+        except Exception as exc:
+            print(f"[documents] Persisting pre-classification failed: {exc}")
+            result["classification"] = pre_classification  # still return it
+    else:
+        # Fallback — run classification from stored chunks (URL ingestion etc.)
+        try:
+            classification = classify_document(document_id)
+            save_classification(document_id, classification)
+            result["classification"] = classification
+        except Exception as exc:
+            print(f"[documents] Classification failed (non-blocking): {exc}")
+            result["classification"] = {"doc_type": "general", "confidence": 0.0}
 
     return result
 
@@ -103,7 +131,7 @@ async def upload_document(
             temp_path,
             use_llamaparse=use_lp,
             doc_type=vision_template,
-            user_id=uid,                  # ← scopes document to this user
+            user_id=uid,
         )
     except Exception as exc:
         return internal_error(f"Ingestion failed: {exc}")

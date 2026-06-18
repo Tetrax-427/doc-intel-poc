@@ -8,6 +8,7 @@ from core.responses import bad_request, internal_error
 from core.logger import get_logger
 from retrieval import query_document, query_document_stream, compress_history
 from db import get_chat_history, save_message
+from hyde import VALID_RETRIEVAL_MODES
 
 logger = get_logger("routers.query")
 
@@ -22,10 +23,14 @@ class QueryRequest(BaseModel):
     document_ids: list[str] | None = None
     history: list[dict] = []
     history_summary: str = ""
-    # When supplied, the engine uses this provider/model directly (no fallback).
-    # Both must be set together; supplying only one raises a 400.
+    # C3 — per-call provider/model override
     provider: str | None = None
     model: str | None = None
+    # D2 — retrieval mode
+    # "standard" or "none" = plain hybrid search (default)
+    # "hyde"      = HyDE passage replaces query for dense embedding
+    # "multiquery" = 2-3 query variants, merged + deduped
+    retrieval_mode: str = "standard"
 
     @validator("question")
     def question_not_empty(cls, v):
@@ -42,6 +47,19 @@ class QueryRequest(BaseModel):
                 "set both or neither for a per-call override."
             )
         return model
+
+    @validator("retrieval_mode", always=True)
+    def retrieval_mode_valid(cls, v):
+        # normalise "none" → "standard"; reject truly unknown values
+        normalised = v.strip().lower() if v else "standard"
+        if normalised == "none":
+            return "standard"
+        if normalised not in VALID_RETRIEVAL_MODES:
+            raise ValueError(
+                f"retrieval_mode must be one of: {', '.join(sorted(VALID_RETRIEVAL_MODES))}. "
+                f"Got '{v}'."
+            )
+        return normalised
 
 
 class SaveChatRequest(BaseModel):
@@ -78,10 +96,15 @@ class CompressRequest(BaseModel):
 def query(req: QueryRequest):
     """
     Answer a question, optionally grounded in one or more documents.
-    Uses hybrid search + Cohere reranking + LLM generation.
 
-    Optional fields: provider + model override the fallback chain for
-    this single request. Both must be supplied together or not at all.
+    New D2 field: retrieval_mode
+        "standard" (default) — plain hybrid search, no extra LLM calls
+        "hyde"     — HyDE passage replaces query for dense embedding step
+        "multiquery" — 2-3 paraphrased query variants, results merged+deduped
+
+    New C3 fields: provider + model
+        Override the LLM provider/model for this single request.
+        Both must be supplied together or not at all.
     """
     try:
         return query_document(
@@ -92,6 +115,7 @@ def query(req: QueryRequest):
             req.history_summary,
             provider=req.provider,
             model=req.model,
+            retrieval_mode=req.retrieval_mode,
         )
     except Exception as exc:
         return internal_error(f"Query failed: {exc}")
@@ -102,7 +126,7 @@ def query_stream(req: QueryRequest):
     """
     Streaming version of /query.
     Tokens are base64-encoded SSE events; ends with data: [DONE].
-    Provider/model override is forwarded to the stream path.
+    retrieval_mode is applied before streaming begins.
     """
     def event_stream():
         try:
@@ -114,6 +138,7 @@ def query_stream(req: QueryRequest):
                 req.history_summary,
                 provider=req.provider,
                 model=req.model,
+                retrieval_mode=req.retrieval_mode,
             ):
                 encoded = base64.b64encode(token.encode()).decode()
                 yield f"data: {encoded}\n\n"
