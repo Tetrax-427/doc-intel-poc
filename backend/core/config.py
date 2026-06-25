@@ -7,8 +7,6 @@ load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Default hierarchical chunking doc types
-# Long, section-heavy documents benefit most from parent/child chunking.
-# Short flat docs (invoice, cv_resume, receipt) stay on flat chunking.
 # ---------------------------------------------------------------------------
 _DEFAULT_HIERARCHICAL_DOC_TYPES = [
     "contract", "agreement", "nda", "loan_application",
@@ -18,7 +16,7 @@ _DEFAULT_HIERARCHICAL_DOC_TYPES = [
 
 @dataclass
 class Config:
-    # LLM — primary provider (used as first entry if fallback chain is empty)
+    # LLM — primary provider
     llm_provider: str
     llm_model: str
     groq_api_key: str
@@ -53,31 +51,47 @@ class Config:
     classification_confidence_threshold: float
 
     # ── D3 — Retrieval pool / top-N ──────────────────────────────────────
-    # Candidate pool passed to hybrid_search() before Cohere reranking.
-    # Increased from hardcoded 10 → configurable 50.
     retrieval_candidate_pool: int
-
-    # Final top-N returned from hybrid_search() after reranking.
-    # Independent of candidate pool — must be <= pool (clamped at load time).
     retrieval_top_n: int
 
     # ── D1 — Hierarchical chunking ────────────────────────────────────────
-    # Doc types that use parent/child chunking instead of flat chunking.
-    # All other doc types continue to use flat SentenceSplitter chunking.
     hierarchical_chunking_doc_types: list[str]
-
-    # Parent chunk size (chars) — large, context-rich windows (e.g. a full section).
     hierarchical_parent_chunk_size: int
-
-    # Child chunk size (chars) — small, precise windows used for dense retrieval.
     hierarchical_child_chunk_size: int
-
-    # ── D2 — HyDE / multi-query ───────────────────────────────────────────
-    # When True, child chunks retrieved in hierarchical mode are expanded to
-    # their parent chunk text for the LLM context window. Child metadata
-    # (page, file) is preserved for source citations.
-    # When False, child chunk text is used as-is (same as flat mode).
     hierarchical_expand_to_parent: bool
+
+    # ── E1 — Two-stage classifier ─────────────────────────────────────────
+    # When False, Stage 1 is skipped entirely and the LLM always fires.
+    # Useful for disabling without a code change during debugging.
+    classifier_stage1_enabled: bool
+
+    # Stage 1 passes if confidence >= this threshold.
+    # Below threshold → Stage 2 (LLM) fires.
+    # Tune via env var — no redeploy needed.
+    classifier_confidence_threshold: float
+
+    # ── F3 — CORS ─────────────────────────────────────────────────────────
+    # Comma-separated list of allowed origins.
+    # Example: https://app.example.com,http://localhost:8501
+    cors_allowed_origins: str
+
+    # ── F2 — API key rotation ─────────────────────────────────────────────
+    # How long (seconds) a rotated-out key stays valid after rotation.
+    # Default: 86400 (24 hours) — gives integrations time to update.
+    api_key_rotation_grace_period_seconds: int
+
+    # ---------------------------------------------------------------------------
+    # Derived helpers
+    # ---------------------------------------------------------------------------
+
+    def get_cors_origins(self) -> list[str]:
+        """
+        Parse cors_allowed_origins into a validated list of origin strings.
+        Falls back to ["http://localhost:8501"] if the value is empty.
+        """
+        raw = self.cors_allowed_origins or ""
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        return origins if origins else ["http://localhost:8501"]
 
 
 # ---------------------------------------------------------------------------
@@ -85,22 +99,7 @@ class Config:
 # ---------------------------------------------------------------------------
 
 def _parse_fallback_chain(raw: str, default_provider: str, default_model: str) -> list[str]:
-    """
-    Parse LLM_FALLBACK_CHAIN env var into a list of "provider:model" strings.
-
-    Expected format (comma-separated):
-        groq:llama-3.3-70b-versatile,openai:gpt-4o-mini,anthropic:claude-3-5-haiku-20241022
-
-    Rules:
-    - Whitespace around entries is stripped.
-    - Empty entries are skipped.
-    - If the env var is absent or blank, a single-entry chain is built from
-      LLM_PROVIDER + LLM_MODEL so existing single-provider deployments work
-      without any .env changes.
-    - Invalid entries (no colon, empty provider/model) are skipped with a warning.
-    """
     if not raw or not raw.strip():
-        # No chain configured — build a single-entry chain from primary provider
         return [f"{default_provider}:{default_model}"]
 
     entries = []
@@ -135,20 +134,12 @@ def _parse_fallback_chain(raw: str, default_provider: str, default_model: str) -
 
 
 def _parse_hierarchical_doc_types(raw: str) -> list[str]:
-    """
-    Parse HIERARCHICAL_CHUNKING_DOC_TYPES env var (comma-separated doc type strings).
-    Falls back to _DEFAULT_HIERARCHICAL_DOC_TYPES if not set.
-    """
     if not raw or not raw.strip():
         return list(_DEFAULT_HIERARCHICAL_DOC_TYPES)
     return [t.strip().lower() for t in raw.split(",") if t.strip()]
 
 
 def _validated_pool_and_top_n(pool: int, top_n: int) -> tuple[int, int]:
-    """
-    Validate and clamp RETRIEVAL_TOP_N <= RETRIEVAL_CANDIDATE_POOL.
-    Logs a warning and clamps top_n if misconfigured.
-    """
     if top_n > pool:
         logging.warning(
             f"[config] RETRIEVAL_TOP_N ({top_n}) > RETRIEVAL_CANDIDATE_POOL ({pool}) "
@@ -186,10 +177,28 @@ def load_config() -> Config:
     raw_top_n = int(os.getenv("RETRIEVAL_TOP_N", "5"))
     pool, top_n = _validated_pool_and_top_n(raw_pool, raw_top_n)
 
-    # Log effective retrieval config at startup so Cohere cost is visible
     logging.info(
         f"[config] Retrieval config — candidate_pool={pool}, top_n={top_n}"
     )
+
+    # E1 config
+    stage1_enabled     = os.getenv("CLASSIFIER_STAGE1_ENABLED", "true").lower() == "true"
+    clf_threshold      = float(os.getenv("CLASSIFIER_CONFIDENCE_THRESHOLD", "0.75"))
+
+    # F2 config
+    grace_period       = int(os.getenv("API_KEY_ROTATION_GRACE_PERIOD_SECONDS", "86400"))
+
+    # F3 config — CORS
+    # CORS_ALLOWED_ORIGINS takes precedence; STREAMLIT_URL kept for backward compat
+    streamlit_url      = os.getenv("STREAMLIT_URL", "").strip()
+    cors_raw           = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+    if not cors_raw and streamlit_url:
+        # Migrate: build from legacy STREAMLIT_URL if new var not set
+        cors_raw = f"{streamlit_url},http://localhost:8501,http://127.0.0.1:8501"
+        logging.info("[config] CORS_ALLOWED_ORIGINS not set — built from STREAMLIT_URL")
+
+    logging.info(f"[config] E1 Stage 1 — enabled={stage1_enabled}, threshold={clf_threshold}")
+    logging.info(f"[config] CORS origins — {cors_raw or '(dev wildcard)'}")
 
     return Config(
         llm_provider=default_provider,
@@ -231,6 +240,13 @@ def load_config() -> Config:
         hierarchical_expand_to_parent=os.getenv(
             "HIERARCHICAL_EXPAND_TO_PARENT", "true"
         ).lower() == "true",
+        # E1
+        classifier_stage1_enabled=stage1_enabled,
+        classifier_confidence_threshold=clf_threshold,
+        # F2
+        api_key_rotation_grace_period_seconds=grace_period,
+        # F3
+        cors_allowed_origins=cors_raw,
     )
 
 
@@ -241,8 +257,6 @@ def load_config() -> Config:
 def uses_hierarchical_chunking(doc_type: str) -> bool:
     """
     Return True if doc_type is configured for hierarchical (parent/child) chunking.
-    Always False for unknown/general doc types.
-    Called by ingestion.py before building chunks.
     """
     return doc_type.lower().strip() in config.hierarchical_chunking_doc_types
 

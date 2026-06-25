@@ -8,19 +8,48 @@ Endpoints:
     GET   /tables/{document_id}
     POST  /review/{document_id}
     GET   /review/{document_id}/corrections
+
+E2: extract_fields() now returns per-field dicts with "value" and "bbox".
+    This router flattens or preserves that shape depending on the endpoint.
+    The public API response includes bbox as a top-level sibling of value
+    so existing callers reading result["extracted"][field] still work if
+    they only need the value — they just get a dict now instead of a string.
 """
 
 from fastapi import APIRouter
 from pydantic import BaseModel, validator
 
 from core.responses import bad_request, error_response, internal_error, not_found
-from retrieval import extract_fields,nl_to_schema, extract_nl,extract_tables
-from webhooks import trigger_webhooks, trigger_webhooks
+from retrieval import extract_fields, nl_to_schema, extract_nl, extract_tables
+from webhooks import trigger_webhooks
 from schemas.templates import list_templates
 from schemas.templates import get_template as _get_template
-from db import get_classification, save_correction,supabase
+from db import get_classification, save_correction, supabase
+from db_extraction import store_extraction_result as _store_extraction, get_extraction_result_by_id as _get_extraction_by_id
 
 router = APIRouter(tags=["Extraction"])
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _flatten_extracted(extracted: dict) -> dict:
+    """
+    E2 compatibility shim.
+
+    extract_fields() now returns:
+        { field_name: {"value": ..., "bbox": ...} }
+
+    Callers (webhooks, batch summary) that only need the plain value get
+    a flat dict via this helper.  The public API response keeps the full
+    shape so the frontend can render bbox overlays.
+    """
+    flat = {}
+    for k, v in extracted.items():
+        if isinstance(v, dict) and "value" in v:
+            flat[k] = v["value"]
+        else:
+            flat[k] = v   # legacy / error shapes pass through unchanged
+    return flat
 
 
 # ── Input models ──────────────────────────────────────────────────────────────
@@ -72,7 +101,7 @@ class BatchExtractRequest(BaseModel):
 
 class ReviewAction(BaseModel):
     field: str
-    action: str                  # "approve" | "reject" | "correct"
+    action: str          # "approve" | "reject" | "correct"
     original_value: str = ""
     corrected_value: str = ""
     evidence_used: str = ""
@@ -88,23 +117,42 @@ class ReviewAction(BaseModel):
 # ── Extraction routes ─────────────────────────────────────────────────────────
 
 @router.post("/extract")
-def extract(req: ExtractRequest):
+def extract(req: ExtractRequest, user=Depends(get_current_user)):
     """
     Extract structured fields from a document using a field schema dict.
-    Each key is a field name; each value is a description of what to extract.
+
+    E2 response shape — each field now includes bbox:
+        {
+            "extracted": {
+                "invoice_number": {"value": "INV-001", "bbox": {"x": 0.1, ...}},
+                "total_amount":   {"value": "₹5000",   "bbox": null},
+                ...
+            },
+            "validation": {...},
+            "business_validation": {...}
+        }
     """
     try:
         result = extract_fields(req.document_id, req.fields)
     except Exception as exc:
         return internal_error(f"Extraction failed: {exc}")
 
+    # Webhook receives flat values (backward compat with webhook consumers)
     trigger_webhooks("extraction.complete", {
         "document_id": req.document_id,
-        "extracted": result.get("extracted"),
-        "validation": result.get("validation"),
+        "extracted":   _flatten_extracted(result.get("extracted", {})),
+        "validation":  result.get("validation"),
     })
 
-    return result
+    # E2 — persist extraction so GET /extract/{extraction_id} can retrieve it
+    uid = get_user_id(user) if hasattr(user, "user_id") else "system"
+    extraction_id = _store_extraction(
+        document_id=req.document_id,
+        template_id="custom",
+        results=result.get("extracted", {}),
+        user_id=uid,
+    )
+    return {**result, "extraction_id": extraction_id}
 
 
 @router.post("/extract/nl")
@@ -113,9 +161,9 @@ def extract_natural_language(req: NLExtractRequest):
     Natural language extraction.
     Converts a plain-English instruction to a field schema, then extracts.
     Set preview_only=true to return the generated schema without extracting.
-    """
-    
 
+    E2: extracted fields include bbox when layout data is available.
+    """
     if req.preview_only:
         try:
             schema = nl_to_schema(req.instruction)
@@ -134,8 +182,8 @@ def extract_natural_language(req: NLExtractRequest):
     trigger_webhooks("extraction.complete", {
         "document_id": req.document_id,
         "instruction": req.instruction,
-        "extracted": result.get("extracted"),
-        "validation": result.get("validation"),
+        "extracted":   _flatten_extracted(result.get("extracted") or {}),
+        "validation":  result.get("validation"),
     })
 
     return result
@@ -144,11 +192,10 @@ def extract_natural_language(req: NLExtractRequest):
 @router.post("/extract/batch")
 def batch_extract(req: BatchExtractRequest):
     """
-    Extract fields from multiple documents using the same schema or instruction.
-    Runs sequentially.
-    Provide either `fields` (schema dict) or `instruction` (natural language).
-    """
+    Extract fields from multiple documents.
 
+    E2: each result's extracted dict includes bbox per field.
+    """
     if not req.fields and not req.instruction:
         return bad_request(
             "Provide either 'fields' (schema dict) or 'instruction' (natural language).",
@@ -165,28 +212,28 @@ def batch_extract(req: BatchExtractRequest):
 
             results.append({
                 "document_id": doc_id,
-                "success": True,
+                "success":     True,
                 **result,
             })
 
             trigger_webhooks("extraction.complete", {
                 "document_id": doc_id,
-                "extracted": result.get("extracted"),
-                "validation": result.get("validation"),
+                "extracted":   _flatten_extracted(result.get("extracted") or {}),
+                "validation":  result.get("validation"),
             })
 
         except Exception as exc:
             results.append({
                 "document_id": doc_id,
-                "success": False,
-                "error": str(exc),
+                "success":     False,
+                "error":       str(exc),
             })
 
     return {
-        "total": len(req.document_ids),
+        "total":     len(req.document_ids),
         "succeeded": sum(1 for r in results if r["success"]),
-        "failed": sum(1 for r in results if not r["success"]),
-        "results": results,
+        "failed":    sum(1 for r in results if not r["success"]),
+        "results":   results,
     }
 
 
@@ -207,11 +254,7 @@ def get_template(template_id: str):
 
 @router.get("/tables/{document_id}")
 def get_tables(document_id: str):
-    """
-    Extract and return all tables found in a document as structured JSON.
-    Each table includes headers, rows, and a suggested chart type.
-    """
-
+    """Extract and return all tables found in a document."""
     try:
         tables = extract_tables(document_id)
         return {"tables": tables}
@@ -225,11 +268,12 @@ def get_tables(document_id: str):
 def submit_review(document_id: str, actions: list[ReviewAction]):
     """
     Submit human review decisions for a document's extracted fields.
-    Persists each decision to review_corrections so the feedback loop
-    can inject past corrections into future extraction prompts.
+
+    E2 note: original_value here should be the plain string value, not the
+    full {"value": ..., "bbox": ...} dict.  The frontend must extract
+    .value before submitting.
     """
-    
-    cls = get_classification(document_id)
+    cls      = get_classification(document_id)
     doc_type = cls.get("doc_type", "general") if cls else "general"
 
     for action in actions:
@@ -246,18 +290,14 @@ def submit_review(document_id: str, actions: list[ReviewAction]):
 
     return {
         "reviewed_fields": [a.field for a in actions],
-        "doc_type": doc_type,
-        "saved": len(actions),
+        "doc_type":        doc_type,
+        "saved":           len(actions),
     }
 
 
 @router.get("/review/{document_id}/corrections")
 def get_corrections(document_id: str):
-    """
-    Return all review corrections saved for a document, newest-first.
-    Used by the frontend to show review history.
-    """
-    
+    """Return all review corrections saved for a document, newest-first."""
     result = (
         supabase.table("review_corrections")
         .select("*")
@@ -266,3 +306,30 @@ def get_corrections(document_id: str):
         .execute()
     )
     return result.data or []
+
+
+# ── E2 — GET /extract/{extraction_id} ────────────────────────────────────────
+
+from core.auth import get_current_user, get_user_id
+from fastapi import Depends
+
+
+@router.get("/extract/{extraction_id}")
+def get_extraction(
+    extraction_id: str,
+    user: object = Depends(get_current_user),
+):
+    """
+    E2 — Fetch a stored extraction result by its UUID.
+
+    Used by the frontend "Field Locations" tab to load bbox data
+    for a previously-run extraction without re-running it.
+
+    Returns the full row including per-field {value, bbox} shape.
+    404 if not found or not owned by the requesting user.
+    """
+    uid = get_user_id(user)
+    result = _get_extraction_by_id(extraction_id, user_id=uid)
+    if not result:
+        return not_found(f"Extraction result '{extraction_id}'")
+    return result
