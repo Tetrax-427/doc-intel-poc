@@ -8,12 +8,6 @@ Endpoints:
     GET    /summary/{document_id}
     GET    /documents/{document_id}/classification
     POST   /documents/{document_id}/classification
-
- _run_post_ingest() now accepts an optional pre-computed
-classification result from ingest_file() (stored in result["_classification"]).
-If present, it is persisted directly without running classify_document() again.
-classify_document() is only called as a fallback when the key is absent
-(URL ingestion, old code paths).
 """
 
 import os
@@ -25,6 +19,9 @@ from pydantic import BaseModel, validator
 
 from core.auth import get_current_user, get_user_id
 from core.responses import error_response, internal_error, unsupported_file_type
+from core.lineage import (
+    log_deleted, log_classification_overridden, log_summarized, timed_event, LineageEvent,
+)
 from retrieval import generate_summary, classify_document
 from db import (
     save_summary, save_classification, get_classification,
@@ -62,22 +59,22 @@ class ClassificationOverrideRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _run_post_ingest(document_id: str, result: dict) -> dict:
+def _run_post_ingest(document_id: str, result: dict, user_id: str = "system") -> dict:
     """
     Run summary + classification after ingestion.
-
-    D1 change: if ingest_file() already ran pre-ingestion classification
-    (stored in result["_classification"]), persist it directly and skip the
-    second classify_document() call. This avoids a redundant LLM call.
-
-    Falls back to classify_document() if _classification is absent or None
-    (URL ingestion path, old callers).
+    Uses pre-computed classification from ingest_file() when available.
     """
-    # Summary
+    # Summary (timed)
     try:
-        summary_data = generate_summary(document_id)
-        save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
+        with timed_event(
+            document_id, user_id, LineageEvent.SUMMARIZED,
+            event_data={"file": result.get("file", "")},
+        ):
+            summary_data = generate_summary(document_id)
+            save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
+
         result["summary_short"] = summary_data["summary_short"]
+        log_summarized(document_id, user_id=user_id)
     except Exception as exc:
         print(f"[documents] Summary generation failed (non-blocking): {exc}")
 
@@ -90,9 +87,8 @@ def _run_post_ingest(document_id: str, result: dict) -> dict:
             result["classification"] = pre_classification
         except Exception as exc:
             print(f"[documents] Persisting pre-classification failed: {exc}")
-            result["classification"] = pre_classification  # still return it
+            result["classification"] = pre_classification
     else:
-        # Fallback — run classification from stored chunks (URL ingestion etc.)
         try:
             classification = classify_document(document_id)
             save_classification(document_id, classification)
@@ -139,7 +135,7 @@ async def upload_document(
     if "error" in result:
         return error_response(result["error"], code="INGESTION_ERROR")
 
-    result = _run_post_ingest(result["document_id"], result)
+    result = _run_post_ingest(result["document_id"], result, user_id=uid)
     return result
 
 
@@ -157,7 +153,7 @@ async def ingest_from_url(
     if "error" in result:
         return error_response(result["error"], code="INGESTION_ERROR")
 
-    result = _run_post_ingest(result["document_id"], result)
+    result = _run_post_ingest(result["document_id"], result, user_id=uid)
     return result
 
 
@@ -180,7 +176,25 @@ def list_documents(
 
 
 @router.delete("/documents/{document_id}")
-def delete_document(document_id: str):
+def delete_document(
+    document_id: str,
+    user=Depends(get_current_user),
+):
+    uid = get_user_id(user)
+
+    # F1 — fetch doc metadata before deletion for lineage record
+    try:
+        from db import get_document
+        doc      = get_document(document_id)
+        filename = doc.get("file_name", "") if doc else ""
+        doc_type = doc.get("doc_type", "") if doc else ""
+    except Exception:
+        filename = ""
+        doc_type = ""
+
+    # F1 — log deletion BEFORE deleting (after deletion doc_id may be gone)
+    log_deleted(document_id, user_id=uid, filename=filename, doc_type=doc_type)
+
     delete_document_by_id(document_id)
     return {"status": "deleted", "document_id": document_id}
 
@@ -213,8 +227,15 @@ def get_doc_classification(document_id: str):
 
 
 @router.post("/documents/{document_id}/classification")
-def override_classification(document_id: str, body: ClassificationOverrideRequest):
-    existing      = get_classification(document_id) or {}
+def override_classification(
+    document_id: str,
+    body: ClassificationOverrideRequest,
+    user=Depends(get_current_user),
+):
+    uid      = get_user_id(user)
+    existing = get_classification(document_id) or {}
+    old_type = existing.get("doc_type", "general")
+
     existing_data = existing.get("classification_data") or {}
     updated = {
         **existing_data,
@@ -225,4 +246,14 @@ def override_classification(document_id: str, body: ClassificationOverrideReques
         "requires_human_review": False,
     }
     save_classification(document_id, updated)
+
+    # F1 — log classification override
+    if old_type != body.doc_type:
+        log_classification_overridden(
+            document_id,
+            user_id=uid,
+            old_type=old_type,
+            new_type=body.doc_type,
+        )
+
     return {"status": "updated", "classification": updated}

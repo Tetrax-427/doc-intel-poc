@@ -16,6 +16,9 @@ from core.cache import get_embedding, set_embedding
 from vision.triggers import should_use_vision
 from vision.engine import describe_image, describe_pdf_page
 from hierarchical import build_hierarchical_chunks, make_flat_chunk_metadata
+from core.lineage import (
+    log_uploaded, log_parsed, log_classified, log_chunked, timed_event, LineageEvent,
+)
 
 load_dotenv()
 
@@ -86,7 +89,7 @@ def _run_vision_for_page(
         if not should_use_vision(file_path, page.text, is_scanned, doc_type, config):
             return page.images
 
-        ext          = os.path.splitext(file_path)[1].lower()
+        ext           = os.path.splitext(file_path)[1].lower()
         is_image_file = ext in _IMAGE_EXTENSIONS
         updated_images: list[ImageElement] = []
 
@@ -135,7 +138,7 @@ def _run_vision_for_page(
 
 
 # ---------------------------------------------------------------------------
-# Main file ingestion —
+# Main file ingestion
 # ---------------------------------------------------------------------------
 
 def ingest_file(
@@ -144,25 +147,6 @@ def ingest_file(
     doc_type: str = "general",
     user_id: str = "anonymous",
 ) -> dict:
-    """
-    Ingest a file into the vector store.
-
-    D1 change: classifies document from raw text BEFORE chunking so the
-    correct chunking mode (hierarchical vs flat) can be selected per page.
-    The classification result is returned in the response dict so
-    documents.py can persist it without running classification a second time.
-
-    Args:
-        file_path:      Absolute path to the uploaded file.
-        use_llamaparse: Use LlamaParse for PDF parsing (falls back to pypdf).
-        doc_type:       Hint from the upload form — used only as a fallback
-                        if our internal classification fails or returns "general".
-        user_id:        Scopes the document to this user.
-
-    Returns:
-        Dict with document_id, chunk counts, parser used, vision_used flag,
-        and classification result. Returns {"error": "..."} on failure.
-    """
     file_name = os.path.basename(file_path)
     ext       = os.path.splitext(file_path)[1].lower()
     model     = get_embed_model()
@@ -171,10 +155,28 @@ def ingest_file(
         logger.error("Unsupported file type", file=file_name, ext=ext)
         return {"error": f"Unsupported file type: {ext}"}
 
-    # --- Parse ---
+    # --- Insert document row first so we have doc_id for lineage ---
+    doc_id = insert_document(file_name, user_id=user_id)
+
+    # F1 — log upload received
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    log_uploaded(
+        doc_id,
+        user_id=user_id,
+        filename=file_name,
+        file_size_bytes=file_size,
+        content_type=ext,
+    )
+
+    # --- Parse (timed) ---
     try:
         logger.info("Routing file to parser", file=file_name, doc_type=doc_type)
-        document = _router.parse(file_path)
+        with timed_event(
+            doc_id, user_id, LineageEvent.DOCUMENT_PARSED,
+            event_data={"file_name": file_name, "parser_hint": doc_type},
+        ):
+            document = _router.parse(file_path)
+
         logger.info(
             "Parse complete",
             file=file_name,
@@ -183,6 +185,15 @@ def ingest_file(
             tables=len(document.tables),
             is_scanned=document.is_scanned,
         )
+        # F1 — log parse details (page count, parser used)
+        log_parsed(
+            doc_id,
+            user_id=user_id,
+            page_count=document.page_count,
+            parser_used=document.parser_used,
+            is_scanned=document.is_scanned,
+        )
+
     except UnsupportedFileTypeError as e:
         return {"error": str(e), "code": e.code}
     except ParseError as e:
@@ -195,18 +206,23 @@ def ingest_file(
             return {"error": "Could not extract text. File may be empty or image-only."}
 
     # ----------------------------------------------------------------
-    # Classify from raw text BEFORE chunking
-    # This determines whether to use hierarchical or flat chunking.
+    # Classify from raw text BEFORE chunking (timed)
     # ----------------------------------------------------------------
-    detected_doc_type = doc_type   # start with caller's hint
+    detected_doc_type     = doc_type
     classification_result = None
 
     try:
         from retrieval import classify_document_from_text
         raw_text_sample = document.full_text[:3000]
-        classification_result = classify_document_from_text(
-            raw_text_sample, document_id=""
-        )
+
+        with timed_event(
+            doc_id, user_id, LineageEvent.DOCUMENT_CLASSIFIED,
+            event_data={"file_name": file_name},
+        ):
+            classification_result = classify_document_from_text(
+                raw_text_sample, document_id=doc_id
+            )
+
         detected = classification_result.get("doc_type", "general")
         if detected and detected != "general":
             detected_doc_type = detected
@@ -222,6 +238,16 @@ def ingest_file(
                 file=file_name,
                 hint=doc_type,
             )
+
+        # F1 — log classification details
+        log_classified(
+            doc_id,
+            user_id=user_id,
+            doc_type=detected_doc_type,
+            confidence=classification_result.get("confidence", 0.0),
+            stage_used=classification_result.get("stage_used", "stage2"),
+        )
+
     except Exception as exc:
         logger.warning(
             "Pre-ingestion classification failed — using caller hint",
@@ -238,9 +264,8 @@ def ingest_file(
         mode="hierarchical" if use_hierarchical else "flat",
     )
 
-    is_scanned = document.is_scanned
-    doc_id     = insert_document(file_name, user_id=user_id)
-    chunk_rows = []
+    is_scanned  = document.is_scanned
+    chunk_rows  = []
     vision_used = False
 
     def _embed(text: str) -> list[float]:
@@ -248,9 +273,7 @@ def ingest_file(
 
     for page in document.pages:
 
-        # ----------------------------------------------------------------
-        # 1. Text chunks — hierarchical or flat depending on doc type
-        # ----------------------------------------------------------------
+        # 1. Text chunks
         if use_hierarchical:
             hier_rows = build_hierarchical_chunks(
                 page_text=page.text,
@@ -261,7 +284,6 @@ def ingest_file(
             )
             chunk_rows.extend(hier_rows)
         else:
-            # Flat chunking — unchanged from original ingestion.py
             llama_doc = LlamaIndexDocument(text=page.text)
             nodes     = splitter.get_nodes_from_documents([llama_doc])
 
@@ -279,9 +301,7 @@ def ingest_file(
                     ),
                 })
 
-        # ----------------------------------------------------------------
-        # 2. Table chunks — always flat regardless of chunking mode
-        # ----------------------------------------------------------------
+        # 2. Table chunks
         for table in page.tables:
             if not table.raw_text.strip():
                 continue
@@ -297,9 +317,7 @@ def ingest_file(
                 ),
             })
 
-        # ----------------------------------------------------------------
-        # 3. Vision description chunks — always flat
-        # ----------------------------------------------------------------
+        # 3. Vision description chunks
         images_with_descriptions = _run_vision_for_page(
             file_path, page, detected_doc_type, is_scanned
         )
@@ -331,10 +349,19 @@ def ingest_file(
 
     insert_chunks(chunk_rows)
 
-    text_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "text"
-                       and c["metadata"].get("chunk_level") != "parent")
-    table_chunks = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "table")
-    desc_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "description")
+    # F1 — log chunks stored
+    log_chunked(
+        doc_id,
+        user_id=user_id,
+        chunk_count=len(chunk_rows),
+        chunk_mode="hierarchical" if use_hierarchical else "flat",
+        doc_type=detected_doc_type,
+    )
+
+    text_chunks   = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "text"
+                        and c["metadata"].get("chunk_level") != "parent")
+    table_chunks  = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "table")
+    desc_chunks   = sum(1 for c in chunk_rows if c["metadata"]["chunk_type"] == "description")
     parent_chunks = sum(1 for c in chunk_rows if c["metadata"].get("chunk_level") == "parent")
 
     logger.info(
@@ -353,27 +380,25 @@ def ingest_file(
     )
 
     return {
-        "document_id":      doc_id,
-        "file":             file_name,
-        "chunks_stored":    len(chunk_rows),
-        "text_chunks":      text_chunks,
-        "table_chunks":     table_chunks,
+        "document_id":        doc_id,
+        "file":               file_name,
+        "chunks_stored":      len(chunk_rows),
+        "text_chunks":        text_chunks,
+        "table_chunks":       table_chunks,
         "description_chunks": desc_chunks,
-        "parent_chunks":    parent_chunks,
-        "parser":           document.parser_used,
-        "page_count":       document.page_count,
-        "table_count":      len(document.tables),
-        "vision_used":      vision_used,
-        "doc_type":         detected_doc_type,
-        "chunking_mode":    "hierarchical" if use_hierarchical else "flat",
-        # Pass classification result so documents.py can persist it
-        # without running a second classify_document() call.
-        "_classification":  classification_result,
+        "parent_chunks":      parent_chunks,
+        "parser":             document.parser_used,
+        "page_count":         document.page_count,
+        "table_count":        len(document.tables),
+        "vision_used":        vision_used,
+        "doc_type":           detected_doc_type,
+        "chunking_mode":      "hierarchical" if use_hierarchical else "flat",
+        "_classification":    classification_result,
     }
 
 
 # ---------------------------------------------------------------------------
-# URL ingestion — flat chunking only (URLs are always flat)
+# URL ingestion — flat chunking only
 # ---------------------------------------------------------------------------
 
 def ingest_url(url: str, user_id: str = "anonymous") -> dict:
@@ -392,6 +417,13 @@ def ingest_url(url: str, user_id: str = "anonymous") -> dict:
 
     doc_id     = insert_document(document.file_name, user_id=user_id)
     chunk_rows = []
+
+    log_uploaded(
+        doc_id,
+        user_id=user_id,
+        filename=document.file_name,
+        content_type="url",
+    )
 
     def _embed(text: str) -> list[float]:
         return _get_embedding(text, model)
@@ -419,6 +451,8 @@ def ingest_url(url: str, user_id: str = "anonymous") -> dict:
         return {"error": "No content could be extracted from this URL."}
 
     insert_chunks(chunk_rows)
+
+    log_chunked(doc_id, user_id=user_id, chunk_count=len(chunk_rows), chunk_mode="flat")
 
     logger.info("URL ingestion complete", url=url, doc_id=doc_id, chunks=len(chunk_rows))
 
