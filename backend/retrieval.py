@@ -85,16 +85,6 @@ def format_source(chunk: dict) -> dict:
       "description" — vision description (image-level, no specific figure ref)
       "figure"      — B3: figure/chart with caption + bbox in metadata
 
-    The returned dict is the contract between retrieval and the frontend.
-    Fields present on ALL types:
-      chunk, page, file, preview, chunk_type, exact_sentence
-
-    Additional fields for "figure":
-      image_ref, caption, bbox
-
-    Additional fields for "description":
-      image_ref
-
     Never raises — falls back to a basic source dict on any error.
     """
     try:
@@ -105,13 +95,13 @@ def format_source(chunk: dict) -> dict:
             "file":           chunk.get("file"),
             "preview":        chunk.get("content", "")[:150],
             "chunk_type":     chunk_type,
-            "exact_sentence": "",   # filled by caller after get_exact_sentence()
+            "exact_sentence": "",
         }
 
         if chunk_type == "figure":
             base["image_ref"] = chunk.get("image_ref")
             base["caption"]   = chunk.get("caption", "")
-            base["bbox"]      = chunk.get("bbox")          # B1 — normalized coords
+            base["bbox"]      = chunk.get("bbox")
 
         elif chunk_type in ("description", "table"):
             base["image_ref"] = chunk.get("image_ref")
@@ -119,7 +109,6 @@ def format_source(chunk: dict) -> dict:
         return base
 
     except Exception:
-        # Safe fallback — never let source formatting break a query response
         return {
             "chunk":          chunk.get("chunk_num"),
             "page":           chunk.get("page"),
@@ -131,7 +120,7 @@ def format_source(chunk: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Classification
+# Classification (question type)
 # ---------------------------------------------------------------------------
 
 def classify_question(question: str, has_document: bool = True) -> str:
@@ -160,7 +149,7 @@ def classify_question(question: str, has_document: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Query expansion —
+# Query expansion
 # ---------------------------------------------------------------------------
 
 def expand_query(question: str) -> str:
@@ -183,7 +172,7 @@ def expand_query(question: str) -> str:
 # ---------------------------------------------------------------------------
 
 def rerank_chunks(question: str, chunks: list[dict], top_k: int = None) -> list[dict]:
-    """Use Cohere to rerank retrieved chunks. top_k defaults to config.retrieval_top_n."""
+    """Use Cohere to rerank retrieved chunks."""
     effective_top_k = top_k if top_k is not None else app_config.retrieval_top_n
 
     if not chunks or not os.getenv("COHERE_API_KEY"):
@@ -209,29 +198,20 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = None) -> list[
 
 
 # ---------------------------------------------------------------------------
-# Parent context expansion —
+# Parent context expansion
 # ---------------------------------------------------------------------------
 
 def expand_to_parent_context(chunks: list[dict]) -> list[dict]:
     """
-    For child chunks (chunk_level="child"), fetch the parent chunk from DB
-    and replace the LLM context text with the parent's fuller text.
-
-    Behaviour controlled by config.hierarchical_expand_to_parent:
-    - True (default): child chunk's content is replaced with parent text for
-      LLM context. Child metadata (page, file, chunk_num) is preserved for
-      source citations.
-    - False: chunks returned unchanged (child text used as-is).
-
-    Flat chunks (chunk_level="flat" or missing) are always returned unchanged.
-    Never raises — on any DB error, the original chunk is returned as-is.
+    For child chunks, fetch the parent chunk from DB and replace the LLM
+    context text with the parent's fuller text.
     """
     if not app_config.hierarchical_expand_to_parent:
         return chunks
 
     expanded = []
     for chunk in chunks:
-        level = chunk.get("metadata", {}).get("chunk_level", "flat")
+        level     = chunk.get("metadata", {}).get("chunk_level", "flat")
         parent_id = chunk.get("metadata", {}).get("parent_chunk_id")
 
         if level == "child" and parent_id:
@@ -256,7 +236,7 @@ def expand_to_parent_context(chunks: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# D3 — Hybrid search (configurable pool + top_n)
+# D3 — Hybrid search
 # ---------------------------------------------------------------------------
 
 def hybrid_search(
@@ -266,30 +246,12 @@ def hybrid_search(
     top_n: int | None = None,
     dense_query_override: str | None = None,
 ) -> list[dict]:
-    """
-    Hybrid dense + sparse search with configurable candidate pool and top-N.
+    """Hybrid dense + sparse search with configurable candidate pool and top-N."""
+    pool_size = candidate_pool if candidate_pool is not None else app_config.retrieval_candidate_pool
+    n_results = top_n          if top_n          is not None else app_config.retrieval_top_n
 
-    Args:
-        question:             User question — used for BM25 and (if no override)
-                              dense embedding.
-        document_ids:         Documents to search (None = no results).
-        candidate_pool:       Override config.retrieval_candidate_pool for this call.
-        top_n:                Override config.retrieval_top_n for this call.
-        dense_query_override: If set, use this text for dense embedding instead
-                              of question (used by HyDE mode).
-
-    Returns:
-        Reranked list of up to top_n chunks.
-    """
-    pool_size  = candidate_pool if candidate_pool is not None else app_config.retrieval_candidate_pool
-    n_results  = top_n          if top_n          is not None else app_config.retrieval_top_n
-
-    # Clamp top_n <= pool_size
     if n_results > pool_size:
-        logger.warning(
-            "top_n > candidate_pool — clamping",
-            top_n=n_results, pool=pool_size,
-        )
+        logger.warning("top_n > candidate_pool — clamping", top_n=n_results, pool=pool_size)
         n_results = pool_size
 
     embed_model = get_embed_model()
@@ -306,7 +268,6 @@ def hybrid_search(
     if not all_chunks:
         return []
 
-    # Only search child + flat chunks — parent chunks have no embedding
     searchable = [
         c for c in all_chunks
         if c.get("metadata", {}).get("chunk_level", "flat") != "parent"
@@ -316,15 +277,12 @@ def hybrid_search(
     if not searchable:
         return []
 
-    expanded_question = expand_query(question)
-
-    # Dense embedding — use override (HyDE passage) if provided
-    dense_query_text  = dense_query_override if dense_query_override else expanded_question
+    expanded_question  = expand_query(question)
+    dense_query_text   = dense_query_override if dense_query_override else expanded_question
     question_embedding = embed_model.get_text_embedding(dense_query_text)
 
     texts = [c["content"] for c in searchable]
 
-    # Dense scores
     dense_scores = []
     for chunk in searchable:
         raw_emb = chunk["embedding"]
@@ -332,12 +290,10 @@ def hybrid_search(
             raw_emb = json.loads(raw_emb)
         dense_scores.append(cosine_similarity(question_embedding, raw_emb))
 
-    # BM25 — always uses original expanded question (not HyDE passage)
-    tokenized  = [t.lower().split() for t in texts]
-    bm25       = BM25Okapi(tokenized)
+    tokenized   = [t.lower().split() for t in texts]
+    bm25        = BM25Okapi(tokenized)
     bm25_scores = bm25.get_scores(expanded_question.lower().split())
 
-    # RRF fusion
     def rrf_score(rank, k=60):
         return 1 / (k + rank + 1)
 
@@ -354,15 +310,17 @@ def hybrid_search(
 
     candidates = [
         {
-            "chunk_num":  i + 1,
-            "content":    searchable[idx]["content"],
-            "page":       searchable[idx]["metadata"].get("page", "?"),
-            "file":       searchable[idx]["metadata"].get("file", "?"),
-            "chunk_type": searchable[idx]["metadata"].get("chunk_type", "text"),
-            "image_ref":  searchable[idx]["metadata"].get("image_ref"),
+            "chunk_num":       i + 1,
+            "content":         searchable[idx]["content"],
+            "page":            searchable[idx]["metadata"].get("page", "?"),
+            "file":            searchable[idx]["metadata"].get("file", "?"),
+            "chunk_type":      searchable[idx]["metadata"].get("chunk_type", "text"),
+            "image_ref":       searchable[idx]["metadata"].get("image_ref"),
             "chunk_level":     searchable[idx]["metadata"].get("chunk_level", "flat"),
             "parent_chunk_id": searchable[idx]["metadata"].get("parent_chunk_id"),
-            "score":      rrf[idx],
+            "score":           rrf[idx],
+            # E2 — carry bbox through from chunk metadata for find_field_bbox()
+            "bbox":            searchable[idx]["metadata"].get("bbox"),
         }
         for i, idx in enumerate(top_indices)
     ]
@@ -371,7 +329,7 @@ def hybrid_search(
 
 
 # ---------------------------------------------------------------------------
-# hybrid_search_with_mode (HyDE / multi-query dispatcher)
+# hybrid_search_with_mode
 # ---------------------------------------------------------------------------
 
 def hybrid_search_with_mode(
@@ -382,26 +340,7 @@ def hybrid_search_with_mode(
     top_n: int | None = None,
     doc_type: str = "general",
 ) -> list[dict]:
-    """
-    Run hybrid search with the requested retrieval mode.
-
-    Modes:
-        "standard" / "none": plain hybrid_search (no extra LLM calls)
-        "hyde":     generate HyDE passage, use as dense query override
-        "multiquery": generate 2-3 query variants, merge+dedup results
-
-    Args:
-        question:       User's original question.
-        document_ids:   Documents to search.
-        retrieval_mode: One of standard/none/hyde/multiquery.
-        candidate_pool: Override pool size (passed through to hybrid_search).
-        top_n:          Override top-N (passed through to hybrid_search).
-        doc_type:       Document type hint for HyDE passage generation.
-
-    Returns:
-        Reranked, deduplicated list of chunks after parent expansion.
-    """
-    mode = normalise_retrieval_mode(retrieval_mode)
+    mode            = normalise_retrieval_mode(retrieval_mode)
     effective_top_n = top_n if top_n is not None else app_config.retrieval_top_n
 
     if mode == "hyde":
@@ -428,7 +367,6 @@ def hybrid_search_with_mode(
         chunks = merge_and_dedupe(results_per_query, top_n=effective_top_n)
 
     else:
-        # standard / none
         chunks = hybrid_search(
             question,
             document_ids=document_ids,
@@ -436,7 +374,6 @@ def hybrid_search_with_mode(
             top_n=effective_top_n,
         )
 
-    # D1 — expand child chunks to parent context where configured
     return expand_to_parent_context(chunks)
 
 
@@ -514,7 +451,7 @@ Return ONLY the sentence text, nothing else.""",
 
 
 # ---------------------------------------------------------------------------
-# Document query —
+# Document query
 # ---------------------------------------------------------------------------
 
 def query_document(
@@ -536,8 +473,6 @@ def query_document(
 
     ids      = document_ids if document_ids else ([document_id] if document_id else None)
     is_multi = ids and len(ids) > 1
-
-    # Detect doc type for HyDE hint (best-effort — use first doc's classification)
     doc_type = _get_doc_type_hint(ids)
 
     chunks = hybrid_search_with_mode(
@@ -584,7 +519,7 @@ def query_document(
 
 
 # ---------------------------------------------------------------------------
-# Streaming query —
+# Streaming query
 # ---------------------------------------------------------------------------
 
 def query_document_stream(
@@ -661,7 +596,60 @@ def build_correction_examples(doc_type: str, fields: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Field extraction — filter to parent+flat chunks for context
+# E2 — Bounding box lookup for extracted field values
+# ---------------------------------------------------------------------------
+
+def find_field_bbox(
+    field_value: str | None,
+    document_id: str,
+) -> dict | None:
+    """
+    Find the best-matching chunk for an extracted field value and return
+    its bounding box.
+
+    Fetches all chunks for the document internally (single DB call),
+    then scans for the chunk whose content best contains the field value.
+
+    Matching strategy:
+      1. Substring match (case-insensitive): chunk content contains the
+         field value.
+      2. Among matches, prefer the chunk where the value appears closest
+         to the start (heuristic: field values tend to be near section tops).
+      3. Skip chunks without a bbox (e.g. pypdf-parsed documents).
+
+    Returns:
+      dict with bbox keys (x, y, width, height, page, page_width,
+      page_height) or None if:
+        - field_value is None / empty / < 4 chars (too short to be reliable)
+        - no matching chunk found
+        - matching chunk has no bbox
+    """
+    if not field_value or len(field_value.strip()) < 4:
+        return None
+
+    chunks = get_chunks_by_document(document_id)
+    value_lower = field_value.strip().lower()
+
+    matching = [
+        c for c in chunks
+        if value_lower in c.get("content", "").lower()
+        and c.get("metadata", {}).get("bbox") is not None
+    ]
+
+    if not matching:
+        return None
+
+    # Sort: earlier match position = higher priority
+    def match_position(chunk):
+        idx = chunk["content"].lower().find(value_lower)
+        return idx if idx >= 0 else 9999
+
+    best = min(matching, key=match_position)
+    return best["metadata"]["bbox"]
+
+
+# ---------------------------------------------------------------------------
+# Field extraction — E2 enriched with bbox
 # ---------------------------------------------------------------------------
 
 def extract_fields(
@@ -672,10 +660,26 @@ def extract_fields(
     """
     Extract fields from a document using Instructor structured output.
 
-    D1 change: for hierarchical-mode documents, context is built from
-    parent + flat chunks only (chunk_level in ("parent", "flat")).
-    Children are excluded to avoid redundant/overlapping text in the prompt.
-    Pre-D1 documents (no chunk_level key) are treated as flat — safe via .get().
+    E2 change: each extracted field now includes a ``bbox`` key pointing to
+    the best-match bounding box in the source document.  The bbox is None
+    when the document was parsed without layout data (e.g. pypdf fallback).
+
+    Return shape:
+        {
+            "extracted": {
+                field_name: {
+                    "value": str | None,
+                    "bbox":  dict | None   ← NEW (E2)
+                },
+                ...
+            },
+            "validation":          dict | None,
+            "business_validation": dict,
+        }
+
+    Backward compatibility: existing callers that read
+    result["extracted"][field_name] will get a dict instead of a string.
+    The router (routers/extraction.py) handles both shapes.
     """
     if doc_type == "general":
         try:
@@ -688,14 +692,14 @@ def extract_fields(
         except Exception:
             pass
 
+    # Fetch chunks once — used for both context building and bbox lookup (E2)
     all_chunks = get_chunks_by_document(document_id)
 
-    # use parent + flat only for extraction context
+    # Use parent + flat only for extraction context (D1)
     context_chunks = [
         c for c in all_chunks
         if c.get("metadata", {}).get("chunk_level", "flat") in ("parent", "flat")
     ]
-    # Fallback: if filtering yields nothing (old data), use all chunks
     if not context_chunks:
         context_chunks = all_chunks
 
@@ -722,16 +726,28 @@ def extract_fields(
             call_type="extract",
             response_model=ExtractionResult,
         )
-        extracted = {k: v for k, v in result_model.model_dump().items() if v is not None}
+        raw_extracted = {k: v for k, v in result_model.model_dump().items() if v is not None}
     except Exception as exc:
         return {"extracted": {"error": str(exc)}, "validation": None, "business_validation": {}}
 
-    validation = validate_extraction(extracted, fields)
+    # E2 — attach bbox per field (find_field_bbox fetches chunks internally)
+    extracted: dict[str, dict] = {}
+    for field_name, value in raw_extracted.items():
+        bbox = find_field_bbox(value, document_id)
+        extracted[field_name] = {
+            "value": value,
+            "bbox":  bbox,
+        }
+
+    # Build plain dict for validation (validators expect field_name → value)
+    plain_values = {k: v["value"] for k, v in extracted.items()}
+
+    validation = validate_extraction(plain_values, fields)
 
     business_validation = {}
     try:
         engine = ValidationEngine()
-        business_validation = engine.validate(extracted, doc_type)
+        business_validation = engine.validate(plain_values, doc_type)
     except (ImportError, Exception):
         pass
 
@@ -849,7 +865,7 @@ def extract_nl(document_id: str, instruction: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Document classification — from chunks (existing flow)
+# Document classification — E1 two-stage pipeline
 # ---------------------------------------------------------------------------
 
 DOCUMENT_CLASSIFIER_PROMPT = """You are a document classification expert.
@@ -899,7 +915,7 @@ def _get_confidence_threshold() -> float:
 def classify_document(document_id: str) -> dict:
     """
     Classify a document using chunks already stored in the DB.
-    Used post-ingestion (called from documents.py _run_post_ingest).
+    E1: routes through the two-stage pipeline.
     """
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
@@ -910,36 +926,57 @@ def classify_document(document_id: str) -> dict:
         }
 
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
-    return _classify_from_context(context, document_id=document_id)
+    return classify_document_from_text(context, document_id=document_id)
 
 
 def classify_document_from_text(text: str, document_id: str = "") -> dict:
     """
-    Classify a document from raw text — used by ingestion.py BEFORE chunks
-    are stored, so we know the doc type before deciding chunking mode (D1).
+    Classify a document from raw text.
+    E1: tries Stage 1 (keyword + embedding) first; falls back to LLM only
+    when Stage 1 confidence is below threshold.
 
     Args:
-        text:        Raw full text of the document (first ~2000 chars used).
-        document_id: Optional — used only for logging.
+        text:        Raw full text of the document.
+        document_id: Optional — used only for logging / cache key.
 
     Returns:
-        Same shape as classify_document().
+        {
+            "doc_type":              str,
+            "schema_template":       str,
+            "confidence":            float,
+            "reasoning":             str,
+            "key_signals":           list,
+            "requires_human_review": bool,
+            "stage_used":            "stage1" | "stage2",   ← new (E1)
+        }
     """
     if not text or not text.strip():
         return {
             "doc_type": "general", "schema_template": "custom",
             "confidence": 0.0, "reasoning": "No text provided.",
             "key_signals": [], "requires_human_review": True,
+            "stage_used": "stage2",
         }
 
-    context = text[:2000]
-    return _classify_from_context(context, document_id=document_id)
+    from classification.pipeline import classify as _classify_pipeline
+
+    def _embed(t: str) -> list[float]:
+        """Wrap the embed model in the signature Stage 1 expects."""
+        return get_embed_model().get_text_embedding(t)
+
+    return _classify_pipeline(
+        full_text=text,
+        get_embedding_fn=_embed,
+        document_id=document_id or None,
+    )
 
 
 def _classify_from_context(context: str, document_id: str = "") -> dict:
     """
-    Shared classification logic used by both classify_document() and
-    classify_document_from_text(). Checks cache, calls LLM, writes cache.
+    LLM-only classification — called by pipeline.py Stage 2.
+    Checks cache, calls LLM, writes cache.
+    This function intentionally does NOT go through the pipeline again
+    (no recursion risk).
     """
     try:
         text_hash = make_text_hash(context)
@@ -963,6 +1000,7 @@ def _classify_from_context(context: str, document_id: str = "") -> dict:
             "doc_type": "general", "schema_template": "custom",
             "confidence": 0.0, "reasoning": f"Classification error: {exc}",
             "key_signals": [], "requires_human_review": True,
+            "stage_used": "stage2",
         }
 
     doc_type        = result.doc_type.lower().strip()
@@ -971,7 +1009,7 @@ def _classify_from_context(context: str, document_id: str = "") -> dict:
     threshold       = _get_confidence_threshold()
 
     _clf_logger.info(
-        "Document classified",
+        "Document classified (LLM)",
         document_id=document_id, doc_type=doc_type,
         confidence=round(confidence, 3),
         requires_review=confidence < threshold,
@@ -984,6 +1022,7 @@ def _classify_from_context(context: str, document_id: str = "") -> dict:
         "reasoning":             result.reasoning,
         "key_signals":           result.key_signals,
         "requires_human_review": confidence < threshold,
+        "stage_used":            "stage2",
     }
 
     try:
@@ -1000,11 +1039,6 @@ def _classify_from_context(context: str, document_id: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 def _get_doc_type_hint(document_ids: list[str] | None) -> str:
-    """
-    Best-effort doc type hint from the first document's stored classification.
-    Used to improve HyDE passage generation vocabulary.
-    Returns "general" on any failure.
-    """
     if not document_ids:
         return "general"
     try:

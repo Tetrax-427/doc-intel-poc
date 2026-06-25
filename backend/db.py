@@ -260,3 +260,30 @@ def get_corrections_for_doc_type(
         .execute()
     )
     return result.data or []
+
+
+def mark_api_key_rotating(key_id: str, grace_expires_at: str) -> None:
+    """
+    Marks a key as 'rotating' — still valid until grace period expires.
+    Called by rotate_api_key() in api_keys.py.
+    """
+    supabase.table("api_keys").update({
+        "status":          "rotating",
+        "grace_expires_at": grace_expires_at,
+    }).eq("id", key_id).execute()
+ 
+ 
+def get_api_key_by_id(key_id: str, user_id: str) -> dict | None:
+    """
+    Fetch one API key record by UUID + user_id ownership check.
+    Returns None if not found or not owned by user_id.
+    """
+    resp = (
+        supabase.table("api_keys")
+        .select("*")
+        .eq("id", key_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return resp.data[0] if resp.data else None
+ 
