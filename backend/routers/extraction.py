@@ -113,17 +113,15 @@ def extract(req: ExtractRequest, user=Depends(get_current_user)):
     """
     uid = get_user_id(user)
 
-    # F1 — log extraction started
     log_extraction_started(req.document_id, user_id=uid, field_count=len(req.fields))
 
     try:
-        result = extract_fields(req.document_id, req.fields)
+        result = extract_fields(req.document_id, req.fields, user_id=uid)
     except Exception as exc:
         return internal_error(f"Extraction failed: {exc}")
 
     extracted = result.get("extracted", {})
 
-    # F1 — log extraction completed
     fields_with_value = sum(
         1 for v in extracted.values()
         if isinstance(v, dict) and v.get("value") is not None
@@ -147,7 +145,6 @@ def extract(req: ExtractRequest, user=Depends(get_current_user)):
         "validation":  result.get("validation"),
     })
 
-    # E2 — persist extraction result
     extraction_id = _store_extraction(
         document_id=req.document_id,
         template_id="custom",
@@ -158,16 +155,18 @@ def extract(req: ExtractRequest, user=Depends(get_current_user)):
 
 
 @router.post("/extract/nl")
-def extract_natural_language(req: NLExtractRequest):
+def extract_natural_language(req: NLExtractRequest, user=Depends(get_current_user)):
+    uid = get_user_id(user)
+
     if req.preview_only:
         try:
-            schema = nl_to_schema(req.instruction)
+            schema = nl_to_schema(req.instruction, user_id=uid)
         except Exception as exc:
             return internal_error(f"Schema generation failed: {exc}")
         return {"schema": schema, "extracted": None, "validation": None}
 
     try:
-        result = extract_nl(req.document_id, req.instruction)
+        result = extract_nl(req.document_id, req.instruction, user_id=uid)
     except Exception as exc:
         return internal_error(f"NL extraction failed: {exc}")
 
@@ -185,7 +184,9 @@ def extract_natural_language(req: NLExtractRequest):
 
 
 @router.post("/extract/batch")
-def batch_extract(req: BatchExtractRequest):
+def batch_extract(req: BatchExtractRequest, user=Depends(get_current_user)):
+    uid = get_user_id(user)
+
     if not req.fields and not req.instruction:
         return bad_request(
             "Provide either 'fields' (schema dict) or 'instruction' (natural language).",
@@ -196,9 +197,9 @@ def batch_extract(req: BatchExtractRequest):
     for doc_id in req.document_ids:
         try:
             if req.instruction:
-                result = extract_nl(doc_id, req.instruction)
+                result = extract_nl(doc_id, req.instruction, user_id=uid)
             else:
-                result = extract_fields(doc_id, req.fields)
+                result = extract_fields(doc_id, req.fields, user_id=uid)
 
             results.append({"document_id": doc_id, "success": True, **result})
 
@@ -243,9 +244,10 @@ def get_template(template_id: str):
 
 
 @router.get("/tables/{document_id}")
-def get_tables(document_id: str):
+def get_tables(document_id: str, user=Depends(get_current_user)):
+    uid = get_user_id(user)
     try:
-        tables = extract_tables(document_id)
+        tables = extract_tables(document_id, user_id=uid)
         return {"tables": tables}
     except Exception as exc:
         return internal_error(f"Table extraction failed: {exc}")
@@ -274,7 +276,6 @@ def submit_review(
             evidence=action.evidence_used,
             note=action.reviewer_note,
         )
-        # F1 — log each correction
         log_corrected(
             document_id,
             user_id=uid,

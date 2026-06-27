@@ -1,10 +1,11 @@
 import base64
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, validator
 
 from core.responses import bad_request, internal_error
+from core.auth import get_current_user, get_user_id
 from core.logger import get_logger
 from retrieval import query_document, query_document_stream, compress_history
 from db import get_chat_history, save_message
@@ -23,13 +24,8 @@ class QueryRequest(BaseModel):
     document_ids: list[str] | None = None
     history: list[dict] = []
     history_summary: str = ""
-    # C3 — per-call provider/model override
     provider: str | None = None
     model: str | None = None
-    # D2 — retrieval mode
-    # "standard" or "none" = plain hybrid search (default)
-    # "hyde"      = HyDE passage replaces query for dense embedding
-    # "multiquery" = 2-3 query variants, merged + deduped
     retrieval_mode: str = "standard"
 
     @validator("question")
@@ -50,7 +46,6 @@ class QueryRequest(BaseModel):
 
     @validator("retrieval_mode", always=True)
     def retrieval_mode_valid(cls, v):
-        # normalise "none" → "standard"; reject truly unknown values
         normalised = v.strip().lower() if v else "standard"
         if normalised == "none":
             return "standard"
@@ -93,19 +88,8 @@ class CompressRequest(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/query")
-def query(req: QueryRequest):
-    """
-    Answer a question, optionally grounded in one or more documents.
-
-    New D2 field: retrieval_mode
-        "standard" (default) — plain hybrid search, no extra LLM calls
-        "hyde"     — HyDE passage replaces query for dense embedding step
-        "multiquery" — 2-3 paraphrased query variants, results merged+deduped
-
-    New C3 fields: provider + model
-        Override the LLM provider/model for this single request.
-        Both must be supplied together or not at all.
-    """
+def query(req: QueryRequest, user=Depends(get_current_user)):
+    uid = get_user_id(user)
     try:
         return query_document(
             req.question,
@@ -116,18 +100,16 @@ def query(req: QueryRequest):
             provider=req.provider,
             model=req.model,
             retrieval_mode=req.retrieval_mode,
+            user_id=uid,
         )
     except Exception as exc:
         return internal_error(f"Query failed: {exc}")
 
 
 @router.post("/query/stream")
-def query_stream(req: QueryRequest):
-    """
-    Streaming version of /query.
-    Tokens are base64-encoded SSE events; ends with data: [DONE].
-    retrieval_mode is applied before streaming begins.
-    """
+def query_stream(req: QueryRequest, user=Depends(get_current_user)):
+    uid = get_user_id(user)
+
     def event_stream():
         try:
             for token in query_document_stream(
@@ -139,6 +121,7 @@ def query_stream(req: QueryRequest):
                 provider=req.provider,
                 model=req.model,
                 retrieval_mode=req.retrieval_mode,
+                user_id=uid,
             ):
                 encoded = base64.b64encode(token.encode()).decode()
                 yield f"data: {encoded}\n\n"
@@ -170,13 +153,10 @@ def save_chat(document_id: str, body: SaveChatRequest):
 
 
 @router.post("/compress")
-def compress(req: CompressRequest):
-    """
-    Summarise a conversation history into a compact string.
-    Used by the frontend to manage context-window size.
-    """
+def compress(req: CompressRequest, user=Depends(get_current_user)):
+    uid = get_user_id(user)
     try:
-        summary = compress_history(req.messages)
+        summary = compress_history(req.messages, user_id=uid)
         return {"summary": summary}
     except Exception as exc:
         return internal_error(f"Compression failed: {exc}")

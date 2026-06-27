@@ -27,6 +27,7 @@ from db import (
     save_summary, save_classification, get_classification,
     get_summary, get_all_documents, delete_document_by_id,
 )
+from db_llm_cache import invalidate_for_document
 from ingestion import ingest_file, ingest_url
 
 router = APIRouter(tags=["Documents"])
@@ -70,7 +71,7 @@ def _run_post_ingest(document_id: str, result: dict, user_id: str = "system") ->
             document_id, user_id, LineageEvent.SUMMARIZED,
             event_data={"file": result.get("file", "")},
         ):
-            summary_data = generate_summary(document_id)
+            summary_data = generate_summary(document_id, user_id=user_id)
             save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
 
         result["summary_short"] = summary_data["summary_short"]
@@ -90,7 +91,7 @@ def _run_post_ingest(document_id: str, result: dict, user_id: str = "system") ->
             result["classification"] = pre_classification
     else:
         try:
-            classification = classify_document(document_id)
+            classification = classify_document(document_id, user_id=user_id)
             save_classification(document_id, classification)
             result["classification"] = classification
         except Exception as exc:
@@ -185,7 +186,7 @@ def delete_document(
     # F1 — fetch doc metadata before deletion for lineage record
     try:
         from db import get_document
-        doc      = get_document(document_id)
+        doc      = get_document(document_id, user_id=uid)
         filename = doc.get("file_name", "") if doc else ""
         doc_type = doc.get("doc_type", "") if doc else ""
     except Exception:
@@ -195,16 +196,24 @@ def delete_document(
     # F1 — log deletion BEFORE deleting (after deletion doc_id may be gone)
     log_deleted(document_id, user_id=uid, filename=filename, doc_type=doc_type)
 
-    delete_document_by_id(document_id)
+    # Invalidate all Layer 2 cache entries for this document + user
+    # Non-blocking — a cache invalidation failure must never prevent the delete.
+    try:
+        invalidate_for_document(document_id, user_id=uid)
+    except Exception:
+        pass
+
+    delete_document_by_id(document_id, user_id=uid)
     return {"status": "deleted", "document_id": document_id}
 
 
 @router.get("/summary/{document_id}")
-def get_doc_summary(document_id: str):
+def get_doc_summary(document_id: str, user=Depends(get_current_user)):
+    uid  = get_user_id(user)
     data = get_summary(document_id)
     if not data.get("summary"):
         try:
-            summary_data = generate_summary(document_id)
+            summary_data = generate_summary(document_id, user_id=uid)
             save_summary(document_id, summary_data["summary"], summary_data["summary_short"])
             data = summary_data
         except Exception as exc:
