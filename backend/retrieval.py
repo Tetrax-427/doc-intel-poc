@@ -9,8 +9,11 @@ from rank_bm25 import BM25Okapi
 from db import get_chunks_by_document, get_parent_chunk
 from ingestion import get_embed_model
 from prompts import (
-    QA_PROMPT, QA_PROMPT_MULTI, GENERAL_PROMPT,
-    CLASSIFIER_PROMPT, QUERY_EXPANSION_PROMPT, EXTRACTION_PROMPT
+    QA_SYSTEM, QA_MULTI_SYSTEM,
+    GENERAL_SYSTEM,
+    CLASSIFIER_SYSTEM,
+    QUERY_EXPANSION_SYSTEM,
+    EXTRACTION_SYSTEM,
 )
 from db import get_corrections_for_doc_type
 from llm.engine import call_llm, call_llm_stream
@@ -37,7 +40,6 @@ load_dotenv()
 from core.logger import get_logger as _get_logger
 from schemas.templates import get_template_for_doc_type
 from core.config import config as app_config
-from core.cache import get_classification, set_classification, make_text_hash
 
 import cohere
 co = cohere.Client(os.getenv("COHERE_API_KEY"))
@@ -76,17 +78,6 @@ def get_history_context(messages: list[dict], summary: str = "", window: int = 4
 # ---------------------------------------------------------------------------
 
 def format_source(chunk: dict) -> dict:
-    """
-    Build a standardised source entry from a retrieval chunk.
-
-    Handles four chunk_type values:
-      "text"        — standard text source
-      "table"       — table source
-      "description" — vision description (image-level, no specific figure ref)
-      "figure"      — B3: figure/chart with caption + bbox in metadata
-
-    Never raises — falls back to a basic source dict on any error.
-    """
     try:
         chunk_type = chunk.get("chunk_type", "text")
         base = {
@@ -97,17 +88,13 @@ def format_source(chunk: dict) -> dict:
             "chunk_type":     chunk_type,
             "exact_sentence": "",
         }
-
         if chunk_type == "figure":
             base["image_ref"] = chunk.get("image_ref")
             base["caption"]   = chunk.get("caption", "")
             base["bbox"]      = chunk.get("bbox")
-
         elif chunk_type in ("description", "table"):
             base["image_ref"] = chunk.get("image_ref")
-
         return base
-
     except Exception:
         return {
             "chunk":          chunk.get("chunk_num"),
@@ -123,8 +110,12 @@ def format_source(chunk: dict) -> dict:
 # Classification (question type)
 # ---------------------------------------------------------------------------
 
-def classify_question(question: str, has_document: bool = True) -> str:
-    """Returns 'document' or 'general'"""
+def classify_question(
+    question: str,
+    has_document: bool = True,
+    user_id: str = "system",
+) -> str:
+    """Returns 'document' or 'general'."""
     if not has_document:
         return "general"
 
@@ -138,10 +129,12 @@ def classify_question(question: str, has_document: bool = True) -> str:
 
     try:
         result = call_llm(
-            CLASSIFIER_PROMPT.format(question=question),
+            system=CLASSIFIER_SYSTEM,
+            user=question,
             temperature=0.0,
             max_tokens=10,
-            call_type="classify"
+            call_type="classify",
+            user_id=user_id,
         )
         return "document" if "document" in result.strip().lower() else "general"
     except Exception:
@@ -152,14 +145,16 @@ def classify_question(question: str, has_document: bool = True) -> str:
 # Query expansion
 # ---------------------------------------------------------------------------
 
-def expand_query(question: str) -> str:
+def expand_query(question: str, user_id: str = "system") -> str:
     try:
         result: QueryExpansion = call_llm(
-            QUERY_EXPANSION_PROMPT.format(question=question),
+            system=QUERY_EXPANSION_SYSTEM,
+            user=question,
             temperature=0.0,
             max_tokens=100,
             call_type="expand",
             response_model=QueryExpansion,
+            user_id=user_id,
         )
         expanded = result.expanded_query.strip()
         return expanded if expanded else question
@@ -172,9 +167,7 @@ def expand_query(question: str) -> str:
 # ---------------------------------------------------------------------------
 
 def rerank_chunks(question: str, chunks: list[dict], top_k: int = None) -> list[dict]:
-    """Use Cohere to rerank retrieved chunks."""
     effective_top_k = top_k if top_k is not None else app_config.retrieval_top_n
-
     if not chunks or not os.getenv("COHERE_API_KEY"):
         return chunks[:effective_top_k]
     try:
@@ -182,7 +175,7 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = None) -> list[
             model="rerank-english-v3.0",
             query=question,
             documents=[c["content"] for c in chunks],
-            top_n=effective_top_k
+            top_n=effective_top_k,
         )
         reranked = []
         for r in results.results:
@@ -202,10 +195,6 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = None) -> list[
 # ---------------------------------------------------------------------------
 
 def expand_to_parent_context(chunks: list[dict]) -> list[dict]:
-    """
-    For child chunks, fetch the parent chunk from DB and replace the LLM
-    context text with the parent's fuller text.
-    """
     if not app_config.hierarchical_expand_to_parent:
         return chunks
 
@@ -226,10 +215,8 @@ def expand_to_parent_context(chunks: list[dict]) -> list[dict]:
             except Exception as exc:
                 logger.warning(
                     "Parent chunk lookup failed — using child text",
-                    parent_id=parent_id,
-                    error=str(exc),
+                    parent_id=parent_id, error=str(exc),
                 )
-
         expanded.append(chunk)
 
     return expanded
@@ -245,8 +232,8 @@ def hybrid_search(
     candidate_pool: int | None = None,
     top_n: int | None = None,
     dense_query_override: str | None = None,
+    user_id: str = "system",
 ) -> list[dict]:
-    """Hybrid dense + sparse search with configurable candidate pool and top-N."""
     pool_size = candidate_pool if candidate_pool is not None else app_config.retrieval_candidate_pool
     n_results = top_n          if top_n          is not None else app_config.retrieval_top_n
 
@@ -277,7 +264,7 @@ def hybrid_search(
     if not searchable:
         return []
 
-    expanded_question  = expand_query(question)
+    expanded_question  = expand_query(question, user_id=user_id)
     dense_query_text   = dense_query_override if dense_query_override else expanded_question
     question_embedding = embed_model.get_text_embedding(dense_query_text)
 
@@ -319,7 +306,6 @@ def hybrid_search(
             "chunk_level":     searchable[idx]["metadata"].get("chunk_level", "flat"),
             "parent_chunk_id": searchable[idx]["metadata"].get("parent_chunk_id"),
             "score":           rrf[idx],
-            # E2 — carry bbox through from chunk metadata for find_field_bbox()
             "bbox":            searchable[idx]["metadata"].get("bbox"),
         }
         for i, idx in enumerate(top_indices)
@@ -339,22 +325,24 @@ def hybrid_search_with_mode(
     candidate_pool: int | None = None,
     top_n: int | None = None,
     doc_type: str = "general",
+    user_id: str = "system",
 ) -> list[dict]:
     mode            = normalise_retrieval_mode(retrieval_mode)
     effective_top_n = top_n if top_n is not None else app_config.retrieval_top_n
 
     if mode == "hyde":
-        passage = generate_hyde_passage(question, doc_type=doc_type)
+        passage = generate_hyde_passage(question, doc_type=doc_type, user_id=user_id)
         chunks  = hybrid_search(
             question,
             document_ids=document_ids,
             candidate_pool=candidate_pool,
             top_n=effective_top_n,
             dense_query_override=passage,
+            user_id=user_id,
         )
 
     elif mode == "multiquery":
-        queries = generate_query_variants(question)
+        queries = generate_query_variants(question, user_id=user_id)
         results_per_query = []
         for q in queries:
             results = hybrid_search(
@@ -362,6 +350,7 @@ def hybrid_search_with_mode(
                 document_ids=document_ids,
                 candidate_pool=candidate_pool,
                 top_n=effective_top_n,
+                user_id=user_id,
             )
             results_per_query.append(results)
         chunks = merge_and_dedupe(results_per_query, top_n=effective_top_n)
@@ -372,6 +361,7 @@ def hybrid_search_with_mode(
             document_ids=document_ids,
             candidate_pool=candidate_pool,
             top_n=effective_top_n,
+            user_id=user_id,
         )
 
     return expand_to_parent_context(chunks)
@@ -384,13 +374,16 @@ def hybrid_search_with_mode(
 def answer_general(
     question: str,
     history: list[dict] = None,
-    history_summary: str = ""
+    history_summary: str = "",
+    user_id: str = "system",
 ) -> str:
     history_text = format_history(history or [], history_summary)
     return call_llm(
-        GENERAL_PROMPT.format(history=history_text, question=question),
+        system=GENERAL_SYSTEM,
+        user=f"Conversation so far:\n{history_text}\n\nQuestion: {question}",
         temperature=0.5,
-        call_type="general"
+        call_type="general",
+        user_id=user_id,
     )
 
 
@@ -398,7 +391,10 @@ def answer_general(
 # History compression
 # ---------------------------------------------------------------------------
 
-def compress_history(messages: list[dict]) -> str:
+def compress_history(
+    messages: list[dict],
+    user_id: str = "system",
+) -> str:
     if not messages:
         return ""
     conversation = "\n".join([
@@ -406,17 +402,16 @@ def compress_history(messages: list[dict]) -> str:
         for m in messages
     ])
     return call_llm(
-        f"""Summarize the following conversation in 3-5 sentences.
-Focus on key facts, questions asked, and answers given.
-Be concise — this will be used as context for future questions.
-
-Conversation:
-{conversation}
-
-Summary:""",
+        system=(
+            "Summarize the following conversation in 3-5 sentences. "
+            "Focus on key facts, questions asked, and answers given. "
+            "Be concise — this will be used as context for future questions."
+        ),
+        user=f"Conversation:\n{conversation}\n\nSummary:",
         temperature=0.0,
         max_tokens=300,
-        call_type="compress"
+        call_type="compress",
+        user_id=user_id,
     )
 
 
@@ -424,7 +419,11 @@ Summary:""",
 # Exact evidence extraction
 # ---------------------------------------------------------------------------
 
-def get_exact_sentence(chunk_content: str, question: str) -> str:
+def get_exact_sentence(
+    chunk_content: str,
+    question: str,
+    user_id: str = "system",
+) -> str:
     try:
         if not chunk_content:
             return ""
@@ -435,14 +434,15 @@ def get_exact_sentence(chunk_content: str, question: str) -> str:
             return sentences[0]
         candidates = sentences[:10]
         result = call_llm(
-            f"""From the sentences below, return ONLY the single sentence most relevant to: "{question}"
-
-{chr(10).join(f"{i + 1}. {s}" for i, s in enumerate(candidates))}
-
-Return ONLY the sentence text, nothing else.""",
+            system='Return ONLY the single sentence most relevant to the user\'s question. No explanation.',
+            user=(
+                f'Question: "{question}"\n\n'
+                + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(candidates))
+            ),
             temperature=0.0,
             max_tokens=150,
-            call_type="evidence_extract"
+            call_type="evidence_extract",
+            user_id=user_id,
         )
         extracted = result.strip() if isinstance(result, str) else ""
         return extracted if extracted else sentences[0]
@@ -463,12 +463,13 @@ def query_document(
     provider: str = None,
     model: str = None,
     retrieval_mode: str = "standard",
+    user_id: str = "system",
 ) -> dict:
     has_doc = bool(document_ids or document_id)
-    q_type  = classify_question(question, has_document=has_doc)
+    q_type  = classify_question(question, has_document=has_doc, user_id=user_id)
 
     if q_type == "general":
-        answer = answer_general(question, history, history_summary)
+        answer = answer_general(question, history, history_summary, user_id=user_id)
         return {"answer": answer, "sources": [], "type": "general"}
 
     ids      = document_ids if document_ids else ([document_id] if document_id else None)
@@ -480,10 +481,11 @@ def query_document(
         document_ids=ids,
         retrieval_mode=retrieval_mode,
         doc_type=doc_type,
+        user_id=user_id,
     )
 
     if not chunks:
-        answer = answer_general(question, history, history_summary)
+        answer = answer_general(question, history, history_summary, user_id=user_id)
         return {"answer": answer, "sources": [], "type": "general"}
 
     chunks_text  = "\n\n".join([
@@ -491,14 +493,19 @@ def query_document(
         for c in chunks
     ])
     history_text = format_history(history or [], history_summary)
-    prompt = (QA_PROMPT_MULTI if is_multi else QA_PROMPT).format(
-        chunks=chunks_text,
-        history=history_text,
-        question=question
-    )
+
+    system = QA_MULTI_SYSTEM if is_multi else QA_SYSTEM
+    user   = f"Document chunks:\n{chunks_text}\n\nConversation so far:\n{history_text}\n\nQuestion: {question}"
 
     override_kwargs = {"provider": provider, "model": model} if provider and model else {}
-    answer = call_llm(prompt, temperature=0.2, call_type="query", **override_kwargs)
+    answer = call_llm(
+        system=system,
+        user=user,
+        temperature=0.2,
+        call_type="query",
+        user_id=user_id,
+        **override_kwargs,
+    )
 
     return {
         "answer": answer,
@@ -510,7 +517,7 @@ def query_document(
                 "preview":        c["content"][:150],
                 "chunk_type":     c.get("chunk_type", "text"),
                 "image_ref":      c.get("image_ref"),
-                "exact_sentence": get_exact_sentence(c["content"], question),
+                "exact_sentence": get_exact_sentence(c["content"], question, user_id=user_id),
             }
             for c in chunks
         ],
@@ -531,12 +538,13 @@ def query_document_stream(
     provider: str = None,
     model: str = None,
     retrieval_mode: str = "standard",
+    user_id: str = "system",
 ) -> Generator:
     has_doc = bool(document_ids or document_id)
-    q_type  = classify_question(question, has_document=has_doc)
+    q_type  = classify_question(question, has_document=has_doc, user_id=user_id)
 
     if q_type == "general":
-        yield answer_general(question, history, history_summary)
+        yield answer_general(question, history, history_summary, user_id=user_id)
         return
 
     ids      = document_ids if document_ids else ([document_id] if document_id else None)
@@ -548,10 +556,11 @@ def query_document_stream(
         document_ids=ids,
         retrieval_mode=retrieval_mode,
         doc_type=doc_type,
+        user_id=user_id,
     )
 
     if not chunks:
-        yield answer_general(question, history, history_summary)
+        yield answer_general(question, history, history_summary, user_id=user_id)
         return
 
     chunks_text  = "\n\n".join([
@@ -559,14 +568,19 @@ def query_document_stream(
         for c in chunks
     ])
     history_text = format_history(history or [], history_summary)
-    prompt = (QA_PROMPT_MULTI if is_multi else QA_PROMPT).format(
-        chunks=chunks_text,
-        history=history_text,
-        question=question
-    )
+
+    system = QA_MULTI_SYSTEM if is_multi else QA_SYSTEM
+    user   = f"Document chunks:\n{chunks_text}\n\nConversation so far:\n{history_text}\n\nQuestion: {question}"
 
     override_kwargs = {"provider": provider, "model": model} if provider and model else {}
-    stream_gen = call_llm(prompt, call_type="query_stream", stream=True, **override_kwargs)
+    stream_gen = call_llm(
+        system=system,
+        user=user,
+        call_type="query_stream",
+        stream=True,
+        user_id=user_id,
+        **override_kwargs,
+    )
     for token in stream_gen:
         yield token
 
@@ -599,31 +613,7 @@ def build_correction_examples(doc_type: str, fields: dict) -> str:
 # E2 — Bounding box lookup for extracted field values
 # ---------------------------------------------------------------------------
 
-def find_field_bbox(
-    field_value: str | None,
-    document_id: str,
-) -> dict | None:
-    """
-    Find the best-matching chunk for an extracted field value and return
-    its bounding box.
-
-    Fetches all chunks for the document internally (single DB call),
-    then scans for the chunk whose content best contains the field value.
-
-    Matching strategy:
-      1. Substring match (case-insensitive): chunk content contains the
-         field value.
-      2. Among matches, prefer the chunk where the value appears closest
-         to the start (heuristic: field values tend to be near section tops).
-      3. Skip chunks without a bbox (e.g. pypdf-parsed documents).
-
-    Returns:
-      dict with bbox keys (x, y, width, height, page, page_width,
-      page_height) or None if:
-        - field_value is None / empty / < 4 chars (too short to be reliable)
-        - no matching chunk found
-        - matching chunk has no bbox
-    """
+def find_field_bbox(field_value: str | None, document_id: str) -> dict | None:
     if not field_value or len(field_value.strip()) < 4:
         return None
 
@@ -639,7 +629,6 @@ def find_field_bbox(
     if not matching:
         return None
 
-    # Sort: earlier match position = higher priority
     def match_position(chunk):
         idx = chunk["content"].lower().find(value_lower)
         return idx if idx >= 0 else 9999
@@ -656,30 +645,11 @@ def extract_fields(
     document_id: str,
     fields: dict[str, str],
     doc_type: str = "general",
+    user_id: str = "system",
 ) -> dict:
     """
     Extract fields from a document using Instructor structured output.
-
-    E2 change: each extracted field now includes a ``bbox`` key pointing to
-    the best-match bounding box in the source document.  The bbox is None
-    when the document was parsed without layout data (e.g. pypdf fallback).
-
-    Return shape:
-        {
-            "extracted": {
-                field_name: {
-                    "value": str | None,
-                    "bbox":  dict | None   ← NEW (E2)
-                },
-                ...
-            },
-            "validation":          dict | None,
-            "business_validation": dict,
-        }
-
-    Backward compatibility: existing callers that read
-    result["extracted"][field_name] will get a dict instead of a string.
-    The router (routers/extraction.py) handles both shapes.
+    Returns {extracted: {field: {value, bbox}}, validation, business_validation}.
     """
     if doc_type == "general":
         try:
@@ -692,10 +662,8 @@ def extract_fields(
         except Exception:
             pass
 
-    # Fetch chunks once — used for both context building and bbox lookup (E2)
     all_chunks = get_chunks_by_document(document_id)
 
-    # Use parent + flat only for extraction context (D1)
     context_chunks = [
         c for c in all_chunks
         if c.get("metadata", {}).get("chunk_level", "flat") in ("parent", "flat")
@@ -713,33 +681,32 @@ def extract_fields(
     correction_examples = build_correction_examples(doc_type, fields)
     ExtractionResult    = build_extraction_model(fields)
 
-    prompt = EXTRACTION_PROMPT.format(
-        correction_examples=correction_examples,
-        fields_with_descriptions=fields_with_desc,
-        context=context,
+    user_content = (
+        f"{correction_examples}"
+        f"Fields to extract (name: description):\n{fields_with_desc}\n\n"
+        f"Document:\n{context}"
     )
 
     try:
         result_model = call_llm(
-            prompt,
+            system=EXTRACTION_SYSTEM,
+            user=user_content,
             temperature=0.0,
             call_type="extract",
             response_model=ExtractionResult,
+            user_id=user_id,
+            document_id=document_id,
         )
         raw_extracted = {k: v for k, v in result_model.model_dump().items() if v is not None}
     except Exception as exc:
         return {"extracted": {"error": str(exc)}, "validation": None, "business_validation": {}}
 
-    # E2 — attach bbox per field (find_field_bbox fetches chunks internally)
+    # E2 — attach bbox per field
     extracted: dict[str, dict] = {}
     for field_name, value in raw_extracted.items():
         bbox = find_field_bbox(value, document_id)
-        extracted[field_name] = {
-            "value": value,
-            "bbox":  bbox,
-        }
+        extracted[field_name] = {"value": value, "bbox": bbox}
 
-    # Build plain dict for validation (validators expect field_name → value)
     plain_values = {k: v["value"] for k, v in extracted.items()}
 
     validation = validate_extraction(plain_values, fields)
@@ -762,7 +729,7 @@ def extract_fields(
 # Table extraction
 # ---------------------------------------------------------------------------
 
-def extract_tables(document_id: str) -> list[dict]:
+def extract_tables(document_id: str, user_id: str = "system") -> list[dict]:
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return []
@@ -771,20 +738,18 @@ def extract_tables(document_id: str) -> list[dict]:
 
     try:
         result: TableList = call_llm(
-            f"""Extract ALL tables from the document below.
-For each table identify:
-- title: descriptive title for the table
-- headers: list of column names
-- rows: list of rows, each row is a list of string values
-- chart_type: suggest "bar", "line", or "pie" based on the data
-
-If no tables are found, return an empty tables list.
-
-Document:
-{context}""",
+            system=(
+                "Extract ALL tables from the document the user provides. "
+                "For each table identify: title (descriptive), headers (column names), "
+                "rows (list of string value lists), chart_type ('bar', 'line', or 'pie'). "
+                "If no tables are found, return an empty tables list."
+            ),
+            user=f"Document:\n{context}",
             temperature=0.0,
             call_type="extract_tables",
             response_model=TableList,
+            user_id=user_id,
+            document_id=document_id,
         )
         return [table.model_dump() for table in result.tables]
     except Exception:
@@ -795,7 +760,7 @@ Document:
 # Summary generation
 # ---------------------------------------------------------------------------
 
-def generate_summary(document_id: str) -> dict:
+def generate_summary(document_id: str, user_id: str = "system") -> dict:
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return {"summary": "", "summary_short": ""}
@@ -804,13 +769,13 @@ def generate_summary(document_id: str) -> dict:
 
     try:
         result: DocumentSummary = call_llm(
-            f"""Analyse the document below and extract a structured summary.
-
-Document:
-{context}""",
+            system="Analyse the document the user provides and extract a structured summary.",
+            user=f"Document:\n{context}",
             temperature=0.0,
             call_type="summarize",
             response_model=DocumentSummary,
+            user_id=user_id,
+            document_id=document_id,
         )
         parsed = result.model_dump()
         return {"summary": json.dumps(parsed), "summary_short": parsed.get("short", "")}
@@ -822,21 +787,20 @@ Document:
 # NL to schema
 # ---------------------------------------------------------------------------
 
-def nl_to_schema(instruction: str) -> dict:
+def nl_to_schema(instruction: str, user_id: str = "system") -> dict:
     try:
         result: SchemaResult = call_llm(
-            f"""Convert the following extraction instruction into a JSON schema for document extraction.
-
-Rules:
-- Return a JSON object where keys are snake_case field names
-- Values are clear descriptions of what to extract for that field
-- Include all fields mentioned or implied by the instruction
-- For list fields use descriptive values ending in "as a list"
-
-Instruction: {instruction}""",
+            system=(
+                "Convert the extraction instruction the user provides into a JSON schema. "
+                "Return a JSON object where keys are snake_case field names and values are "
+                "clear descriptions of what to extract. Include all fields mentioned or "
+                "implied. For list fields use values ending in 'as a list'."
+            ),
+            user=f"Instruction: {instruction}",
             temperature=0.0,
             call_type="nl_to_schema",
             response_model=SchemaResult,
+            user_id=user_id,
         )
         schema = result.model_dump()
         if not schema:
@@ -846,8 +810,12 @@ Instruction: {instruction}""",
         return {"error": "Could not parse instruction into schema", "detail": str(exc)}
 
 
-def extract_nl(document_id: str, instruction: str) -> dict:
-    schema = nl_to_schema(instruction)
+def extract_nl(
+    document_id: str,
+    instruction: str,
+    user_id: str = "system",
+) -> dict:
+    schema = nl_to_schema(instruction, user_id=user_id)
     if "error" in schema:
         return {
             "error": "Could not parse instruction into schema",
@@ -855,7 +823,7 @@ def extract_nl(document_id: str, instruction: str) -> dict:
             "schema": None, "extracted": None,
             "validation": None, "business_validation": {},
         }
-    result = extract_fields(document_id, schema)
+    result = extract_fields(document_id, schema, user_id=user_id)
     return {
         "instruction": instruction, "schema": schema,
         "extracted": result.get("extracted"),
@@ -868,17 +836,14 @@ def extract_nl(document_id: str, instruction: str) -> dict:
 # Document classification — E1 two-stage pipeline
 # ---------------------------------------------------------------------------
 
-DOCUMENT_CLASSIFIER_PROMPT = """You are a document classification expert.
-
-Analyse the document text below and classify it.
-
-Valid doc_type values: invoice, receipt, resume, cv, contract, agreement, nda, report,
-research paper, financial statement, balance sheet, income statement, medical record,
-prescription, legal document, court filing, article, email, letter, general,
-gst return, gstr-1, gstr-3b, offer letter, loan application, bank statement
-
-Document (first ~2000 characters):
-{context}"""
+DOCUMENT_CLASSIFIER_SYSTEM = (
+    "You are a document classification expert. "
+    "Analyse the document text and classify it. "
+    "Valid doc_type values: invoice, receipt, resume, cv, contract, agreement, nda, report, "
+    "research paper, financial statement, balance sheet, income statement, medical record, "
+    "prescription, legal document, court filing, article, email, letter, general, "
+    "gst return, gstr-1, gstr-3b, offer letter, loan application, bank statement"
+)
 
 TEMPLATE_MAP = {
     "invoice":              "invoice",
@@ -912,7 +877,7 @@ def _get_confidence_threshold() -> float:
         return 0.75
 
 
-def classify_document(document_id: str) -> dict:
+def classify_document(document_id: str, user_id: str = "system") -> dict:
     """
     Classify a document using chunks already stored in the DB.
     E1: routes through the two-stage pipeline.
@@ -926,29 +891,17 @@ def classify_document(document_id: str) -> dict:
         }
 
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
-    return classify_document_from_text(context, document_id=document_id)
+    return classify_document_from_text(context, document_id=document_id, user_id=user_id)
 
 
-def classify_document_from_text(text: str, document_id: str = "") -> dict:
+def classify_document_from_text(
+    text: str,
+    document_id: str = "",
+    user_id: str = "system",
+) -> dict:
     """
-    Classify a document from raw text.
     E1: tries Stage 1 (keyword + embedding) first; falls back to LLM only
     when Stage 1 confidence is below threshold.
-
-    Args:
-        text:        Raw full text of the document.
-        document_id: Optional — used only for logging / cache key.
-
-    Returns:
-        {
-            "doc_type":              str,
-            "schema_template":       str,
-            "confidence":            float,
-            "reasoning":             str,
-            "key_signals":           list,
-            "requires_human_review": bool,
-            "stage_used":            "stage1" | "stage2",   ← new (E1)
-        }
     """
     if not text or not text.strip():
         return {
@@ -961,38 +914,35 @@ def classify_document_from_text(text: str, document_id: str = "") -> dict:
     from classification.pipeline import classify as _classify_pipeline
 
     def _embed(t: str) -> list[float]:
-        """Wrap the embed model in the signature Stage 1 expects."""
         return get_embed_model().get_text_embedding(t)
 
     return _classify_pipeline(
         full_text=text,
         get_embedding_fn=_embed,
         document_id=document_id or None,
+        user_id=user_id,
     )
 
 
-def _classify_from_context(context: str, document_id: str = "") -> dict:
+def _classify_from_context(
+    context: str,
+    document_id: str = "",
+    user_id: str = "system",
+) -> dict:
     """
     LLM-only classification — called by pipeline.py Stage 2.
-    Checks cache, calls LLM, writes cache.
-    This function intentionally does NOT go through the pipeline again
-    (no recursion risk).
+    No longer uses the old in-memory classification cache (core/cache.py).
+    The new unified llm_cache handles caching automatically via call_llm().
     """
     try:
-        text_hash = make_text_hash(context)
-        cached = get_classification(text_hash)
-        if cached is not None:
-            _clf_logger.info("Classification cache hit", document_id=document_id)
-            return cached
-    except Exception:
-        text_hash = None
-
-    try:
         result: DocumentClassification = call_llm(
-            DOCUMENT_CLASSIFIER_PROMPT.format(context=context),
+            system=DOCUMENT_CLASSIFIER_SYSTEM,
+            user=f"Document (first ~2000 characters):\n{context}",
             temperature=0.0,
             call_type="classify_document",
             response_model=DocumentClassification,
+            user_id=user_id,
+            document_id=document_id if document_id else None,
         )
     except Exception as exc:
         _clf_logger.error("LLM classification failed", document_id=document_id, error=str(exc))
@@ -1015,7 +965,7 @@ def _classify_from_context(context: str, document_id: str = "") -> dict:
         requires_review=confidence < threshold,
     )
 
-    classification_result = {
+    return {
         "doc_type":              doc_type,
         "schema_template":       schema_template,
         "confidence":            confidence,
@@ -1024,14 +974,6 @@ def _classify_from_context(context: str, document_id: str = "") -> dict:
         "requires_human_review": confidence < threshold,
         "stage_used":            "stage2",
     }
-
-    try:
-        if text_hash:
-            set_classification(text_hash, classification_result)
-    except Exception:
-        pass
-
-    return classification_result
 
 
 # ---------------------------------------------------------------------------

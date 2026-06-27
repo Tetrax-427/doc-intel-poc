@@ -27,6 +27,15 @@ BOUNDARY_SIGNALS = [
 
 MIN_PAGE_GAP = 2
 
+_SPLIT_DETECTION_SYSTEM = (
+    "A PDF has been uploaded that may contain multiple documents bundled together. "
+    "Review the page excerpts the user provides and confirm which ones start a genuinely "
+    "new document. A new document boundary is indicated by a distinct document type change, "
+    "a form header, an exhibit marker, or a page numbering reset. "
+    "Do NOT mark boundaries for section headings within a single document. "
+    "Return the confirmed page numbers that start a new document. Always include page 1."
+)
+
 
 class SplitBoundaries(BaseModel):
     page_numbers: list[int] = Field(
@@ -55,9 +64,14 @@ def detect_boundaries_fast(document: Document) -> list[int]:
     return sorted(boundaries)
 
 
-def detect_boundaries_llm(document: Document, fast_boundaries: list[int]) -> list[int]:
+def detect_boundaries_llm(
+    document: Document,
+    fast_boundaries: list[int],
+    user_id: str = "system",
+) -> list[int]:
     if len(fast_boundaries) <= 1:
         return fast_boundaries
+
     candidate_pages = [
         f"Page {page.page_num}: {page.text[:200]}"
         for page in document.pages
@@ -65,17 +79,16 @@ def detect_boundaries_llm(document: Document, fast_boundaries: list[int]) -> lis
     ]
     if not candidate_pages:
         return fast_boundaries
-    prompt = (
-        "A PDF has been uploaded that may contain multiple documents bundled together.\n"
-        "Review these page excerpts and confirm which ones start a genuinely new document.\n"
-        "Do NOT mark boundaries for section headings within a single document.\n\n"
-        "Candidate pages:\n" + "\n".join(candidate_pages) +
-        "\n\nReturn the confirmed page numbers. Always include page 1."
-    )
+
     try:
         result: SplitBoundaries = call_llm(
-            prompt, temperature=0.0, call_type="split_detection",
+            system=_SPLIT_DETECTION_SYSTEM,
+            user="Candidate pages:\n" + "\n".join(candidate_pages),
+            temperature=0.0,
+            call_type="split_detection",
             response_model=SplitBoundaries,
+            user_id=user_id,
+            document_id=document.id if hasattr(document, "id") else None,
         )
         confirmed = sorted(set([1] + [p for p in result.page_numbers if isinstance(p, int)]))
         logger.info("LLM boundary refinement complete", file=document.file_name,
@@ -94,7 +107,7 @@ def split_document(
 ) -> list[Document]:
     boundaries = detect_boundaries_fast(document)
     if use_llm and len(boundaries) > 1:
-        boundaries = detect_boundaries_llm(document, boundaries)
+        boundaries = detect_boundaries_llm(document, boundaries, user_id=user_id)
     if len(boundaries) <= 1:
         logger.info("No document boundaries — returning as single document",
                     file=document.file_name)
@@ -152,11 +165,11 @@ def split_document(
     return sub_docs
 
 
-def preview_split(document: Document, use_llm: bool = True) -> dict:
+def preview_split(document: Document, use_llm: bool = True, user_id: str = "system") -> dict:
     """Preview only — non-destructive, no lineage logged."""
     boundaries = detect_boundaries_fast(document)
     if use_llm and len(boundaries) > 1:
-        boundaries = detect_boundaries_llm(document, boundaries)
+        boundaries = detect_boundaries_llm(document, boundaries, user_id=user_id)
     page_count = document.metadata.get("page_count") or len(document.pages)
     parts = []
     for i, start_page in enumerate(boundaries):

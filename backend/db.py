@@ -6,6 +6,9 @@ All document/chunk queries are scoped by user_id for multi-user isolation.
 - insert_chunks() now passes through pre-assigned `id` fields (parent chunks
   need stable IDs so child chunks can reference them via parent_chunk_id).
 - get_parent_chunk() fetches a single chunk by ID for parent context expansion.
+- delete_document_by_id() now takes user_id and scopes the documents delete
+  to the owning user (security fix — previously unscoped, any caller could
+  delete any document by ID).
 """
 
 import os
@@ -29,6 +32,7 @@ def insert_document(name: str, user_id: str = "anonymous") -> str:
     }).execute()
     return result.data[0]["id"]
 
+
 def get_document(document_id: str, user_id: str = "anonymous") -> dict | None:
     """
     Return a single document record by ID, scoped to the requesting user.
@@ -37,10 +41,6 @@ def get_document(document_id: str, user_id: str = "anonymous") -> dict | None:
       - document not found
       - document belongs to a different user
       - any DB error occurs
-
-    Note: file_path is NOT stored in the DB. Callers that need the file on
-    disk must reconstruct it from the 'name' field:
-        file_path = os.path.join(UPLOAD_DIR, doc["name"])
     """
     try:
         result = (
@@ -58,6 +58,7 @@ def get_document(document_id: str, user_id: str = "anonymous") -> dict | None:
     except Exception:
         return None
 
+
 def get_all_documents(user_id: str = "anonymous") -> list[dict]:
     result = (
         supabase.table("documents")
@@ -69,9 +70,23 @@ def get_all_documents(user_id: str = "anonymous") -> list[dict]:
     return result.data or []
 
 
-def delete_document_by_id(document_id: str):
+def delete_document_by_id(document_id: str, user_id: str = "anonymous") -> None:
+    """
+    Delete all chunks for a document, then the document itself.
+
+    user_id scopes the documents delete so a caller can only delete documents
+    they own. Chunks are deleted by document_id only (chunks have no user_id
+    column of their own — they're owned transitively through their document).
+
+    Behaviour on not-found / wrong owner: silently returns (Supabase delete
+    on zero matching rows is a no-op, not an error). The caller's response
+    is always {"status": "deleted"} — idempotent by design, matching the
+    pre-existing convention.
+    """
+    # Delete chunks first (foreign-key child rows)
     supabase.table("chunks").delete().eq("document_id", document_id).execute()
-    supabase.table("documents").delete().eq("id", document_id).execute()
+    # Delete the document itself, scoped to the owning user
+    supabase.table("documents").delete().eq("id", document_id).eq("user_id", user_id).execute()
 
 
 def save_summary(document_id: str, summary: str, summary_short: str):
@@ -124,18 +139,11 @@ def insert_chunks(chunks: list[dict]):
 
     D1 change: if a chunk dict includes an "id" key, it is passed through
     to Supabase so parent chunks get stable UUIDs that child chunks can
-    reference via parent_chunk_id. Supabase will use the provided id
-    instead of auto-generating one.
-
-    Chunks without an "id" key are inserted as before (Supabase auto-assigns).
-    Rows with embedding=None (parent chunks) are stored without an embedding
-    vector — they are never searched directly, only fetched by ID.
+    reference via parent_chunk_id.
     """
     if not chunks:
         return
 
-    # Batch insert — Supabase handles up to 1000 rows per call cleanly.
-    # Split into batches of 500 to stay well within limits.
     batch_size = 500
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
@@ -145,10 +153,7 @@ def insert_chunks(chunks: list[dict]):
 def get_chunks_by_document(document_id: str) -> list[dict]:
     """
     Fetch all chunks for a document.
-
-    D1 note: returns ALL chunk levels (parent, child, flat).
-    Callers that only want searchable chunks (child + flat) must filter
-    on metadata.chunk_level != "parent" themselves — retrieval.py does this.
+    Returns ALL chunk levels (parent, child, flat) — callers filter as needed.
     """
     result = (
         supabase.table("chunks")
@@ -160,15 +165,6 @@ def get_chunks_by_document(document_id: str) -> list[dict]:
 
 
 def get_parent_chunk(parent_chunk_id: str) -> dict | None:
-    """
-    Fetch a single parent chunk by its ID.
-
-    Used by retrieval.expand_to_parent_context() to retrieve the fuller
-    parent text when a child chunk is matched during retrieval.
-
-    Returns None if the chunk does not exist or the query fails.
-    Never raises — callers fall back to child text on None.
-    """
     try:
         result = (
             supabase.table("chunks")
@@ -263,21 +259,13 @@ def get_corrections_for_doc_type(
 
 
 def mark_api_key_rotating(key_id: str, grace_expires_at: str) -> None:
-    """
-    Marks a key as 'rotating' — still valid until grace period expires.
-    Called by rotate_api_key() in api_keys.py.
-    """
     supabase.table("api_keys").update({
-        "status":          "rotating",
+        "status":           "rotating",
         "grace_expires_at": grace_expires_at,
     }).eq("id", key_id).execute()
- 
- 
+
+
 def get_api_key_by_id(key_id: str, user_id: str) -> dict | None:
-    """
-    Fetch one API key record by UUID + user_id ownership check.
-    Returns None if not found or not owned by user_id.
-    """
     resp = (
         supabase.table("api_keys")
         .select("*")
@@ -286,4 +274,3 @@ def get_api_key_by_id(key_id: str, user_id: str) -> dict | None:
         .execute()
     )
     return resp.data[0] if resp.data else None
- 

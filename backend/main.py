@@ -2,9 +2,7 @@
 FastAPI application entry point.
 
 F2: Added POST /api-keys/{key_id}/rotate endpoint.
-F3: CORS origins now driven by CORS_ALLOWED_ORIGINS env var (replaces
-    wildcard "*" in production).  Falls back to ["*"] in dev mode
-    (no CORS_ALLOWED_ORIGINS set AND no SUPABASE_JWT_SECRET set).
+F3: CORS origins now driven by CORS_ALLOWED_ORIGINS env var.
 """
 
 import os
@@ -17,7 +15,8 @@ from core.queue import task_queue
 from ingestion import get_embed_model
 from routers.auth import router as auth_router
 from routers import system, documents, query, extraction, export, integration
-from routers.lineage import router as lineage_router   # F1 — /documents/{id}/lineage
+from routers.lineage import router as lineage_router
+from routers.llm_observability import router as llm_observability_router
 
 load_dotenv()
 
@@ -45,32 +44,15 @@ app = FastAPI(
 )
 
 # ── F3 — CORS hardening ───────────────────────────────────────────────────────
-#
-# Priority order for determining allowed origins:
-#   1. CORS_ALLOWED_ORIGINS  — explicit comma-separated list (recommended).
-#   2. STREAMLIT_URL         — legacy single-origin var (backward compat).
-#   3. Dev fallback           — wildcard "*" when JWT auth is not configured.
-#
-# Production deployments MUST set CORS_ALLOWED_ORIGINS.
-# Example (Railway env var):
-#   CORS_ALLOWED_ORIGINS=https://myapp.railway.app,https://myapp.com
-#
-# Wildcard ("*") with allow_credentials=True is invalid per the CORS spec
-# and rejected by browsers.  We only set allow_credentials=True when
-# specific origins are configured.
 
 from core.config import config as app_config
 
 _cors_origins = app_config.get_cors_origins()
-
-# Detect dev mode — no JWT secret configured
-_is_dev_mode = not os.getenv("SUPABASE_JWT_SECRET", "").strip()
-
-# In strict dev mode with no origins configured fall back to wildcard
+_is_dev_mode  = not os.getenv("SUPABASE_JWT_SECRET", "").strip()
 _use_wildcard = _is_dev_mode and _cors_origins == ["http://localhost:8501"]
 
 ALLOWED_ORIGINS    = ["*"] if _use_wildcard else _cors_origins
-_allow_credentials = not _use_wildcard   # credentials require specific origins
+_allow_credentials = not _use_wildcard
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,13 +92,11 @@ app.include_router(extraction.router)
 app.include_router(export.router)
 app.include_router(integration.router)
 app.include_router(auth_router)
-app.include_router(lineage_router)    # F1 — /documents/{id}/lineage
+app.include_router(lineage_router)
+app.include_router(llm_observability_router)   # LLM tracing + cache stats
 
 
-# ── F2 — API key rotation endpoint ───────────────────────────────────────────
-#
-# Placed here (not in a dedicated router) because it's a one-off management
-# endpoint that doesn't justify a new router file.
+# ── F2 — API key management endpoints ────────────────────────────────────────
 
 class CreateApiKeyRequest(BaseModel):
     name: str
@@ -128,29 +108,18 @@ def create_api_key_endpoint(
     req: CreateApiKeyRequest,
     user=Depends(verify_api_key),
 ):
-    """Create a new API key."""
     from api_keys import create_api_key
     return create_api_key(req.name, req.rate_limit)
 
 
 @app.get("/api-keys", tags=["API Keys"])
 def list_api_keys_endpoint(user=Depends(verify_api_key)):
-    """List all API keys (hashes excluded)."""
     from api_keys import list_api_keys
     return list_api_keys()
 
 
 @app.post("/api-keys/{key_id}/rotate", tags=["API Keys"])
 def rotate_api_key_endpoint(key_id: str, user=Depends(verify_api_key)):
-    """
-    F2 — Rotate an API key.
-
-    Generates a new key, marks the old one as inactive but keeps it valid
-    for the configured grace period (default 24 hours) so existing
-    integrations have time to update.
-
-    Response includes the new key (shown once only) and the grace expiry.
-    """
     from api_keys import rotate_api_key
     try:
         return rotate_api_key(key_id)
@@ -160,7 +129,6 @@ def rotate_api_key_endpoint(key_id: str, user=Depends(verify_api_key)):
 
 @app.delete("/api-keys/{key_id}", tags=["API Keys"])
 def revoke_api_key_endpoint(key_id: str, user=Depends(verify_api_key)):
-    """Immediately revoke an API key. No grace period."""
     from api_keys import revoke_api_key
     revoke_api_key(key_id)
     return {"status": "revoked", "key_id": key_id}
