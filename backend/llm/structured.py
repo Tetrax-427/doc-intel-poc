@@ -2,8 +2,9 @@
 llm/structured.py — Instructor-powered structured output for DocIntel.
 
 Public API:
-    call_structured(raw_client, provider, model, messages,
-                    response_model, temperature, call_type) -> BaseModel
+    call_structured(raw_client, provider, model, system, user,
+                    response_model, temperature, call_type)
+        -> (BaseModel, usage_dict | None)
     build_extraction_model(fields: dict[str, str]) -> type[BaseModel]
 
 Pydantic models (used by retrieval.py call sites):
@@ -13,11 +14,22 @@ Pydantic models (used by retrieval.py call sites):
     DocumentSummary
     TableItem / TableList
     SchemaResult
+
+CHANGED from the previous version:
+- messages: list[dict] -> system: str, user: str (mandatory split — see
+  FINAL_PLAN.md §0/§2). Internally builds the provider-correct message shape.
+- Returns (result, usage) instead of bare result. usage is a plain dict
+  {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+  or None if the installed Instructor/provider SDK version doesn't expose
+  usage in a shape we recognise. This is the fix for the bug in the original
+  plan docs where every structured call silently logged zero cost — see
+  _extract_usage() below for exactly what's tried.
+- log_usage() / llm.usage import removed — superseded by llm/tracer.py,
+  which the caller (llm/engine.py) wraps around this function.
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import instructor
@@ -25,7 +37,6 @@ from pydantic import BaseModel, Field, ConfigDict, create_model
 
 from core.errors import StructuredOutputError, LLMConfigError
 from core.logger import get_logger
-from llm.usage import log_usage
 
 logger = get_logger("llm.structured")
 
@@ -94,13 +105,6 @@ def build_extraction_model(fields: dict[str, str]) -> type[BaseModel]:
     All fields are Optional[str] with a None default so the model never
     fails validation when the LLM omits a field.
 
-    Example:
-        fields = {"vendor_name": "Name of the vendor", "total_amount": "Total invoice amount"}
-        Model = build_extraction_model(fields)
-        # → class ExtractionResult(BaseModel):
-        #       vendor_name: str | None = Field(default=None, description="Name of the vendor")
-        #       total_amount: str | None = Field(default=None, description="Total invoice amount")
-
     Args:
         fields: dict mapping snake_case field names to plain-English descriptions.
 
@@ -109,7 +113,6 @@ def build_extraction_model(fields: dict[str, str]) -> type[BaseModel]:
     """
     field_defs: dict[str, Any] = {}
     for name, description in fields.items():
-        # Sanitise field name — replace spaces/hyphens with underscores
         safe_name = name.strip().replace(" ", "_").replace("-", "_")
         field_defs[safe_name] = (
             str | None,
@@ -148,6 +151,70 @@ def _get_instructor_client(raw_client, provider: str):
 
 
 # ---------------------------------------------------------------------------
+# Usage extraction — defensive, multi-shape
+# ---------------------------------------------------------------------------
+
+def _extract_usage(result: BaseModel, provider: str) -> dict | None:
+    """
+    Best-effort extraction of token usage from an Instructor-returned model.
+
+    Instructor attaches the raw provider response to the validated model as
+    `_raw_response` (this has been stable across recent instructor versions,
+    but is not a guaranteed public API — hence the defensive try/except here
+    rather than assuming a fixed shape).
+
+    Provider response.usage shapes differ:
+      - OpenAI / Groq (OpenAI-compatible): usage.prompt_tokens, usage.completion_tokens,
+        usage.total_tokens
+      - Anthropic: usage.input_tokens, usage.output_tokens (no total_tokens field —
+        computed here as their sum)
+
+    Returns:
+        {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+        or None if usage could not be found in any recognised shape. Returning
+        None (not zeros) is deliberate — see llm/tracer.py's cost estimator,
+        which treats None as "unknown" rather than "free".
+    """
+    try:
+        raw = getattr(result, "_raw_response", None)
+        if raw is None:
+            return None
+
+        usage = getattr(raw, "usage", None)
+        if usage is None:
+            return None
+
+        if provider == "anthropic":
+            input_tokens = getattr(usage, "input_tokens", None)
+            output_tokens = getattr(usage, "output_tokens", None)
+            if input_tokens is None or output_tokens is None:
+                return None
+            return {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            }
+
+        # OpenAI-compatible (openai, groq)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens if total_tokens is not None else prompt_tokens + completion_tokens,
+        }
+
+    except Exception as exc:
+        # Never let usage extraction break the actual call — log once at
+        # debug level and move on with usage=None.
+        logger.debug("Usage extraction failed — continuing without it", provider=provider, error=str(exc))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Core structured call
 # ---------------------------------------------------------------------------
 
@@ -156,12 +223,13 @@ def call_structured(
     raw_client,
     provider: str,
     model: str,
-    messages: list[dict],
+    system: str,
+    user: str,
     response_model: type[BaseModel],
     temperature: float = 0.0,
     max_tokens: int = 1000,
     call_type: str = "structured",
-) -> BaseModel:
+) -> tuple[BaseModel, dict | None]:
     """
     Make an LLM call and coerce the response into response_model via Instructor.
 
@@ -173,14 +241,15 @@ def call_structured(
         raw_client:     Raw Groq / OpenAI / Anthropic client (from fallback.build_client).
         provider:       Provider name string (for adapter selection + error context).
         model:          Model string passed to the API.
-        messages:       Full message list including system prompt if any.
+        system:         Static instruction text for this call.
+        user:           Per-call content (the thing the instruction operates on).
         response_model: Pydantic BaseModel subclass to coerce into.
         temperature:    Sampling temperature (default 0.0 for structured tasks).
         max_tokens:     Max response tokens.
-        call_type:      Label for usage tracking.
+        call_type:      Label for tracing.
 
     Returns:
-        Validated instance of response_model.
+        (validated_instance, usage_dict_or_None)
 
     Raises:
         StructuredOutputError: if Instructor fails to coerce the response.
@@ -188,46 +257,55 @@ def call_structured(
     """
     instructor_client = _get_instructor_client(raw_client, provider)
 
-    # Separate system message for Anthropic (top-level param)
     if provider == "anthropic":
-        system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
-        user_messages = [m for m in messages if m["role"] != "system"]
+        # Layer 1: cache_control on the system block. Same as engine.py's
+        # _call_anthropic — the system instruction is stable per call_type,
+        # so marking it ephemeral gives Anthropic the chance to cache it
+        # server-side and apply a token discount on repeated calls.
+        # Import CACHE_ENABLED from engine here rather than duplicating the
+        # env-var read, since engine.py already owns the feature-flag logic.
+        try:
+            from llm.engine import CACHE_ENABLED as _cache_enabled
+        except ImportError:
+            _cache_enabled = True  # safe default if import fails
+        if _cache_enabled:
+            system_block = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        else:
+            system_block = system
         kwargs: dict[str, Any] = {
             "model":          model,
             "max_tokens":     max_tokens,
             "temperature":    temperature,
-            "messages":       user_messages,
+            "system":         system_block,
+            "messages":       [{"role": "user", "content": user}],
             "response_model": response_model,
         }
-        if system_msg:
-            kwargs["system"] = system_msg
     else:
         kwargs = {
             "model":          model,
             "max_tokens":     max_tokens,
             "temperature":    temperature,
-            "messages":       messages,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
             "response_model": response_model,
         }
 
-    start = time.time()
     try:
         result = instructor_client.messages.create(**kwargs) \
             if provider == "anthropic" \
             else instructor_client.chat.completions.create(**kwargs)
 
-        latency = time.time() - start
-        _log_structured(call_type, model, messages, result, latency)
-        return result
+        usage = _extract_usage(result, provider)
+        return result, usage
 
     except Exception as exc:
-        latency = time.time() - start
         logger.error(
             "Instructor structured call failed",
             provider=provider,
             model=model,
             response_model=response_model.__name__,
-            latency_ms=round(latency * 1000),
             error=str(exc),
         )
         raise StructuredOutputError(
@@ -236,23 +314,3 @@ def call_structured(
             provider=provider,
             model=model,
         ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _log_structured(call_type: str, model: str, messages: list[dict],
-                     result: BaseModel, latency: float):
-    try:
-        prompt_len   = sum(len(m.get("content", "")) for m in messages)
-        response_len = len(result.model_dump_json())
-        log_usage(
-            call_type=call_type,
-            model=model,
-            prompt_len=prompt_len,
-            response_len=response_len,
-            latency=latency,
-        )
-    except Exception:
-        pass  # never break a call over logging
