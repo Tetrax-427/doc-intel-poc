@@ -879,14 +879,27 @@ DOCUMENT_CLASSIFIER_SYSTEM = (
 )
 
 TEMPLATE_MAP = {
-    "invoice": "invoice", "receipt": "invoice",
-    "resume": "cv_resume", "cv": "cv_resume", "curriculum vitae": "cv_resume",
-    "contract": "contract", "agreement": "contract", "nda": "contract",
-    "report": "report", "research paper": "report",
-    "financial statement": "financial", "balance sheet": "financial", "income statement": "financial",
-    "medical record": "medical", "prescription": "medical",
-    "legal document": "legal", "court filing": "legal",
-    "article": "general", "email": "general", "letter": "general", "general": "general",
+    "invoice":              "invoice",
+    "receipt":              "invoice",
+    "resume":               "cv_resume",
+    "cv":                   "cv_resume",
+    "curriculum vitae":     "cv_resume",
+    "contract":             "contract",
+    "agreement":            "contract",
+    "nda":                  "contract",
+    "report":               "report",
+    "research paper":       "report",
+    "financial statement":  "financial",
+    "balance sheet":        "financial",
+    "income statement":     "financial",
+    "medical record":       "medical",
+    "prescription":         "medical",
+    "legal document":       "legal",
+    "court filing":         "legal",
+    "article":              "general",
+    "email":                "general",
+    "letter":               "general",
+    "general":              "general",
 }
 
 
