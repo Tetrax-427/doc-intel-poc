@@ -1,4 +1,15 @@
-# backend/retrieval.py
+"""
+retrieval.py
+All retrieval, extraction, classification, and query functions.
+
+Changes in this phase (Security):
+  - sandbox_and_check() applied at 4 document-content call sites:
+      extract_fields(), generate_summary(), extract_tables(),
+      _classify_from_context()
+  - sanitize_llm_output() applied to query_document() and
+      query_document_stream() responses
+  - org_id/team_id threaded through to call_llm() where available
+"""
 
 import os
 import json
@@ -17,6 +28,7 @@ from prompts import (
 )
 from db import get_corrections_for_doc_type
 from llm.engine import call_llm, call_llm_stream
+from llm.sanitizer import sandbox_and_check, sanitize_llm_output
 from llm.structured import (
     DocumentClassification,
     QueryExpansion,
@@ -46,6 +58,7 @@ co = cohere.Client(os.getenv("COHERE_API_KEY"))
 _clf_logger = _get_logger("retrieval.classify")
 logger = _get_logger("retrieval")
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -74,7 +87,7 @@ def get_history_context(messages: list[dict], summary: str = "", window: int = 4
 
 
 # ---------------------------------------------------------------------------
-# Source formatting (B3)
+# Source formatting
 # ---------------------------------------------------------------------------
 
 def format_source(chunk: dict) -> dict:
@@ -115,7 +128,6 @@ def classify_question(
     has_document: bool = True,
     user_id: str = "system",
 ) -> str:
-    """Returns 'document' or 'general'."""
     if not has_document:
         return "general"
 
@@ -223,7 +235,7 @@ def expand_to_parent_context(chunks: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# D3 — Hybrid search
+# Hybrid search
 # ---------------------------------------------------------------------------
 
 def hybrid_search(
@@ -247,7 +259,6 @@ def hybrid_search(
         all_chunks = []
         for doc_id in document_ids:
             chunks = get_chunks_by_document(doc_id)
-            logger.debug("Loaded chunks for doc", doc_id=doc_id, count=len(chunks))
             all_chunks.extend(chunks)
     else:
         return []
@@ -268,8 +279,7 @@ def hybrid_search(
     dense_query_text   = dense_query_override if dense_query_override else expanded_question
     question_embedding = embed_model.get_text_embedding(dense_query_text)
 
-    texts = [c["content"] for c in searchable]
-
+    texts        = [c["content"] for c in searchable]
     dense_scores = []
     for chunk in searchable:
         raw_emb = chunk["embedding"]
@@ -333,34 +343,25 @@ def hybrid_search_with_mode(
     if mode == "hyde":
         passage = generate_hyde_passage(question, doc_type=doc_type, user_id=user_id)
         chunks  = hybrid_search(
-            question,
-            document_ids=document_ids,
-            candidate_pool=candidate_pool,
-            top_n=effective_top_n,
-            dense_query_override=passage,
-            user_id=user_id,
+            question, document_ids=document_ids,
+            candidate_pool=candidate_pool, top_n=effective_top_n,
+            dense_query_override=passage, user_id=user_id,
         )
-
     elif mode == "multiquery":
         queries = generate_query_variants(question, user_id=user_id)
         results_per_query = []
         for q in queries:
             results = hybrid_search(
-                q,
-                document_ids=document_ids,
-                candidate_pool=candidate_pool,
-                top_n=effective_top_n,
+                q, document_ids=document_ids,
+                candidate_pool=candidate_pool, top_n=effective_top_n,
                 user_id=user_id,
             )
             results_per_query.append(results)
         chunks = merge_and_dedupe(results_per_query, top_n=effective_top_n)
-
     else:
         chunks = hybrid_search(
-            question,
-            document_ids=document_ids,
-            candidate_pool=candidate_pool,
-            top_n=effective_top_n,
+            question, document_ids=document_ids,
+            candidate_pool=candidate_pool, top_n=effective_top_n,
             user_id=user_id,
         )
 
@@ -391,10 +392,7 @@ def answer_general(
 # History compression
 # ---------------------------------------------------------------------------
 
-def compress_history(
-    messages: list[dict],
-    user_id: str = "system",
-) -> str:
+def compress_history(messages: list[dict], user_id: str = "system") -> str:
     if not messages:
         return ""
     conversation = "\n".join([
@@ -464,48 +462,49 @@ def query_document(
     model: str = None,
     retrieval_mode: str = "standard",
     user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> dict:
     has_doc = bool(document_ids or document_id)
     q_type  = classify_question(question, has_document=has_doc, user_id=user_id)
 
     if q_type == "general":
         answer = answer_general(question, history, history_summary, user_id=user_id)
-        return {"answer": answer, "sources": [], "type": "general"}
+        return {"answer": sanitize_llm_output(answer), "sources": [], "type": "general"}
 
     ids      = document_ids if document_ids else ([document_id] if document_id else None)
     is_multi = ids and len(ids) > 1
     doc_type = _get_doc_type_hint(ids)
 
     chunks = hybrid_search_with_mode(
-        question,
-        document_ids=ids,
-        retrieval_mode=retrieval_mode,
-        doc_type=doc_type,
-        user_id=user_id,
+        question, document_ids=ids, retrieval_mode=retrieval_mode,
+        doc_type=doc_type, user_id=user_id,
     )
 
     if not chunks:
         answer = answer_general(question, history, history_summary, user_id=user_id)
-        return {"answer": answer, "sources": [], "type": "general"}
+        return {"answer": sanitize_llm_output(answer), "sources": [], "type": "general"}
 
     chunks_text  = "\n\n".join([
         f"[{c['chunk_num']}] (Doc: {c['file']}, Page {c['page']}): {c['content']}"
         for c in chunks
     ])
     history_text = format_history(history or [], history_summary)
-
-    system = QA_MULTI_SYSTEM if is_multi else QA_SYSTEM
-    user   = f"Document chunks:\n{chunks_text}\n\nConversation so far:\n{history_text}\n\nQuestion: {question}"
+    system       = QA_MULTI_SYSTEM if is_multi else QA_SYSTEM
+    user         = f"Document chunks:\n{chunks_text}\n\nConversation so far:\n{history_text}\n\nQuestion: {question}"
 
     override_kwargs = {"provider": provider, "model": model} if provider and model else {}
-    answer = call_llm(
+    raw_answer = call_llm(
         system=system,
         user=user,
         temperature=0.2,
         call_type="query",
         user_id=user_id,
+        org_id=org_id,
+        team_id=team_id,
         **override_kwargs,
     )
+    answer = sanitize_llm_output(raw_answer)
 
     return {
         "answer": answer,
@@ -539,12 +538,14 @@ def query_document_stream(
     model: str = None,
     retrieval_mode: str = "standard",
     user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> Generator:
     has_doc = bool(document_ids or document_id)
     q_type  = classify_question(question, has_document=has_doc, user_id=user_id)
 
     if q_type == "general":
-        yield answer_general(question, history, history_summary, user_id=user_id)
+        yield sanitize_llm_output(answer_general(question, history, history_summary, user_id=user_id))
         return
 
     ids      = document_ids if document_ids else ([document_id] if document_id else None)
@@ -552,15 +553,12 @@ def query_document_stream(
     doc_type = _get_doc_type_hint(ids)
 
     chunks = hybrid_search_with_mode(
-        question,
-        document_ids=ids,
-        retrieval_mode=retrieval_mode,
-        doc_type=doc_type,
-        user_id=user_id,
+        question, document_ids=ids, retrieval_mode=retrieval_mode,
+        doc_type=doc_type, user_id=user_id,
     )
 
     if not chunks:
-        yield answer_general(question, history, history_summary, user_id=user_id)
+        yield sanitize_llm_output(answer_general(question, history, history_summary, user_id=user_id))
         return
 
     chunks_text  = "\n\n".join([
@@ -568,17 +566,14 @@ def query_document_stream(
         for c in chunks
     ])
     history_text = format_history(history or [], history_summary)
-
-    system = QA_MULTI_SYSTEM if is_multi else QA_SYSTEM
-    user   = f"Document chunks:\n{chunks_text}\n\nConversation so far:\n{history_text}\n\nQuestion: {question}"
+    system       = QA_MULTI_SYSTEM if is_multi else QA_SYSTEM
+    user         = f"Document chunks:\n{chunks_text}\n\nConversation so far:\n{history_text}\n\nQuestion: {question}"
 
     override_kwargs = {"provider": provider, "model": model} if provider and model else {}
     stream_gen = call_llm(
-        system=system,
-        user=user,
-        call_type="query_stream",
-        stream=True,
-        user_id=user_id,
+        system=system, user=user,
+        call_type="query_stream", stream=True,
+        user_id=user_id, org_id=org_id, team_id=team_id,
         **override_kwargs,
     )
     for token in stream_gen:
@@ -610,14 +605,14 @@ def build_correction_examples(doc_type: str, fields: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# E2 — Bounding box lookup for extracted field values
+# Bounding box lookup
 # ---------------------------------------------------------------------------
 
 def find_field_bbox(field_value: str | None, document_id: str) -> dict | None:
     if not field_value or len(field_value.strip()) < 4:
         return None
 
-    chunks = get_chunks_by_document(document_id)
+    chunks      = get_chunks_by_document(document_id)
     value_lower = field_value.strip().lower()
 
     matching = [
@@ -638,7 +633,7 @@ def find_field_bbox(field_value: str | None, document_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Field extraction — E2 enriched with bbox
+# Field extraction — SANDBOXED at document content
 # ---------------------------------------------------------------------------
 
 def extract_fields(
@@ -646,11 +641,9 @@ def extract_fields(
     fields: dict[str, str],
     doc_type: str = "general",
     user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> dict:
-    """
-    Extract fields from a document using Instructor structured output.
-    Returns {extracted: {field: {value, bbox}}, validation, business_validation}.
-    """
     if doc_type == "general":
         try:
             from db import get_classification as _get_cls
@@ -681,10 +674,18 @@ def extract_fields(
     correction_examples = build_correction_examples(doc_type, fields)
     ExtractionResult    = build_extraction_model(fields)
 
+    # ── SANDBOX: wrap document content before passing to LLM ──
+    sandboxed_context = sandbox_and_check(
+        context,
+        user_id=user_id,
+        document_id=document_id,
+        label="extract_fields",
+    )
+
     user_content = (
         f"{correction_examples}"
         f"Fields to extract (name: description):\n{fields_with_desc}\n\n"
-        f"Document:\n{context}"
+        f"{sandboxed_context}"
     )
 
     try:
@@ -696,20 +697,20 @@ def extract_fields(
             response_model=ExtractionResult,
             user_id=user_id,
             document_id=document_id,
+            org_id=org_id,
+            team_id=team_id,
         )
         raw_extracted = {k: v for k, v in result_model.model_dump().items() if v is not None}
     except Exception as exc:
         return {"extracted": {"error": str(exc)}, "validation": None, "business_validation": {}}
 
-    # E2 — attach bbox per field
     extracted: dict[str, dict] = {}
     for field_name, value in raw_extracted.items():
         bbox = find_field_bbox(value, document_id)
         extracted[field_name] = {"value": value, "bbox": bbox}
 
     plain_values = {k: v["value"] for k, v in extracted.items()}
-
-    validation = validate_extraction(plain_values, fields)
+    validation   = validate_extraction(plain_values, fields)
 
     business_validation = {}
     try:
@@ -726,15 +727,28 @@ def extract_fields(
 
 
 # ---------------------------------------------------------------------------
-# Table extraction
+# Table extraction — SANDBOXED
 # ---------------------------------------------------------------------------
 
-def extract_tables(document_id: str, user_id: str = "system") -> list[dict]:
+def extract_tables(
+    document_id: str,
+    user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
+) -> list[dict]:
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return []
 
     context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
+
+    # ── SANDBOX ──
+    sandboxed_context = sandbox_and_check(
+        context,
+        user_id=user_id,
+        document_id=document_id,
+        label="extract_tables",
+    )
 
     try:
         result: TableList = call_llm(
@@ -744,12 +758,14 @@ def extract_tables(document_id: str, user_id: str = "system") -> list[dict]:
                 "rows (list of string value lists), chart_type ('bar', 'line', or 'pie'). "
                 "If no tables are found, return an empty tables list."
             ),
-            user=f"Document:\n{context}",
+            user=sandboxed_context,
             temperature=0.0,
             call_type="extract_tables",
             response_model=TableList,
             user_id=user_id,
             document_id=document_id,
+            org_id=org_id,
+            team_id=team_id,
         )
         return [table.model_dump() for table in result.tables]
     except Exception:
@@ -757,25 +773,40 @@ def extract_tables(document_id: str, user_id: str = "system") -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Summary generation
+# Summary generation — SANDBOXED
 # ---------------------------------------------------------------------------
 
-def generate_summary(document_id: str, user_id: str = "system") -> dict:
+def generate_summary(
+    document_id: str,
+    user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
+) -> dict:
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return {"summary": "", "summary_short": ""}
 
     context = "\n\n".join([c["content"] for c in doc_chunks[:15]])
 
+    # ── SANDBOX ──
+    sandboxed_context = sandbox_and_check(
+        context,
+        user_id=user_id,
+        document_id=document_id,
+        label="generate_summary",
+    )
+
     try:
         result: DocumentSummary = call_llm(
             system="Analyse the document the user provides and extract a structured summary.",
-            user=f"Document:\n{context}",
+            user=sandboxed_context,
             temperature=0.0,
             call_type="summarize",
             response_model=DocumentSummary,
             user_id=user_id,
             document_id=document_id,
+            org_id=org_id,
+            team_id=team_id,
         )
         parsed = result.model_dump()
         return {"summary": json.dumps(parsed), "summary_short": parsed.get("short", "")}
@@ -814,6 +845,8 @@ def extract_nl(
     document_id: str,
     instruction: str,
     user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> dict:
     schema = nl_to_schema(instruction, user_id=user_id)
     if "error" in schema:
@@ -823,7 +856,7 @@ def extract_nl(
             "schema": None, "extracted": None,
             "validation": None, "business_validation": {},
         }
-    result = extract_fields(document_id, schema, user_id=user_id)
+    result = extract_fields(document_id, schema, user_id=user_id, org_id=org_id, team_id=team_id)
     return {
         "instruction": instruction, "schema": schema,
         "extracted": result.get("extracted"),
@@ -833,7 +866,7 @@ def extract_nl(
 
 
 # ---------------------------------------------------------------------------
-# Document classification — E1 two-stage pipeline
+# Document classification
 # ---------------------------------------------------------------------------
 
 DOCUMENT_CLASSIFIER_SYSTEM = (
@@ -846,27 +879,14 @@ DOCUMENT_CLASSIFIER_SYSTEM = (
 )
 
 TEMPLATE_MAP = {
-    "invoice":              "invoice",
-    "receipt":              "invoice",
-    "resume":               "cv_resume",
-    "cv":                   "cv_resume",
-    "curriculum vitae":     "cv_resume",
-    "contract":             "contract",
-    "agreement":            "contract",
-    "nda":                  "contract",
-    "report":               "report",
-    "research paper":       "report",
-    "financial statement":  "financial",
-    "balance sheet":        "financial",
-    "income statement":     "financial",
-    "medical record":       "medical",
-    "prescription":         "medical",
-    "legal document":       "legal",
-    "court filing":         "legal",
-    "article":              "general",
-    "email":                "general",
-    "letter":               "general",
-    "general":              "general",
+    "invoice": "invoice", "receipt": "invoice",
+    "resume": "cv_resume", "cv": "cv_resume", "curriculum vitae": "cv_resume",
+    "contract": "contract", "agreement": "contract", "nda": "contract",
+    "report": "report", "research paper": "report",
+    "financial statement": "financial", "balance sheet": "financial", "income statement": "financial",
+    "medical record": "medical", "prescription": "medical",
+    "legal document": "legal", "court filing": "legal",
+    "article": "general", "email": "general", "letter": "general", "general": "general",
 }
 
 
@@ -878,10 +898,6 @@ def _get_confidence_threshold() -> float:
 
 
 def classify_document(document_id: str, user_id: str = "system") -> dict:
-    """
-    Classify a document using chunks already stored in the DB.
-    E1: routes through the two-stage pipeline.
-    """
     doc_chunks = get_chunks_by_document(document_id)
     if not doc_chunks:
         return {
@@ -889,7 +905,6 @@ def classify_document(document_id: str, user_id: str = "system") -> dict:
             "confidence": 0.0, "reasoning": "No document content found.",
             "key_signals": [], "requires_human_review": True,
         }
-
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
     return classify_document_from_text(context, document_id=document_id, user_id=user_id)
 
@@ -899,10 +914,6 @@ def classify_document_from_text(
     document_id: str = "",
     user_id: str = "system",
 ) -> dict:
-    """
-    E1: tries Stage 1 (keyword + embedding) first; falls back to LLM only
-    when Stage 1 confidence is below threshold.
-    """
     if not text or not text.strip():
         return {
             "doc_type": "general", "schema_template": "custom",
@@ -931,13 +942,20 @@ def _classify_from_context(
 ) -> dict:
     """
     LLM-only classification — called by pipeline.py Stage 2.
-    No longer uses the old in-memory classification cache (core/cache.py).
-    The new unified llm_cache handles caching automatically via call_llm().
+    SANDBOXED: document content is wrapped before passing to LLM.
     """
+    # ── SANDBOX ──
+    sandboxed_context = sandbox_and_check(
+        context,
+        user_id=user_id,
+        document_id=document_id if document_id else None,
+        label="classify_document",
+    )
+
     try:
         result: DocumentClassification = call_llm(
             system=DOCUMENT_CLASSIFIER_SYSTEM,
-            user=f"Document (first ~2000 characters):\n{context}",
+            user=sandboxed_context,
             temperature=0.0,
             call_type="classify_document",
             response_model=DocumentClassification,

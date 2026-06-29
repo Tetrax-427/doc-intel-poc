@@ -30,17 +30,9 @@ logger = get_logger("llm.engine")
 LLM_PROVIDER: str = app_config.llm_provider
 LLM_MODEL:    str = app_config.llm_model
 
-# Retry config per provider attempt
 MAX_RETRIES  = 3
-RETRY_DELAY  = 2   # seconds base; exponential backoff on rate limits
+RETRY_DELAY  = 2
 
-# ---------------------------------------------------------------------------
-# Feature flags — read from environment, default both on.
-# TODO: migrate these into core/config.py's Config dataclass + load_config()
-#       alongside the other env-var-driven settings so they appear in the
-#       single source of truth for config. For now they're here to avoid
-#       touching config.py in this PR.
-# ---------------------------------------------------------------------------
 import os as _os
 TRACING_ENABLED: bool = _os.getenv("LLM_TRACING_ENABLED", "true").lower() == "true"
 CACHE_ENABLED:   bool = _os.getenv("CACHE_ENABLED",        "true").lower() == "true"
@@ -59,69 +51,58 @@ def call_llm(
     json_mode: bool = False,
     call_type: str = "general",
     stream: bool = False,
-    # C3 — per-call override
+    # Per-call provider override
     provider: str = None,
     model: str = None,
-    # C1 — structured output
+    # Structured output
     response_model: type[BaseModel] = None,
-    # Tracing context (FINAL_PLAN.md Phase B) — all optional, default to
-    # safe values so callers that haven't been migrated to pass these yet
-    # don't break. Every production call site SHOULD pass user_id at minimum.
+    # Tracing context
     user_id: str = "system",
     document_id: str | None = None,
     session_id: str | None = None,
+    # Org/team context — used for usage aggregation in llm_calls table
+    # Optional: callers that don't have org context pass None (safe default)
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> str | dict | BaseModel | Generator:
     """
     Central LLM caller. All LLM calls in the app go through here.
 
     Args:
-        system:         Static instruction text for this call. Required —
-                        every call site must separate "what to do" (system)
-                        from "what to do it to" (user). See FINAL_PLAN.md §2
-                        for the split used at each existing call site.
-        user:           Per-call content.
+        system:         Static instruction text. Required.
+        user:           Per-call content (untrusted document content goes here,
+                        sandboxed by llm/sanitizer.py before being passed in).
         temperature:    0.0 for deterministic, higher for creative.
         max_tokens:     Max response tokens.
-        json_mode:      If True and response_model is None, parses response
-                        as JSON dict (legacy path — prefer response_model).
+        json_mode:      If True and response_model is None, parses response as JSON.
         call_type:      Label for tracing — becomes llm_calls.call_type.
-        stream:         If True, returns a token generator (no fallback,
-                        no structured output, no caching — streaming is
-                        best-effort and excluded from Layer 2 by design).
-        provider:       Override provider for this call only (C3).
-                        When set, model must also be set.
-        model:          Override model for this call only (C3).
-        response_model: Pydantic BaseModel subclass (C1). When set,
-                        routes through Instructor and returns a validated
-                        model instance. Overrides json_mode.
-        user_id:        Owning user — required for correct tracing/cache
-                        scoping. Defaults to "system" for any not-yet-migrated
-                        internal caller; production call sites should always
-                        pass the real authenticated user_id.
-        document_id:    Document this call relates to, if any. Used for
-                        cache invalidation on document delete (Phase F).
+        stream:         If True, returns a token generator.
+        provider:       Override provider for this call only.
+        model:          Override model for this call only.
+        response_model: Pydantic BaseModel for structured output.
+        user_id:        Owning user — required for correct tracing/cache scoping.
+        document_id:    Document this call relates to, if any.
         session_id:     Reserved for future chat-session grouping.
+        org_id:         Org context for usage aggregation. Optional.
+        team_id:        Team context for usage aggregation. Optional.
 
     Returns:
         - Generator of str tokens  when stream=True
         - BaseModel instance       when response_model is set
         - dict                     when json_mode=True
         - str                      otherwise
-
-    Raises:
-        LLMProviderOverrideError:  override provider/model failed (no fallback).
-        LLMFallbackExhaustedError: all chain providers failed.
     """
 
-    # --- Streaming: single-provider best-effort (no fallback, no structured) ---
+    # --- Streaming ---
     if stream:
         return _call_stream(
             system, user, temperature=temperature, call_type=call_type,
             provider=provider, model=model,
             user_id=user_id, document_id=document_id, session_id=session_id,
+            org_id=org_id, team_id=team_id,
         )
 
-    # --- Build chain: override (1 entry) or full fallback chain ---
+    # --- Build chain ---
     if provider or model:
         if not (provider and model):
             raise LLMProviderOverrideError(
@@ -139,8 +120,8 @@ def call_llm(
 
     # --- Walk chain ---
     providers_tried: list[tuple[str, str]] = []
-    cacheable = CACHE_ENABLED and llm_cache.is_cacheable(call_type)
-    primary_provider = None  # set on first iteration, used to compute used_fallback
+    cacheable        = CACHE_ENABLED and llm_cache.is_cacheable(call_type)
+    primary_provider = None
 
     for (prov, mdl) in chain:
         if primary_provider is None:
@@ -148,7 +129,7 @@ def call_llm(
         providers_tried.append((prov, mdl))
         used_fallback = (prov != primary_provider)
 
-        # --- Layer 2 cache lookup ---
+        # --- Cache lookup ---
         if cacheable:
             cache_row = llm_cache.lookup(user_id, prov, mdl, system, user)
             if cache_row is not None:
@@ -178,12 +159,9 @@ def call_llm(
             ) if TRACING_ENABLED else _noop_trace()
             with _trace as t:
                 result, usage = _call_single_provider(
-                    provider=prov,
-                    model=mdl,
-                    system=system,
-                    user=user,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                    provider=prov, model=mdl,
+                    system=system, user=user,
+                    temperature=temperature, max_tokens=max_tokens,
                     call_type=call_type,
                     response_model=response_model,
                     json_mode=json_mode,
@@ -192,6 +170,7 @@ def call_llm(
                 if TRACING_ENABLED:
                     t.set_result(response_text=response_text, usage=usage)
 
+            # --- Store in cache ---
             if cacheable:
                 cost = None
                 try:
@@ -212,14 +191,11 @@ def call_llm(
         except Exception as exc:
             logger.warning(
                 "Provider failed — trying next in chain",
-                provider=prov,
-                model=mdl,
-                error=str(exc),
+                provider=prov, model=mdl, error=str(exc),
                 is_override=is_override,
             )
             if is_override:
                 raise LLMProviderOverrideError(prov, mdl, reason=str(exc)) from exc
-            # else: continue to next provider
 
     raise LLMFallbackExhaustedError(providers_tried)
 
@@ -232,16 +208,19 @@ def call_llm_stream(
     user_id: str = "system",
     document_id: str | None = None,
     session_id: str | None = None,
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> Generator:
     """Convenience wrapper for streaming calls."""
     return call_llm(
         system, user, temperature=temperature, call_type=call_type, stream=True,
         user_id=user_id, document_id=document_id, session_id=session_id,
+        org_id=org_id, team_id=team_id,
     )
 
 
 # ---------------------------------------------------------------------------
-# Single-provider call (one entry in the chain)
+# Single-provider call
 # ---------------------------------------------------------------------------
 
 def _call_single_provider(
@@ -256,34 +235,22 @@ def _call_single_provider(
     response_model: type[BaseModel] | None,
     json_mode: bool,
 ) -> tuple[str | dict | BaseModel, dict | None]:
-    """
-    Attempt one provider with up to MAX_RETRIES on rate-limit errors.
-
-    Returns (result, usage) on success. usage is a dict with prompt_tokens/
-    completion_tokens/total_tokens, or None if the provider/SDK didn't expose
-    it. Raises on non-retryable errors or after retries exhausted.
-    """
     client = build_client(provider)
 
     for attempt in range(MAX_RETRIES):
         try:
-            # --- C1: Instructor structured output ---
             if response_model is not None:
                 from llm.structured import call_structured
                 result, usage = call_structured(
                     raw_client=client,
-                    provider=provider,
-                    model=model,
-                    system=system,
-                    user=user,
+                    provider=provider, model=model,
+                    system=system, user=user,
                     response_model=response_model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                    temperature=temperature, max_tokens=max_tokens,
                     call_type=call_type,
                 )
                 return result, usage
 
-            # --- Standard text call ---
             if provider == "anthropic":
                 raw, usage = _call_anthropic(client, model, system, user, temperature, max_tokens)
             else:
@@ -294,10 +261,10 @@ def _call_single_provider(
             return raw, usage
 
         except Exception as exc:
-            error_str = str(exc).lower()
-            is_rate_limit = "rate limit" in error_str or "429" in error_str
+            error_str   = str(exc).lower()
+            is_rate_lim = "rate limit" in error_str or "429" in error_str
 
-            if is_rate_limit and attempt < MAX_RETRIES - 1:
+            if is_rate_lim and attempt < MAX_RETRIES - 1:
                 wait = RETRY_DELAY * (2 ** attempt)
                 logger.warning(
                     "Rate limited — backing off",
@@ -307,7 +274,6 @@ def _call_single_provider(
                 time.sleep(wait)
                 continue
 
-            # Non-retryable or last attempt — propagate to fallback loop
             logger.error(
                 "Provider call failed",
                 provider=provider, model=model,
@@ -315,58 +281,34 @@ def _call_single_provider(
             )
             raise LLMError(str(exc), provider=provider, model=model) from exc
 
-    # Should never reach here — loop always raises on last attempt
     raise LLMError("Retry loop exited without result", provider=provider, model=model)
 
 
 # ---------------------------------------------------------------------------
-# Provider-specific raw callers — each returns (text, usage_dict_or_None)
+# Provider-specific raw callers
 # ---------------------------------------------------------------------------
 
-def _call_openai_compatible(
-    client: Groq | OpenAI,
-    model: str,
-    system: str,
-    user: str,
-    temperature: float,
-    max_tokens: int,
-) -> tuple[str, dict | None]:
+def _call_openai_compatible(client, model, system, user, temperature, max_tokens):
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ],
         temperature=temperature,
         max_tokens=max_tokens,
         stream=False,
     )
-    text = response.choices[0].message.content
+    text  = response.choices[0].message.content
     usage = _usage_from_openai_compatible_response(response)
     return text, usage
 
 
-def _call_anthropic(
-    client: anthropic.Anthropic,
-    model: str,
-    system: str,
-    user: str,
-    temperature: float,
-    max_tokens: int,
-) -> tuple[str, dict | None]:
-    """
-    Call Anthropic messages API with Layer 1 cache_control on the system block.
-    cache_control: {"type": "ephemeral"} tells Anthropic to cache the system
-    prompt server-side for ~5 minutes. On repeated calls with the same system
-    text (same call type = same instruction), Anthropic applies a ~50% token
-    discount on the cached portion automatically.
-    Only applied when CACHE_ENABLED=True — when caching is disabled entirely,
-    we send a plain system string instead (no cache markers).
-    """
+def _call_anthropic(client, model, system, user, temperature, max_tokens):
     if CACHE_ENABLED:
         system_block = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
     else:
-        system_block = system  # plain string — Anthropic accepts both forms
+        system_block = system
 
     kwargs: dict[str, Any] = {
         "model":       model,
@@ -376,52 +318,49 @@ def _call_anthropic(
         "messages":    [{"role": "user", "content": user}],
     }
     response = client.messages.create(**kwargs)
-    text = response.content[0].text
-    usage = _usage_from_anthropic_response(response)
+    text     = response.content[0].text
+    usage    = _usage_from_anthropic_response(response)
     return text, usage
 
 
 def _usage_from_openai_compatible_response(response) -> dict | None:
-    """Extract usage from an OpenAI/Groq chat.completions response. Defensive."""
     try:
         usage = getattr(response, "usage", None)
         if usage is None:
             return None
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        if prompt_tokens is None or completion_tokens is None:
+        pt = getattr(usage, "prompt_tokens", None)
+        ct = getattr(usage, "completion_tokens", None)
+        tt = getattr(usage, "total_tokens", None)
+        if pt is None or ct is None:
             return None
         return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens if total_tokens is not None else prompt_tokens + completion_tokens,
+            "prompt_tokens":     pt,
+            "completion_tokens": ct,
+            "total_tokens":      tt if tt is not None else pt + ct,
         }
     except Exception:
         return None
 
 
 def _usage_from_anthropic_response(response) -> dict | None:
-    """Extract usage from an Anthropic messages.create response. Defensive."""
     try:
         usage = getattr(response, "usage", None)
         if usage is None:
             return None
-        input_tokens = getattr(usage, "input_tokens", None)
-        output_tokens = getattr(usage, "output_tokens", None)
-        if input_tokens is None or output_tokens is None:
+        it = getattr(usage, "input_tokens",  None)
+        ot = getattr(usage, "output_tokens", None)
+        if it is None or ot is None:
             return None
         return {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
+            "prompt_tokens":     it,
+            "completion_tokens": ot,
+            "total_tokens":      it + ot,
         }
     except Exception:
         return None
 
 
 def _stringify_result(result: str | dict | BaseModel) -> str:
-    """Normalize a call result to a string for trace/cache storage. Defensive."""
     try:
         if isinstance(result, BaseModel):
             return result.model_dump_json()
@@ -438,25 +377,6 @@ def _reconstruct_result(
     response_model: type[BaseModel] | None,
     json_mode: bool,
 ) -> str | dict | BaseModel:
-    """
-    Reverse _stringify_result() for a cache hit. A cached response_text is
-    always a plain string (that's what's stored), but the ORIGINAL call may
-    have returned a BaseModel or dict — callers expect that same shape back,
-    not a raw string, or every cache hit on a structured call would silently
-    break downstream code expecting e.g. result.doc_type.
-
-    Raises StructuredOutputError-shaped behavior is intentionally avoided
-    here: if cached JSON no longer validates against response_model (e.g.
-    the model's schema changed since this entry was cached), we log and fall
-    back to returning the raw dict rather than raising — a cache-hit code
-    path failing validation should degrade, not crash, since the safe
-    recovery (skip the cache, call live) is exactly one cache-miss away on
-    the caller's next attempt if they retry. For now this returns the raw
-    parsed dict; calling code that strictly requires a model instance should
-    treat this as a known edge case — see FINAL_PLAN.md open items re:
-    schema-version staleness (the PROMPT_VERSION discussion, deliberately
-    deferred).
-    """
     if response_model is not None:
         import json
         try:
@@ -480,7 +400,7 @@ def _reconstruct_result(
 
 
 # ---------------------------------------------------------------------------
-# Streaming (best-effort, first available provider)
+# Streaming
 # ---------------------------------------------------------------------------
 
 def _call_stream(
@@ -494,21 +414,9 @@ def _call_stream(
     user_id: str = "system",
     document_id: str | None = None,
     session_id: str | None = None,
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> Generator:
-    """
-    Return a token generator using the first available provider.
-    Falls back through the chain to find one that works, then streams.
-    No structured output support in stream mode. No caching (Layer 2 never
-    applies to streaming calls — see FINAL_PLAN.md §0).
-
-    Tracing note: streaming responses don't expose usage in a way that's
-    available before the generator is exhausted by the caller, and we don't
-    want to hold a trace open across an arbitrarily long consumer-paced
-    stream. So streaming calls are traced with usage=None and a response_text
-    of "<streamed>" — latency reflects time-to-first-token-stream-start, not
-    total stream duration. This matches both original plan docs' treatment
-    of streaming and is a deliberate, documented limitation, not an oversight.
-    """
     if provider and model:
         chain = build_override_chain(provider, model)
     else:
@@ -547,7 +455,7 @@ def _stream_openai_compatible(client, model, system, user, temperature) -> Gener
         model=model,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ],
         temperature=temperature,
         max_tokens=1000,
@@ -563,13 +471,12 @@ def _stream_openai_compatible(client, model, system, user, temperature) -> Gener
 
 def _stream_anthropic(client, model, system, user, temperature) -> Generator:
     kwargs: dict[str, Any] = {
-        "model": model,
-        "max_tokens": 1000,
+        "model":       model,
+        "max_tokens":  1000,
         "temperature": temperature,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
+        "system":      system,
+        "messages":    [{"role": "user", "content": user}],
     }
-
     def generator():
         with client.messages.stream(**kwargs) as s:
             for text in s.text_stream:
@@ -587,18 +494,12 @@ def call_vision_llm(
     call_type: str = "vision",
     user_id: str = "system",
     document_id: str | None = None,
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> str:
     """
     Call vision LLM to describe an image.
     Returns empty string if no vision model configured.
-    Uses VISION_PROVIDER / VISION_MODEL from config (not the fallback chain —
-    single-provider, no fallback, by design, matching pre-existing behavior).
-
-    Traced separately from call_llm()'s chain loop (it isn't text-shaped and
-    has no fallback chain) — see FINAL_PLAN.md §0. Cached separately too,
-    via llm.cache.lookup_vision/store_vision — same llm_cache table, but the
-    key hashes image bytes + prompt instead of system+user text (there's no
-    meaningful system/user split for an image call).
     """
     vision_provider = app_config.vision_provider
     vision_model    = app_config.vision_model
@@ -619,13 +520,12 @@ def call_vision_llm(
         }
         mime_type = mime_map.get(ext, "image/jpeg")
 
-        # --- Layer 2 cache lookup for vision ---
         if CACHE_ENABLED:
             cache_row = llm_cache.lookup_vision(user_id, vision_provider, vision_model, image_data, prompt)
             if cache_row is not None:
                 _trace = tracer.trace(
                     call_type=call_type, provider=vision_provider, model=vision_model,
-                    system="<vision call — see user field for prompt>", user=prompt,
+                    system="<vision>", user=prompt,
                     user_id=user_id, document_id=document_id,
                     is_override=False, is_stream=False,
                 ) if TRACING_ENABLED else _noop_trace()
@@ -636,51 +536,42 @@ def call_vision_llm(
 
         _trace = tracer.trace(
             call_type=call_type, provider=vision_provider, model=vision_model,
-            system="<vision call — see user field for prompt>", user=prompt,
+            system="<vision>", user=prompt,
             user_id=user_id, document_id=document_id,
             is_override=False, is_stream=False,
         ) if TRACING_ENABLED else _noop_trace()
         with _trace as t:
             if vision_provider == "openai":
-                client = OpenAI(api_key=app_config.openai_api_key)
+                client   = OpenAI(api_key=app_config.openai_api_key)
                 response = client.chat.completions.create(
                     model=vision_model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:{mime_type};base64,{image_data}"
-                            }},
-                        ],
-                    }],
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{mime_type};base64,{image_data}"
+                        }},
+                    ]}],
                     max_tokens=500,
                 )
                 description = response.choices[0].message.content
-                usage = _usage_from_openai_compatible_response(response)
+                usage       = _usage_from_openai_compatible_response(response)
 
             elif vision_provider == "anthropic":
-                client = anthropic.Anthropic(api_key=app_config.anthropic_api_key)
+                client   = anthropic.Anthropic(api_key=app_config.anthropic_api_key)
                 response = client.messages.create(
                     model=vision_model,
                     max_tokens=500,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": mime_type,
-                                    "data": image_data,
-                                },
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
-                    }],
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": image_data,
+                        }},
+                        {"type": "text", "text": prompt},
+                    ]}],
                 )
                 description = response.content[0].text
-                usage = _usage_from_anthropic_response(response)
+                usage       = _usage_from_anthropic_response(response)
 
             else:
                 logger.warning("Vision provider not supported", provider=vision_provider)
@@ -716,7 +607,6 @@ def call_vision_llm(
 # ---------------------------------------------------------------------------
 
 def _parse_json(text: str) -> dict:
-    """Clean and parse JSON from LLM response. Legacy path for json_mode=True."""
     import json
     text = text.strip()
     if text.startswith("```"):
@@ -730,7 +620,6 @@ def _parse_json(text: str) -> dict:
 
 
 class _NoopTraceHandle:
-    """Dropped-in replacement for _TraceHandle when TRACING_ENABLED=false."""
     def set_result(self, *a, **kw): pass
     def set_error(self, *a, **kw): pass
     def set_cache_hit(self, *a, **kw): pass
@@ -742,5 +631,4 @@ class _NoopTraceContext:
 
 
 def _noop_trace() -> _NoopTraceContext:
-    """Return a no-op context manager used when TRACING_ENABLED=False."""
     return _NoopTraceContext()
