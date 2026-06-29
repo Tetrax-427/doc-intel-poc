@@ -1,14 +1,16 @@
 """
+api_keys.py
 API key management for DocIntel.
 
-F2: Keys now have a 'status' column: 'active' | 'rotating' | 'deleted'.
-    - rotate_api_key(): new key created, old marked status='rotating' with
-      grace_expires_at set; stays valid during grace period.
-    - validate_api_key(): accepts 'active' keys and 'rotating' keys within
-      grace period.
-    - revoke_api_key(): sets status='deleted', clears grace_expires_at.
+Changes in this phase:
+  - create_api_key() accepts scope ('personal' | 'org') and org_id
+  - org-scoped keys stored with org_id + scope='org' columns
+  - validate_api_key() unchanged — scope is metadata only, not enforced differently
 
-DB helpers delegated to db_apikeys.py.
+F2 (unchanged):
+  - Keys have status: 'active' | 'rotating' | 'deleted'
+  - rotate_api_key(): new key created, old marked rotating with grace period
+  - validate_api_key(): accepts active + rotating-within-grace-period keys
 """
 
 import hashlib
@@ -25,45 +27,73 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 def generate_api_key() -> tuple[str, str, str]:
-    """Generate API key — returns (full_key, prefix, hash)"""
+    """Generate API key — returns (full_key, prefix, hash)."""
     key      = f"dik_{secrets.token_urlsafe(32)}"
     prefix   = key[:10]
     key_hash = hashlib.sha256(key.encode()).hexdigest()
     return key, prefix, key_hash
 
 
-def create_api_key(name: str, rate_limit: int = 100) -> dict:
-    """Create and store a new API key (status='active')."""
+def create_api_key(
+    name: str,
+    rate_limit: int = 100,
+    scope: str = "personal",
+    org_id: str | None = None,
+) -> dict:
+    """
+    Create and store a new API key.
+
+    Args:
+        name:       Human-readable name for the key.
+        rate_limit: Max calls per day.
+        scope:      'personal' (default) or 'org'.
+        org_id:     Required when scope='org'. Links key to an org.
+
+    Returns key details including the full key (shown once only).
+    """
+    if scope not in ("personal", "org"):
+        scope = "personal"
+
+    if scope == "org" and not org_id:
+        raise ValueError("org_id is required when scope='org'")
+
     key, prefix, key_hash = generate_api_key()
 
-    supabase.table("api_keys").insert({
+    row: dict = {
         "name":       name,
         "key_hash":   key_hash,
         "key_prefix": prefix,
         "rate_limit": rate_limit,
         "status":     "active",
-    }).execute()
+        "scope":      scope,
+    }
+    if org_id:
+        row["org_id"] = org_id
+
+    supabase.table("api_keys").insert(row).execute()
 
     return {
-        "key":        key,   # returned once only
+        "key":        key,
         "prefix":     prefix,
         "name":       name,
         "rate_limit": rate_limit,
+        "scope":      scope,
+        "org_id":     org_id,
         "message":    "Store this key safely — it will not be shown again.",
     }
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Validation — unchanged
 # ---------------------------------------------------------------------------
 
 def validate_api_key(key: str) -> tuple[bool, str]:
     """
     Validate an API key — returns (is_valid, reason).
 
-    A key is valid if:
+    Valid if:
       - status = 'active', OR
-      - status = 'rotating' AND grace_expires_at > now (still in grace period)
+      - status = 'rotating' AND grace_expires_at > now
     """
     try:
         key_hash = hashlib.sha256(key.encode()).hexdigest()
@@ -83,7 +113,6 @@ def validate_api_key(key: str) -> tuple[bool, str]:
         now    = datetime.now(timezone.utc)
 
         if status == "active":
-            # Reset daily counter if needed
             today = date.today().isoformat()
             if record.get("last_reset") != today:
                 supabase.table("api_keys").update({
@@ -108,13 +137,11 @@ def validate_api_key(key: str) -> tuple[bool, str]:
                         grace_expires_at.replace("Z", "+00:00")
                     )
                     if now < expiry:
-                        # Valid during grace period — don't rate-limit rotating keys
                         return True, "valid_rotating"
                 except Exception:
                     pass
             return False, "API key rotation grace period expired"
 
-        # status = 'deleted' or unknown
         return False, "Invalid or inactive API key"
 
     except Exception as e:
@@ -123,21 +150,14 @@ def validate_api_key(key: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Rotation  (F2)
+# Rotation (F2) — unchanged
 # ---------------------------------------------------------------------------
 
 def rotate_api_key(key_id: str) -> dict:
     """
     Rotate an API key.
-
-    1. Fetch existing key via db_apikeys.get_api_key_by_id().
-    2. Create a new key (status='active').
-    3. Mark old key status='rotating' + grace_expires_at via
-       db_apikeys.mark_api_key_rotating().
-    4. Record rotated_to pointer on old key.
-
-    Returns new key details (full key shown once only).
-    Raises ValueError if key_id not found.
+    New key created (active), old key marked rotating with grace period.
+    Raises ValueError if key not found.
     """
     from db_apikeys import get_api_key_by_id, mark_api_key_rotating
     from core.config import config as app_config
@@ -154,7 +174,6 @@ def rotate_api_key(key_id: str) -> dict:
         datetime.now(timezone.utc) + timedelta(seconds=grace_secs)
     ).isoformat()
 
-    # Create new key
     new_key, new_prefix, new_hash = generate_api_key()
     new_result = supabase.table("api_keys").insert({
         "name":       old_record["name"] + " (rotated)",
@@ -162,25 +181,25 @@ def rotate_api_key(key_id: str) -> dict:
         "key_prefix": new_prefix,
         "rate_limit": old_record.get("rate_limit", 100),
         "status":     "active",
+        "scope":      old_record.get("scope", "personal"),
+        "org_id":     old_record.get("org_id"),
     }).execute()
     new_id = new_result.data[0]["id"] if new_result.data else None
 
-    # Mark old key as rotating
     mark_api_key_rotating(key_id, grace_expires_at=grace_expiry)
 
-    # Record forward pointer
     if new_id:
         supabase.table("api_keys").update({
             "rotated_to": new_id,
         }).eq("id", key_id).execute()
 
     return {
-        "new_key":              new_key,
-        "new_prefix":           new_prefix,
-        "new_key_id":           new_id,
-        "old_key_id":           key_id,
-        "old_key_prefix":       old_record.get("key_prefix", ""),
-        "grace_period_seconds": grace_secs,
+        "new_key":                 new_key,
+        "new_prefix":              new_prefix,
+        "new_key_id":              new_id,
+        "old_key_id":              key_id,
+        "old_key_prefix":          old_record.get("key_prefix", ""),
+        "grace_period_seconds":    grace_secs,
         "grace_period_expires_at": grace_expiry,
         "message": (
             f"Old key remains valid for {grace_secs // 3600} hour(s). "
@@ -190,15 +209,14 @@ def rotate_api_key(key_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# List / revoke
+# List / revoke — unchanged
 # ---------------------------------------------------------------------------
 
 def list_api_keys() -> list[dict]:
-    """List all API keys (without hashes)."""
     result = (
         supabase.table("api_keys")
         .select(
-            "id, name, key_prefix, status, rate_limit, "
+            "id, name, key_prefix, status, scope, org_id, rate_limit, "
             "calls_today, created_at, grace_expires_at, rotated_to"
         )
         .order("created_at", desc=True)
@@ -208,11 +226,8 @@ def list_api_keys() -> list[dict]:
 
 
 def revoke_api_key(key_id: str) -> None:
-    """
-    Hard-revoke a key — instantly invalid, no grace period.
-    Sets status='deleted' and clears grace_expires_at.
-    """
+    """Hard-revoke a key — instantly invalid, no grace period."""
     supabase.table("api_keys").update({
-        "status":         "deleted",
+        "status":           "deleted",
         "grace_expires_at": None,
     }).eq("id", key_id).execute()

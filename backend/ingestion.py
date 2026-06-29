@@ -1,3 +1,16 @@
+"""
+ingestion.py
+File ingestion pipeline for DocIntel.
+
+Changes in this phase (Security + Org/Team):
+  - ingest_file() accepts org_id, team_id kwargs
+  - org_id/team_id passed to insert_document()
+  - Temp file cleanup moved to router (finally block) — ingestion
+    no longer manages its own temp files; it receives an already-saved
+    path and focuses on processing only
+  - ingest_url() passes org_id/team_id to insert_document()
+"""
+
 import os
 import threading
 
@@ -57,7 +70,7 @@ _router = AutoRouter(config)
 
 
 # ---------------------------------------------------------------------------
-# Embedding helper — cache-aware
+# Embedding helper
 # ---------------------------------------------------------------------------
 
 def _get_embedding(text: str, model) -> list[float]:
@@ -146,7 +159,23 @@ def ingest_file(
     use_llamaparse: bool = True,
     doc_type: str = "general",
     user_id: str = "anonymous",
+    org_id: str | None = None,
+    team_id: str | None = None,
 ) -> dict:
+    """
+    Ingest a file into DocIntel.
+
+    Args:
+        file_path:      Path to the file on disk (already saved by the router).
+                        Caller (router) is responsible for cleanup via finally block.
+        use_llamaparse: Whether to use LlamaParse for PDF parsing.
+        doc_type:       Hint for document type (overridden by classification).
+        user_id:        Owning user.
+        org_id:         Org context — stored on document row for visibility.
+        team_id:        Team context — stored on document row for visibility.
+
+    Returns dict with document_id, chunk counts, and classification result.
+    """
     file_name = os.path.basename(file_path)
     ext       = os.path.splitext(file_path)[1].lower()
     model     = get_embed_model()
@@ -155,10 +184,16 @@ def ingest_file(
         logger.error("Unsupported file type", file=file_name, ext=ext)
         return {"error": f"Unsupported file type: {ext}"}
 
-    # --- Insert document row first so we have doc_id for lineage ---
-    doc_id = insert_document(file_name, user_id=user_id)
+    # Insert document row with org/team context
+    doc_id = insert_document(
+        file_name,
+        user_id=user_id,
+        org_id=org_id,
+        team_id=team_id,
+        visibility="private",  # default; router can update via PATCH /visibility
+    )
 
-    # F1 — log upload received
+    # Log upload received
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
     log_uploaded(
         doc_id,
@@ -168,7 +203,7 @@ def ingest_file(
         content_type=ext,
     )
 
-    # --- Parse (timed) ---
+    # Parse
     try:
         logger.info("Routing file to parser", file=file_name, doc_type=doc_type)
         with timed_event(
@@ -185,7 +220,6 @@ def ingest_file(
             tables=len(document.tables),
             is_scanned=document.is_scanned,
         )
-        # F1 — log parse details (page count, parser used)
         log_parsed(
             doc_id,
             user_id=user_id,
@@ -205,9 +239,7 @@ def ingest_file(
         if ext not in _IMAGE_EXTENSIONS:
             return {"error": "Could not extract text. File may be empty or image-only."}
 
-    # ----------------------------------------------------------------
-    # Classify from raw text BEFORE chunking (timed)
-    # ----------------------------------------------------------------
+    # Classify from raw text
     detected_doc_type     = doc_type
     classification_result = None
 
@@ -220,7 +252,7 @@ def ingest_file(
             event_data={"file_name": file_name},
         ):
             classification_result = classify_document_from_text(
-                raw_text_sample, document_id=doc_id
+                raw_text_sample, document_id=doc_id, user_id=user_id,
             )
 
         detected = classification_result.get("doc_type", "general")
@@ -228,18 +260,15 @@ def ingest_file(
             detected_doc_type = detected
             logger.info(
                 "Pre-ingestion classification complete",
-                file=file_name,
-                doc_type=detected_doc_type,
+                file=file_name, doc_type=detected_doc_type,
                 confidence=classification_result.get("confidence", 0.0),
             )
         else:
             logger.info(
                 "Pre-ingestion classification returned general — keeping caller hint",
-                file=file_name,
-                hint=doc_type,
+                file=file_name, hint=doc_type,
             )
 
-        # F1 — log classification details
         log_classified(
             doc_id,
             user_id=user_id,
@@ -251,21 +280,18 @@ def ingest_file(
     except Exception as exc:
         logger.warning(
             "Pre-ingestion classification failed — using caller hint",
-            file=file_name,
-            error=str(exc),
-            fallback_doc_type=doc_type,
+            file=file_name, error=str(exc), fallback_doc_type=doc_type,
         )
 
     use_hierarchical = uses_hierarchical_chunking(detected_doc_type)
     logger.info(
         "Chunking mode selected",
-        file=file_name,
-        doc_type=detected_doc_type,
+        file=file_name, doc_type=detected_doc_type,
         mode="hierarchical" if use_hierarchical else "flat",
     )
 
-    is_scanned  = document.is_scanned
-    chunk_rows  = []
+    is_scanned = document.is_scanned
+    chunk_rows = []
     vision_used = False
 
     def _embed(text: str) -> list[float]:
@@ -273,7 +299,7 @@ def ingest_file(
 
     for page in document.pages:
 
-        # 1. Text chunks
+        # Text chunks
         if use_hierarchical:
             hier_rows = build_hierarchical_chunks(
                 page_text=page.text,
@@ -301,7 +327,7 @@ def ingest_file(
                     ),
                 })
 
-        # 2. Table chunks
+        # Table chunks
         for table in page.tables:
             if not table.raw_text.strip():
                 continue
@@ -317,7 +343,7 @@ def ingest_file(
                 ),
             })
 
-        # 3. Vision description chunks
+        # Vision description chunks
         images_with_descriptions = _run_vision_for_page(
             file_path, page, detected_doc_type, is_scanned
         )
@@ -349,7 +375,6 @@ def ingest_file(
 
     insert_chunks(chunk_rows)
 
-    # F1 — log chunks stored
     log_chunked(
         doc_id,
         user_id=user_id,
@@ -366,15 +391,10 @@ def ingest_file(
 
     logger.info(
         "Ingestion complete",
-        file=file_name,
-        doc_id=doc_id,
-        chunks=len(chunk_rows),
-        text_chunks=text_chunks,
-        table_chunks=table_chunks,
-        desc_chunks=desc_chunks,
-        parent_chunks=parent_chunks,
-        parser=document.parser_used,
-        vision_used=vision_used,
+        file=file_name, doc_id=doc_id, chunks=len(chunk_rows),
+        text_chunks=text_chunks, table_chunks=table_chunks,
+        desc_chunks=desc_chunks, parent_chunks=parent_chunks,
+        parser=document.parser_used, vision_used=vision_used,
         doc_type=detected_doc_type,
         chunking_mode="hierarchical" if use_hierarchical else "flat",
     )
@@ -398,10 +418,15 @@ def ingest_file(
 
 
 # ---------------------------------------------------------------------------
-# URL ingestion — flat chunking only
+# URL ingestion
 # ---------------------------------------------------------------------------
 
-def ingest_url(url: str, user_id: str = "anonymous") -> dict:
+def ingest_url(
+    url: str,
+    user_id: str = "anonymous",
+    org_id: str | None = None,
+    team_id: str | None = None,
+) -> dict:
     model = get_embed_model()
     logger.info("Starting URL ingestion", url=url)
 
@@ -415,7 +440,13 @@ def ingest_url(url: str, user_id: str = "anonymous") -> dict:
     if not document.full_text.strip():
         return {"error": "Could not extract text from this URL."}
 
-    doc_id     = insert_document(document.file_name, user_id=user_id)
+    doc_id = insert_document(
+        document.file_name,
+        user_id=user_id,
+        org_id=org_id,
+        team_id=team_id,
+        visibility="private",
+    )
     chunk_rows = []
 
     log_uploaded(
@@ -451,7 +482,6 @@ def ingest_url(url: str, user_id: str = "anonymous") -> dict:
         return {"error": "No content could be extracted from this URL."}
 
     insert_chunks(chunk_rows)
-
     log_chunked(doc_id, user_id=user_id, chunk_count=len(chunk_rows), chunk_mode="flat")
 
     logger.info("URL ingestion complete", url=url, doc_id=doc_id, chunks=len(chunk_rows))
