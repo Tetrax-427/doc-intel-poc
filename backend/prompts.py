@@ -123,6 +123,34 @@ EXTRACTION_SYSTEM = (
 
 
 # ---------------------------------------------------------------------------
+# Document type classifier (Stage 2 — LLM)
+# ---------------------------------------------------------------------------
+#
+# Used by retrieval._classify_from_context() via classification.pipeline._call_stage2().
+# Stage 1 (keyword + embedding) runs first; this prompt only fires when Stage 1
+# confidence falls below CLASSIFIER_CONFIDENCE_THRESHOLD.
+#
+# The response is coerced into DocumentClassification (llm/structured.py) by
+# Instructor — no JSON format instruction needed here.
+#
+# user side: f"Document text (first {N} chars):\n\n{context}"
+
+DOCUMENT_CLASSIFIER_SYSTEM = (
+    "You are a document classification expert. "
+    "Classify the document based on the text excerpt provided.\n\n"
+    "Supported document types:\n"
+    "invoice, receipt, purchase_order, bank_statement, cv_resume, contract, nda, "
+    "loan_application, gst_return, offer_letter, medical, legal, report, general, id_document\n\n"
+    "Rules:\n"
+    "- Choose the single most specific type that fits the document\n"
+    "- Use 'general' only if no other type fits clearly\n"
+    "- Provide a confidence score from 0.0 (uncertain) to 1.0 (certain)\n"
+    "- Give a one-sentence reasoning explaining your choice\n"
+    "- List 2-4 short key signals (phrases or patterns) from the text that "
+    "led to your classification"
+)
+
+# ---------------------------------------------------------------------------
 # Legacy aliases — kept for backward compatibility with any code outside
 # retrieval.py that still imports the old combined-prompt names.
 # These will be removed in a future cleanup pass.
