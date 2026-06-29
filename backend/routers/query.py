@@ -1,3 +1,14 @@
+"""
+routers/query.py
+Query endpoints.
+
+Changes in this phase:
+  - Switch to get_current_user_context()
+  - Rate limiting on /query and /query/stream
+  - org_id/team_id threaded through to retrieval layer
+  - LLM output already sanitized in retrieval.py — no extra step needed here
+"""
+
 import base64
 
 from fastapi import APIRouter, Depends
@@ -5,28 +16,28 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, validator
 
 from core.responses import bad_request, internal_error
-from core.auth import get_current_user, get_user_id
+from core.auth import get_current_user_context, get_user_id, UserContext
+from core.rate_limiter import check_rate_limit
 from core.logger import get_logger
 from retrieval import query_document, query_document_stream, compress_history
 from db import get_chat_history, save_message
 from hyde import VALID_RETRIEVAL_MODES
 
 logger = get_logger("routers.query")
-
 router = APIRouter(tags=["Query"])
 
 
 # ── Input models ──────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    question: str
-    document_id: str | None = None
-    document_ids: list[str] | None = None
-    history: list[dict] = []
+    question:        str
+    document_id:     str | None = None
+    document_ids:    list[str] | None = None
+    history:         list[dict] = []
     history_summary: str = ""
-    provider: str | None = None
-    model: str | None = None
-    retrieval_mode: str = "standard"
+    provider:        str | None = None
+    model:           str | None = None
+    retrieval_mode:  str = "standard"
 
     @validator("question")
     def question_not_empty(cls, v):
@@ -58,7 +69,7 @@ class QueryRequest(BaseModel):
 
 
 class SaveChatRequest(BaseModel):
-    role: str
+    role:    str
     content: str
     sources: list[dict] = []
 
@@ -88,8 +99,15 @@ class CompressRequest(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/query")
-def query(req: QueryRequest, user=Depends(get_current_user)):
+def query(
+    req: QueryRequest,
+    user: UserContext = Depends(get_current_user_context),
+):
     uid = get_user_id(user)
+
+    # Rate limit
+    check_rate_limit(user_id=uid, endpoint="query")
+
     try:
         return query_document(
             req.question,
@@ -101,14 +119,22 @@ def query(req: QueryRequest, user=Depends(get_current_user)):
             model=req.model,
             retrieval_mode=req.retrieval_mode,
             user_id=uid,
+            org_id=str(user.org_id)  if user.org_id  else None,
+            team_id=str(user.team_id) if user.team_id else None,
         )
     except Exception as exc:
         return internal_error(f"Query failed: {exc}")
 
 
 @router.post("/query/stream")
-def query_stream(req: QueryRequest, user=Depends(get_current_user)):
+def query_stream(
+    req: QueryRequest,
+    user: UserContext = Depends(get_current_user_context),
+):
     uid = get_user_id(user)
+
+    # Rate limit — same limit as /query
+    check_rate_limit(user_id=uid, endpoint="query")
 
     def event_stream():
         try:
@@ -122,6 +148,8 @@ def query_stream(req: QueryRequest, user=Depends(get_current_user)):
                 model=req.model,
                 retrieval_mode=req.retrieval_mode,
                 user_id=uid,
+                org_id=str(user.org_id)  if user.org_id  else None,
+                team_id=str(user.team_id) if user.team_id else None,
             ):
                 encoded = base64.b64encode(token.encode()).decode()
                 yield f"data: {encoded}\n\n"
@@ -153,7 +181,10 @@ def save_chat(document_id: str, body: SaveChatRequest):
 
 
 @router.post("/compress")
-def compress(req: CompressRequest, user=Depends(get_current_user)):
+def compress(
+    req: CompressRequest,
+    user: UserContext = Depends(get_current_user_context),
+):
     uid = get_user_id(user)
     try:
         summary = compress_history(req.messages, user_id=uid)

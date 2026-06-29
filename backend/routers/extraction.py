@@ -1,21 +1,17 @@
 """
-Endpoints:
-    POST  /extract
-    POST  /extract/nl
-    POST  /extract/batch
-    GET   /extract/{extraction_id}
-    GET   /templates
-    GET   /templates/{template_id}
-    GET   /tables/{document_id}
-    POST  /review/{document_id}
-    GET   /review/{document_id}/corrections
+routers/extraction.py
+Extraction endpoints.
+
+Changes in this phase:
+  - Switch to get_current_user_context()
+  - org_id/team_id threaded through to retrieval layer
 """
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, validator
 
 from core.responses import bad_request, error_response, internal_error, not_found
-from core.auth import get_current_user, get_user_id
+from core.auth import get_current_user_context, get_user_id, UserContext
 from core.lineage import log_extraction_started, log_extraction_completed, log_corrected
 from retrieval import extract_fields, nl_to_schema, extract_nl, extract_tables
 from webhooks import trigger_webhooks
@@ -46,7 +42,7 @@ def _flatten_extracted(extracted: dict) -> dict:
 
 class ExtractRequest(BaseModel):
     document_id: str
-    fields: dict
+    fields:      dict
 
     @validator("document_id")
     def doc_id_not_empty(cls, v):
@@ -62,8 +58,8 @@ class ExtractRequest(BaseModel):
 
 
 class NLExtractRequest(BaseModel):
-    document_id: str
-    instruction: str
+    document_id:  str
+    instruction:  str
     preview_only: bool = False
 
     @validator("instruction")
@@ -75,8 +71,8 @@ class NLExtractRequest(BaseModel):
 
 class BatchExtractRequest(BaseModel):
     document_ids: list[str]
-    fields: dict = {}
-    instruction: str | None = None
+    fields:       dict = {}
+    instruction:  str | None = None
 
     @validator("document_ids")
     def ids_not_empty(cls, v):
@@ -84,18 +80,14 @@ class BatchExtractRequest(BaseModel):
             raise ValueError("document_ids cannot be empty")
         return v
 
-    @validator("fields")
-    def fields_or_instruction_required(cls, v, values):
-        return v
-
 
 class ReviewAction(BaseModel):
-    field: str
-    action: str
-    original_value: str = ""
+    field:           str
+    action:          str
+    original_value:  str = ""
     corrected_value: str = ""
-    evidence_used: str = ""
-    reviewer_note: str = ""
+    evidence_used:   str = ""
+    reviewer_note:   str = ""
 
     @validator("action")
     def action_must_be_valid(cls, v):
@@ -107,16 +99,21 @@ class ReviewAction(BaseModel):
 # ── Extraction routes ─────────────────────────────────────────────────────────
 
 @router.post("/extract")
-def extract(req: ExtractRequest, user=Depends(get_current_user)):
-    """
-    Extract structured fields. Returns per-field {value, bbox} shape + extraction_id.
-    """
-    uid = get_user_id(user)
+def extract(
+    req: ExtractRequest,
+    user: UserContext = Depends(get_current_user_context),
+):
+    uid    = get_user_id(user)
+    org_id = str(user.org_id)  if user.org_id  else None
+    tid    = str(user.team_id) if user.team_id else None
 
     log_extraction_started(req.document_id, user_id=uid, field_count=len(req.fields))
 
     try:
-        result = extract_fields(req.document_id, req.fields, user_id=uid)
+        result = extract_fields(
+            req.document_id, req.fields,
+            user_id=uid, org_id=org_id, team_id=tid,
+        )
     except Exception as exc:
         return internal_error(f"Extraction failed: {exc}")
 
@@ -155,8 +152,13 @@ def extract(req: ExtractRequest, user=Depends(get_current_user)):
 
 
 @router.post("/extract/nl")
-def extract_natural_language(req: NLExtractRequest, user=Depends(get_current_user)):
-    uid = get_user_id(user)
+def extract_natural_language(
+    req: NLExtractRequest,
+    user: UserContext = Depends(get_current_user_context),
+):
+    uid    = get_user_id(user)
+    org_id = str(user.org_id)  if user.org_id  else None
+    tid    = str(user.team_id) if user.team_id else None
 
     if req.preview_only:
         try:
@@ -166,7 +168,10 @@ def extract_natural_language(req: NLExtractRequest, user=Depends(get_current_use
         return {"schema": schema, "extracted": None, "validation": None}
 
     try:
-        result = extract_nl(req.document_id, req.instruction, user_id=uid)
+        result = extract_nl(
+            req.document_id, req.instruction,
+            user_id=uid, org_id=org_id, team_id=tid,
+        )
     except Exception as exc:
         return internal_error(f"NL extraction failed: {exc}")
 
@@ -184,8 +189,13 @@ def extract_natural_language(req: NLExtractRequest, user=Depends(get_current_use
 
 
 @router.post("/extract/batch")
-def batch_extract(req: BatchExtractRequest, user=Depends(get_current_user)):
-    uid = get_user_id(user)
+def batch_extract(
+    req: BatchExtractRequest,
+    user: UserContext = Depends(get_current_user_context),
+):
+    uid    = get_user_id(user)
+    org_id = str(user.org_id)  if user.org_id  else None
+    tid    = str(user.team_id) if user.team_id else None
 
     if not req.fields and not req.instruction:
         return bad_request(
@@ -197,9 +207,15 @@ def batch_extract(req: BatchExtractRequest, user=Depends(get_current_user)):
     for doc_id in req.document_ids:
         try:
             if req.instruction:
-                result = extract_nl(doc_id, req.instruction, user_id=uid)
+                result = extract_nl(
+                    doc_id, req.instruction,
+                    user_id=uid, org_id=org_id, team_id=tid,
+                )
             else:
-                result = extract_fields(doc_id, req.fields, user_id=uid)
+                result = extract_fields(
+                    doc_id, req.fields,
+                    user_id=uid, org_id=org_id, team_id=tid,
+                )
 
             results.append({"document_id": doc_id, "success": True, **result})
 
@@ -221,8 +237,10 @@ def batch_extract(req: BatchExtractRequest, user=Depends(get_current_user)):
 
 
 @router.get("/extract/{extraction_id}")
-def get_extraction(extraction_id: str, user=Depends(get_current_user)):
-    """E2 — Fetch a stored extraction result by UUID."""
+def get_extraction(
+    extraction_id: str,
+    user: UserContext = Depends(get_current_user_context),
+):
     uid    = get_user_id(user)
     result = _get_extraction_by_id(extraction_id, user_id=uid)
     if not result:
@@ -244,10 +262,21 @@ def get_template(template_id: str):
 
 
 @router.get("/tables/{document_id}")
-def get_tables(document_id: str, user=Depends(get_current_user)):
-    uid = get_user_id(user)
+def get_tables(
+    document_id: str,
+    user: UserContext = Depends(get_current_user_context),
+):
+    uid    = get_user_id(user)
+    org_id = str(user.org_id)  if user.org_id  else None
+    tid    = str(user.team_id) if user.team_id else None
+
     try:
-        tables = extract_tables(document_id, user_id=uid)
+        tables = extract_tables(
+            document_id,
+            user_id=uid,
+            org_id=org_id,
+            team_id=tid,
+        )
         return {"tables": tables}
     except Exception as exc:
         return internal_error(f"Table extraction failed: {exc}")
@@ -259,7 +288,7 @@ def get_tables(document_id: str, user=Depends(get_current_user)):
 def submit_review(
     document_id: str,
     actions: list[ReviewAction],
-    user=Depends(get_current_user),
+    user: UserContext = Depends(get_current_user_context),
 ):
     uid      = get_user_id(user)
     cls      = get_classification(document_id)
