@@ -26,6 +26,8 @@ from prompts import (
     QUERY_EXPANSION_SYSTEM,
     EXTRACTION_SYSTEM,
     DOCUMENT_CLASSIFIER_SYSTEM,
+    KEYWORD_SIGNALS,
+    EMBEDDING_EXEMPLARS,
 )
 from db import get_corrections_for_doc_type
 from llm.engine import call_llm, call_llm_stream
@@ -894,6 +896,19 @@ def classify_document_from_text(
     document_id: str = "",
     user_id: str = "system",
 ) -> dict:
+    """
+    Two-stage classification pipeline (formerly classification/pipeline.py).
+
+    Stage 1: keyword + embedding scoring (fast, no LLM call).
+    Stage 2: LLM classification via _classify_from_context() — only runs
+             when Stage 1 confidence falls below the configured threshold,
+             or when Stage 1 is disabled via feature flag.
+
+    Output shape is a superset of the original classify_document() shape —
+    doc_type, schema_template, confidence, reasoning, key_signals,
+    requires_human_review — plus an additive `stage_used` key
+    ("stage1" | "stage2").
+    """
     if not text or not text.strip():
         return {
             "doc_type": "general", "schema_template": "custom",
@@ -902,17 +917,169 @@ def classify_document_from_text(
             "stage_used": "stage2",
         }
 
-    from classification.pipeline import classify as _classify_pipeline
-
     def _embed(t: str) -> list[float]:
         return get_embed_model().get_text_embedding(t)
 
-    return _classify_pipeline(
-        full_text=text,
-        get_embedding_fn=_embed,
-        document_id=document_id or None,
-        user_id=user_id,
+    if not app_config.classifier_stage1_enabled:
+        # Feature flag off — go straight to LLM (original pre-E1 behaviour)
+        result = _classify_from_context(text[:2000], document_id=document_id or "", user_id=user_id)
+        result["stage_used"] = "stage2"
+        return result
+
+    stage1 = _classify_stage1(text, _embed)
+    threshold = _get_confidence_threshold()
+
+    if stage1["confidence"] >= threshold:
+        _clf_logger.info(
+            "Classification resolved at Stage 1",
+            doc_type=stage1["doc_type"], confidence=stage1["confidence"],
+            document_id=document_id,
+        )
+        return _stage1_to_full_result(stage1, threshold)
+
+    _clf_logger.info(
+        "Stage 1 confidence below threshold — escalating to LLM",
+        stage1_doc_type=stage1["doc_type"], stage1_confidence=stage1["confidence"],
+        threshold=threshold, document_id=document_id,
     )
+
+    hint_suffix = ""
+    if stage1["doc_type"] and stage1["doc_type"] != "general":
+        hint_suffix = (
+            f"\n\n(Preliminary keyword analysis suggests this may be a "
+            f"'{stage1['doc_type']}' — use your own judgment.)"
+        )
+    context = text[:2000] + hint_suffix
+
+    result = _classify_from_context(context, document_id=document_id or "", user_id=user_id)
+    result["stage_used"] = "stage2"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 classifier — keyword + embedding (fast, no LLM call)
+# ---------------------------------------------------------------------------
+# Folded in from the former classification/stage1.py when the
+# classification/ package was merged into retrieval.py. Reuses the existing
+# cosine_similarity() defined at the top of this file instead of keeping a
+# separate pure-Python implementation.
+
+_exemplar_embeddings: dict[str, list[float]] = {}
+
+
+def _get_exemplar_embedding(doc_type: str, get_embedding_fn) -> list[float]:
+    """
+    Return the cached embedding for a doc type's exemplar text (from
+    prompts.EMBEDDING_EXEMPLARS). Computed on first access, then cached
+    for the process lifetime. Resets automatically on restart.
+    """
+    if doc_type not in _exemplar_embeddings:
+        text = EMBEDDING_EXEMPLARS.get(doc_type, "")
+        _exemplar_embeddings[doc_type] = get_embedding_fn(text)
+    return _exemplar_embeddings[doc_type]
+
+
+def _clear_exemplar_cache() -> None:
+    """Clear the Stage 1 exemplar embedding cache. Call if the embedding model changes at runtime."""
+    _exemplar_embeddings.clear()
+
+
+def _keyword_score(text_sample: str) -> dict[str, float]:
+    """
+    Score each doc type by how many keyword signals appear in the first
+    500 characters of document text (case-insensitive). Normalised by the
+    number of signals defined for that type.
+    """
+    text_lower = text_sample[:500].lower()
+    scores: dict[str, float] = {}
+    for doc_type, signals in KEYWORD_SIGNALS.items():
+        if not signals:
+            scores[doc_type] = 0.0
+            continue
+        hits = sum(1 for s in signals if s in text_lower)
+        scores[doc_type] = hits / len(signals)
+    return scores
+
+
+def _embedding_score(text_sample: str, get_embedding_fn) -> dict[str, float]:
+    """
+    Embed the first 300 chars of document text and compute cosine similarity
+    (via the module-level cosine_similarity()) against each doc type's
+    exemplar embedding.
+    """
+    doc_vec = get_embedding_fn(text_sample[:300])
+    scores: dict[str, float] = {}
+    for doc_type in EMBEDDING_EXEMPLARS:
+        exemplar_vec = _get_exemplar_embedding(doc_type, get_embedding_fn)
+        scores[doc_type] = float(cosine_similarity(doc_vec, exemplar_vec))
+    return scores
+
+
+def _classify_stage1(
+    full_text: str,
+    get_embedding_fn,
+    keyword_weight: float = 0.5,
+    embedding_weight: float = 0.5,
+) -> dict:
+    """
+    Stage 1 classification: combine keyword + embedding scores.
+
+    Confidence is spread-based: (best_score - second_score) / 0.3, capped
+    at 1.0. Two nearly-equal top candidates -> low confidence even if both
+    have high absolute scores — this correctly escalates ambiguous docs
+    to Stage 2.
+    """
+    if not full_text or not full_text.strip():
+        return {"doc_type": "general", "confidence": 0.0, "stage": "stage1",
+                "keyword_scores": {}, "embedding_scores": {}}
+
+    kw_scores  = _keyword_score(full_text)
+    emb_scores = _embedding_score(full_text, get_embedding_fn)
+
+    all_types = set(kw_scores) | set(emb_scores)
+    combined: dict[str, float] = {}
+    for doc_type in all_types:
+        kw  = kw_scores.get(doc_type, 0.0)
+        emb = emb_scores.get(doc_type, 0.0)
+        combined[doc_type] = keyword_weight * kw + embedding_weight * emb
+
+    if not combined:
+        return {"doc_type": "general", "confidence": 0.0, "stage": "stage1",
+                "keyword_scores": kw_scores, "embedding_scores": emb_scores}
+
+    sorted_types = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    best_type, best_score = sorted_types[0]
+    second_score = sorted_types[1][1] if len(sorted_types) > 1 else 0.0
+
+    spread     = best_score - second_score
+    confidence = min(spread / 0.3, 1.0) if best_score > 0 else 0.0
+    confidence = round(confidence, 3)
+    resolved_type = best_type if confidence > 0 else "general"
+
+    _clf_logger.info(
+        "Stage 1 classification", doc_type=resolved_type, confidence=confidence,
+        best_score=round(best_score, 3), spread=round(spread, 3),
+    )
+
+    return {
+        "doc_type": resolved_type, "confidence": confidence, "stage": "stage1",
+        "keyword_scores": kw_scores, "embedding_scores": emb_scores,
+    }
+
+
+def _stage1_to_full_result(stage1: dict, threshold: float) -> dict:
+    """Convert a Stage 1 result dict into the full classification shape callers expect."""
+    doc_type   = stage1["doc_type"]
+    confidence = stage1["confidence"]
+    return {
+        "doc_type":              doc_type,
+        "schema_template":       get_template_for_doc_type(doc_type),
+        "confidence":            confidence,
+        "reasoning":             f"Keyword/embedding match (confidence {confidence})",
+        "key_signals":           [],
+        "requires_human_review": confidence < threshold,
+        "stage_used":            "stage1",
+    }
 
 
 def _classify_from_context(

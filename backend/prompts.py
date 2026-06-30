@@ -133,7 +133,8 @@ EXTRACTION_SYSTEM = (
 # The response is coerced into DocumentClassification (llm/structured.py) by
 # Instructor — no JSON format instruction needed here.
 #
-# user side: f"Document text (first {N} chars):\n\n{context}"
+# user side assembled inline in _classify_from_context():
+# f"Document text (first {N} chars):\n\n{context}"
 
 DOCUMENT_CLASSIFIER_SYSTEM = (
     "You are a document classification expert. "
@@ -149,6 +150,164 @@ DOCUMENT_CLASSIFIER_SYSTEM = (
     "- List 2-4 short key signals (phrases or patterns) from the text that "
     "led to your classification"
 )
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 classifier exemplars (keyword + embedding)
+# ---------------------------------------------------------------------------
+#
+# Moved here from the former classification/exemplars.py when the
+# classification/ package was folded into retrieval.py (see
+# retrieval._classify_stage1()). This is static reference data, not LLM
+# instruction text, but it lives alongside DOCUMENT_CLASSIFIER_SYSTEM since
+# both exist to ground document classification.
+#
+# KEYWORD_SIGNALS     — short phrases checked against the first 500 chars of
+#                       document text (case-insensitive substring match).
+# EMBEDDING_EXEMPLARS — short representative passages embedded once and
+#                       cached for cosine similarity against the document's
+#                       first ~300 chars.
+# Both are static domain knowledge — no DB, no LLM, no network calls.
+
+KEYWORD_SIGNALS: dict[str, list[str]] = {
+    "invoice": [
+        "invoice no", "invoice number", "bill to", "total amount due",
+        "tax invoice", "gst invoice", "invoice date", "payment due",
+        "subtotal", "amount payable",
+    ],
+    "receipt": [
+        "receipt no", "receipt number", "amount paid", "payment received",
+        "cash receipt", "transaction id", "paid by",
+    ],
+    "purchase_order": [
+        "purchase order", "po number", "po no", "order number",
+        "delivery address", "ship to", "vendor",
+    ],
+    "bank_statement": [
+        "account number", "account no", "statement period",
+        "opening balance", "closing balance", "transaction date",
+        "available balance", "ifsc", "sort code", "routing number",
+    ],
+    "cv_resume": [
+        "curriculum vitae", "resume", "work experience", "employment history",
+        "education", "skills", "objective", "career summary",
+        "professional experience", "references available",
+    ],
+    "contract": [
+        "this agreement", "whereas", "hereinafter referred to",
+        "terms and conditions", "governing law", "in witness whereof",
+        "indemnification", "termination clause", "force majeure",
+    ],
+    "nda": [
+        "non-disclosure", "confidentiality agreement", "confidential information",
+        "disclosing party", "receiving party", "trade secret",
+    ],
+    "loan_application": [
+        "loan application", "applicant name", "loan amount", "loan purpose",
+        "monthly income", "credit score", "collateral", "emi",
+        "rate of interest", "repayment period",
+    ],
+    "gst_return": [
+        "gstr", "gst return", "gstin", "outward supplies", "inward supplies",
+        "input tax credit", "integrated tax", "central tax", "state tax",
+    ],
+    "offer_letter": [
+        "offer letter", "job offer", "compensation package", "start date",
+        "position offered", "reporting to", "ctc",
+    ],
+    "medical": [
+        "patient name", "date of birth", "diagnosis", "prescription",
+        "dosage", "physician", "medical record", "icd", "rx",
+    ],
+    "legal": [
+        "plaintiff", "defendant", "court of", "whereas", "petitioner",
+        "respondent", "affidavit", "hereby ordered", "jurisdiction",
+    ],
+    "id_document": [
+        "date of birth", "date of issue", "date of expiry", "nationality",
+        "passport no", "driving licence", "aadhaar", "pan card",
+        "voter id", "national id",
+    ],
+}
+
+EMBEDDING_EXEMPLARS: dict[str, str] = {
+    "invoice": (
+        "Invoice No: INV-2024-001\nBill To: ABC Corporation\n"
+        "Invoice Date: 01-Jan-2024\nDue Date: 31-Jan-2024\n"
+        "Item: Professional Services\nAmount: ₹45,000\nTotal: ₹45,000"
+    ),
+    "receipt": (
+        "Receipt No: RCP-001\nAmount Paid: ₹5,000\nPayment Received from: John Doe\n"
+        "Date: 01-Jan-2024\nCash Receipt\nTransaction ID: TXN12345"
+    ),
+    "purchase_order": (
+        "Purchase Order No: PO-2024-001\nVendor: XYZ Supplies Ltd\n"
+        "Ship To: Warehouse, Mumbai\nItem Description: Office Supplies\n"
+        "Quantity: 100\nUnit Price: ₹500\nTotal: ₹50,000"
+    ),
+    "bank_statement": (
+        "Account No: 1234567890\nStatement Period: Jan 2024\n"
+        "Opening Balance: ₹10,000\nClosing Balance: ₹25,000\n"
+        "Date | Description | Debit | Credit | Balance"
+    ),
+    "cv_resume": (
+        "John Doe\nSoftware Engineer\nWork Experience:\n"
+        "2020-Present: Senior Developer at ABC Corp\n"
+        "Education: B.Tech Computer Science 2018\n"
+        "Skills: Python, FastAPI, PostgreSQL"
+    ),
+    "contract": (
+        "This Agreement is entered into as of January 1, 2024 between "
+        "Party A and Party B. Whereas the parties desire to enter into "
+        "this agreement, the following terms and conditions shall apply. "
+        "Governing law: Laws of India."
+    ),
+    "nda": (
+        "Non-Disclosure Agreement between Disclosing Party and Receiving Party. "
+        "Confidential Information shall not be disclosed. Trade secrets protected. "
+        "Effective date: January 2024."
+    ),
+    "loan_application": (
+        "Loan Application Form\nApplicant Name: Jane Smith\n"
+        "Loan Amount Requested: ₹5,00,000\nLoan Purpose: Home Renovation\n"
+        "Monthly Income: ₹75,000\nRepayment Period: 36 months\nEMI: ₹15,000"
+    ),
+    "gst_return": (
+        "GSTIN: 27AAAAA0000A1Z5\nGSTR-3B Return for January 2024\n"
+        "Outward Supplies: ₹10,00,000\nInput Tax Credit: ₹80,000\n"
+        "Central Tax: ₹90,000\nState Tax: ₹90,000"
+    ),
+    "offer_letter": (
+        "Dear John Doe,\nWe are pleased to offer you the position of Software Engineer.\n"
+        "Compensation Package: ₹12,00,000 CTC per annum\n"
+        "Start Date: 15-Feb-2024\nReporting to: Engineering Manager"
+    ),
+    "medical": (
+        "Patient Name: Jane Doe\nDate of Birth: 01/01/1985\n"
+        "Diagnosis: Hypertension\nRx: Amlodipine 5mg\nDosage: Once daily\n"
+        "Physician: Dr. Smith\nMedical Record No: MR-12345"
+    ),
+    "legal": (
+        "In the Court of Civil Judge\nPlaintiff: ABC Corporation\n"
+        "Defendant: XYZ Limited\nCase No: CIV-2024-001\n"
+        "Whereas the petitioner hereby files this affidavit before the court."
+    ),
+    "report": (
+        "Executive Summary\nThis report presents the findings of the quarterly "
+        "analysis. Key metrics show a 15% improvement. Recommendations include "
+        "further investment in technology infrastructure."
+    ),
+    "general": (
+        "This document contains general information and text content "
+        "that does not match a specific document type."
+    ),
+    "id_document": (
+        "Name: John Doe\nDate of Birth: 01/01/1990\nNationality: Indian\n"
+        "Passport No: A1234567\nDate of Issue: 01/01/2020\n"
+        "Date of Expiry: 31/12/2029"
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Legacy aliases — kept for backward compatibility with any code outside
