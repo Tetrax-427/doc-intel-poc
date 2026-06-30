@@ -4,16 +4,16 @@ Endpoints: GET /   GET /health   GET /usage   GET /tasks/{task_id}
 """
 
 from datetime import datetime
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from db import supabase
 from ingestion import get_embed_model
 from llm.engine import LLM_PROVIDER, LLM_MODEL
-from llm.usage import get_usage_summary
 from llm.fallback import SUPPORTED_PROVIDERS, get_fallback_chain
 from core.config import config as app_config
 from core.queue import task_queue
-
+from core.auth import get_current_user_context, get_user_id, UserContext
+from db_usage import get_user_usage
 router = APIRouter(tags=["System"])
 
 # ---------------------------------------------------------------------------
@@ -90,8 +90,8 @@ def health_check():
 
 
 @router.get("/usage")
-def get_usage():
-    return get_usage_summary()
+def get_usage(user: UserContext = Depends(get_current_user_context)):
+    return get_user_usage(get_user_id(user))
 
 
 @router.get("/tasks/{task_id}")
