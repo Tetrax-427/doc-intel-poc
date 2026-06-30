@@ -159,7 +159,7 @@ def rotate_api_key(key_id: str) -> dict:
     New key created (active), old key marked rotating with grace period.
     Raises ValueError if key not found.
     """
-    from db_apikeys import get_api_key_by_id, mark_api_key_rotating
+    from db import get_api_key_by_id, mark_api_key_rotating
     from core.config import config as app_config
 
     old_record = get_api_key_by_id(key_id)
