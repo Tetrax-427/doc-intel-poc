@@ -12,7 +12,7 @@ routes directly into routers/documents.py (both approaches work).
 from fastapi import APIRouter, Depends, Query
 from core.responses import internal_error
 from core.auth import get_current_user_context, get_user_id
-from db_lineage import get_lineage_for_document, get_lineage_summary
+from db_audit import get_lineage_for_document, get_lineage_summary
 
 router = APIRouter(prefix="/documents", tags=["Lineage"])
 

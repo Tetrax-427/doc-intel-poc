@@ -1,29 +1,36 @@
 """
 db_audit.py
-Audit log helpers for DocIntel.
+Audit log helpers (audit_logs table) and document lineage helpers
+(lineage_logs table) for DocIntel.
 
-All writes use the service-role client — audit logs are written by
-trusted server-side code and must not be blocked by RLS.
+Merged from db_audit.py + db_lineage.py — both are append-only event logs
+and were combined to reduce file sprawl.
 
-Reads use the anon client so RLS limits what each user can see
-(own actions + org admin sees all org actions).
+Access pattern differs intentionally between the two halves:
+  - audit_logs:    writes use the service-role client (get_supabase_admin) —
+                    trusted server-side writes must not be blocked by RLS.
+  - lineage_logs:  uses the plain anon client (db.supabase) — RLS scopes
+                    results naturally, and writes go through core/lineage.py
+                    only, never called directly from application code.
 
 Usage:
     from db_audit import log_audit
-
-    log_audit(
-        actor_id="user-uuid",
-        actor_role="org_admin",
-        action="member_added",
-        resource_type="org_member",
-        resource_id="target-user-uuid",
-        org_id="org-uuid",
-        details={"email": "new@example.com", "role": "member"},
-    )
+    from db_audit import store_lineage_event, get_lineage_for_document, get_lineage_summary
 """
 
+from __future__ import annotations
+
 from typing import Any
-from db import get_supabase_admin
+
+from db import get_supabase_admin, supabase
+from core.logger import get_logger
+
+logger = get_logger("db_audit")
+
+
+# ===========================================================================
+# audit_logs
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # Valid action values (for reference — not enforced at DB level)
@@ -93,8 +100,7 @@ def log_audit(
         }).execute()
     except Exception as e:
         # Never let audit logging break a request
-        import logging
-        logging.warning(f"[audit] Failed to write audit log: {e}")
+        logger.warning("Failed to write audit log", error=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +147,7 @@ def get_audit_logs(
         return resp.data or []
 
     except Exception as e:
-        import logging
-        logging.warning(f"[audit] Failed to read audit logs: {e}")
+        logger.warning("Failed to read audit logs", error=str(e))
         return []
 
 
@@ -166,3 +171,96 @@ def get_my_audit_logs(
         return resp.data or []
     except Exception:
         return []
+
+
+# ===========================================================================
+# lineage_logs
+# ===========================================================================
+# F1 — DB helpers for the lineage_logs table.
+#
+# store_lineage_event() is called exclusively by core/lineage.log_event().
+# Do not call it directly from application code.
+
+def store_lineage_event(
+    document_id: str,
+    user_id: str,
+    event_type: str,
+    event_data: dict | None = None,
+    duration_ms: int | None = None,
+    status: str = "success",
+    error_message: str | None = None,
+) -> None:
+    """
+    Insert one event row into lineage_logs.
+
+    Called exclusively by core/lineage.log_event().
+    Do not call directly from application code.
+    """
+    payload: dict = {
+        "document_id": document_id,
+        "user_id":     user_id,
+        "event_type":  event_type,
+        "event_data":  event_data or {},
+        "status":      status,
+    }
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if error_message:
+        payload["error_message"] = error_message
+
+    supabase.table("lineage_logs").insert(payload).execute()
+
+
+def get_lineage_for_document(
+    document_id: str,
+    user_id: str,
+    limit: int = 100,
+    event_type_filter: str | None = None,
+) -> list[dict]:
+    """
+    Return all lineage events for a document, newest-first.
+
+    Args:
+        document_id:        Document to fetch events for.
+        user_id:            Owner — enforces data isolation at query level
+                            (defense in depth on top of RLS).
+        limit:              Max rows (default 100, cap 500).
+        event_type_filter:  Optional filter to a single event_type string.
+    """
+    effective_limit = min(limit, 500)
+
+    query = (
+        supabase.table("lineage_logs")
+        .select("id, document_id, user_id, event_type, event_data, duration_ms, status, error_message, created_at")
+        .eq("document_id", document_id)
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(effective_limit)
+    )
+
+    if event_type_filter:
+        query = query.eq("event_type", event_type_filter)
+
+    result = query.execute()
+    return result.data or []
+
+
+def get_lineage_summary(document_id: str, user_id: str) -> dict[str, int]:
+    """
+    Return event counts grouped by event_type for a document.
+    """
+    result = (
+        supabase.table("lineage_logs")
+        .select("event_type")
+        .eq("document_id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    events = result.data or []
+
+    counts: dict[str, int] = {}
+    for e in events:
+        et = e.get("event_type", "unknown")
+        counts[et] = counts.get(et, 0) + 1
+
+    return counts

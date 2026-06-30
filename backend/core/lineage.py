@@ -54,7 +54,7 @@ _store_fn = None
 def _get_store():
     global _store_fn
     if _store_fn is None:
-        from db_lineage import store_lineage_event
+        from db_audit import store_lineage_event
         _store_fn = store_lineage_event
     return _store_fn
 
