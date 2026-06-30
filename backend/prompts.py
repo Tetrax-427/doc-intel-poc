@@ -308,39 +308,3 @@ EMBEDDING_EXEMPLARS: dict[str, str] = {
     ),
 }
 
-
-# ---------------------------------------------------------------------------
-# Legacy aliases — kept for backward compatibility with any code outside
-# retrieval.py that still imports the old combined-prompt names.
-# These will be removed in a future cleanup pass.
-# ---------------------------------------------------------------------------
-
-QA_PROMPT = (
-    f"{QA_SYSTEM}\n\n"
-    "Document chunks:\n{chunks}\n\nConversation so far:\n{history}\n\nQuestion: {question}\n\nAnswer:"
-)
-
-QA_PROMPT_MULTI = (
-    f"{QA_MULTI_SYSTEM}\n\n"
-    "Document chunks:\n{chunks}\n\nConversation so far:\n{history}\n\nQuestion: {question}\n\nAnswer:"
-)
-
-GENERAL_PROMPT = (
-    f"{GENERAL_SYSTEM}\n\n"
-    "Conversation so far:\n{history}\n\nQuestion: {question}\n\nAnswer:"
-)
-
-CLASSIFIER_PROMPT = (
-    f"{CLASSIFIER_SYSTEM}\n\nQuestion: {{question}}\n\nClassification:"
-)
-
-QUERY_EXPANSION_PROMPT = (
-    f"{QUERY_EXPANSION_SYSTEM}\n\nOriginal question: {{question}}\n\nRewritten question:"
-)
-
-EXTRACTION_PROMPT = (
-    f"{EXTRACTION_SYSTEM}\n\n"
-    "{correction_examples}"
-    "Fields to extract (name: description):\n{fields_with_descriptions}\n\n"
-    "Document:\n{context}\n\nJSON output:"
-)

@@ -104,8 +104,8 @@ def extract(
     user: UserContext = Depends(get_current_user_context),
 ):
     uid    = get_user_id(user)
-    org_id = str(user.org_id)  if user.org_id  else None
-    tid    = str(user.team_id) if user.team_id else None
+    org_id = user.org_id_str
+    tid    = user.team_id_str
 
     log_extraction_started(req.document_id, user_id=uid, field_count=len(req.fields))
 
@@ -157,9 +157,8 @@ def extract_natural_language(
     user: UserContext = Depends(get_current_user_context),
 ):
     uid    = get_user_id(user)
-    org_id = str(user.org_id)  if user.org_id  else None
-    tid    = str(user.team_id) if user.team_id else None
-
+    org_id = user.org_id_str
+    tid    = user.team_id_str
     if req.preview_only:
         try:
             schema = nl_to_schema(req.instruction, user_id=uid)
@@ -194,9 +193,9 @@ def batch_extract(
     user: UserContext = Depends(get_current_user_context),
 ):
     uid    = get_user_id(user)
-    org_id = str(user.org_id)  if user.org_id  else None
-    tid    = str(user.team_id) if user.team_id else None
-
+    org_id = user.org_id_str
+    tid    = user.team_id_str
+    
     if not req.fields and not req.instruction:
         return bad_request(
             "Provide either 'fields' (schema dict) or 'instruction' (natural language).",
@@ -267,9 +266,8 @@ def get_tables(
     user: UserContext = Depends(get_current_user_context),
 ):
     uid    = get_user_id(user)
-    org_id = str(user.org_id)  if user.org_id  else None
-    tid    = str(user.team_id) if user.team_id else None
-
+    org_id = user.org_id_str
+    tid    = user.team_id_str
     try:
         tables = extract_tables(
             document_id,

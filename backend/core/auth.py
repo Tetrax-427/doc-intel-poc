@@ -55,7 +55,13 @@ class UserContext:
     def has_org(self) -> bool:
         return self.org_id is not None
 
+    @property
+    def org_id_str(self) -> str | None:
+        return str(self.org_id) if self.org_id else None
 
+    @property
+    def team_id_str(self) -> str | None:
+        return str(self.team_id) if self.team_id else None
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -69,13 +75,6 @@ def get_user_id(user) -> str:
         return user.get("user_id", "anonymous")
     return "anonymous"
 
-
-def _get_supabase_admin():
-    url         = os.getenv("SUPABASE_URL", "").strip()
-    service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-    if not url or not service_key:
-        return None
-    return create_client(url, service_key)
 
 
 def _verify_supabase_token(token: str) -> UserContext:
