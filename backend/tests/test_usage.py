@@ -2,7 +2,7 @@
 tests/test_usage.py
 Tests for:
   - core/quota_checker.py — quota resolution and enforcement
-  - db_quotas.py          — quota CRUD validation
+  - db_orgs.py          — quota CRUD validation
   - Usage endpoint logic
 """
 
@@ -35,9 +35,9 @@ def make_user(user_id="user-1", org_id=None, team_id=None,
 class TestQuotaTypeValidation:
 
     def test_valid_quota_types_accepted(self):
-        from db_quotas import VALID_QUOTA_TYPES, set_quota
+        from db_orgs import VALID_QUOTA_TYPES, set_quota
         for qt in VALID_QUOTA_TYPES:
-            with patch("db_quotas._sb") as mock_sb:
+            with patch("db_orgs._sb") as mock_sb:
                 mock_sb.return_value.table.return_value.upsert.return_value.execute.return_value = \
                     MagicMock(data=[{"id": "q-1", "quota_type": qt, "limit_value": 10}])
                 result = set_quota(
@@ -49,7 +49,7 @@ class TestQuotaTypeValidation:
                 assert result["quota_type"] == qt
 
     def test_invalid_quota_type_raises(self):
-        from db_quotas import set_quota
+        from db_orgs import set_quota
         with pytest.raises(ValueError) as exc:
             set_quota(
                 quota_type="max_something_invalid",
@@ -87,7 +87,7 @@ class TestQuotaTypeValidation:
 class TestQuotaScopeValidation:
 
     def test_exactly_one_scope_required(self):
-        from db_quotas import set_quota
+        from db_orgs import set_quota
         with pytest.raises(ValueError) as exc:
             set_quota(
                 quota_type="max_documents",
@@ -99,7 +99,7 @@ class TestQuotaScopeValidation:
         assert "exactly one" in str(exc.value).lower()
 
     def test_no_scope_raises(self):
-        from db_quotas import set_quota
+        from db_orgs import set_quota
         with pytest.raises(ValueError) as exc:
             set_quota(
                 quota_type="max_documents",
@@ -110,8 +110,8 @@ class TestQuotaScopeValidation:
         assert "exactly one" in str(exc.value).lower()
 
     def test_user_scope_accepted(self):
-        from db_quotas import set_quota
-        with patch("db_quotas._sb") as mock_sb:
+        from db_orgs import set_quota
+        with patch("db_orgs._sb") as mock_sb:
             mock_sb.return_value.table.return_value.upsert.return_value.execute.return_value = \
                 MagicMock(data=[{"id": "q-1", "quota_type": "max_documents", "limit_value": 50}])
             result = set_quota(
@@ -123,8 +123,8 @@ class TestQuotaScopeValidation:
             assert result is not None
 
     def test_org_scope_accepted(self):
-        from db_quotas import set_quota
-        with patch("db_quotas._sb") as mock_sb:
+        from db_orgs import set_quota
+        with patch("db_orgs._sb") as mock_sb:
             mock_sb.return_value.table.return_value.upsert.return_value.execute.return_value = \
                 MagicMock(data=[{"id": "q-2", "quota_type": "max_llm_cost_month", "limit_value": 10.0}])
             result = set_quota(

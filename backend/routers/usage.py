@@ -19,7 +19,7 @@ from core.permissions import require_org_admin, require_team_lead, require_same_
 from core.quota_checker import get_quota_status
 from core.logger import get_logger
 from db_usage import get_user_usage, get_team_usage, get_org_usage, get_user_daily_breakdown
-from db_quotas import set_quota, delete_quota, list_quotas_for_org, get_quota_by_id, VALID_QUOTA_TYPES
+from db_orgs import set_quota, delete_quota, list_quotas_for_org, get_quota_by_id, VALID_QUOTA_TYPES
 from db_audit import log_audit
 
 logger = get_logger("routers.usage")
