@@ -20,32 +20,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel, validator
 
 from core.responses import internal_error, not_found
-from api_keys import create_api_key,revoke_api_key,list_api_keys
 from db import supabase
 from webhooks import send_webhook
-
-    
-router = APIRouter(tags=["Integration"])
-
-
-# ── Input models ──────────────────────────────────────────────────────────────
-
-class CreateKeyRequest(BaseModel):
-    name: str
-    rate_limit: int = 100
-
-    @validator("name")
-    def name_not_empty(cls, v):
-        if not v.strip():
-            raise ValueError("name cannot be empty")
-        return v.strip()
-
-    @validator("rate_limit")
-    def rate_limit_positive(cls, v):
-        if v < 1:
-            raise ValueError("rate_limit must be at least 1")
-        return v
-
 
 class CreateWebhookRequest(BaseModel):
     name: str
@@ -72,30 +48,9 @@ class CreateWebhookRequest(BaseModel):
         if not v:
             raise ValueError("events list cannot be empty")
         return v
+    
+router = APIRouter(tags=["Integration"])
 
-
-# ── API key routes ────────────────────────────────────────────────────────────
-
-@router.post("/api-keys")
-def create_key(req: CreateKeyRequest):
-    """Generate a new API key."""
-    return create_api_key(req.name, req.rate_limit)
-
-
-@router.get("/api-keys")
-def list_keys():
-    """List all active API keys (hashed — raw key is only shown at creation)."""
-    return list_api_keys()
-
-
-@router.delete("/api-keys/{key_id}")
-def revoke_key(key_id: str):
-    """Revoke (deactivate) an API key by ID."""
-    revoke_api_key(key_id)
-    return {"status": "revoked", "key_id": key_id}
-
-
-# ── Webhook routes ────────────────────────────────────────────────────────────
 # /webhooks/logs is registered first to avoid path-param collision.
 
 @router.get("/webhooks/logs")
