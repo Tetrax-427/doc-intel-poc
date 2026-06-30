@@ -25,6 +25,7 @@ from prompts import (
     CLASSIFIER_SYSTEM,
     QUERY_EXPANSION_SYSTEM,
     EXTRACTION_SYSTEM,
+    DOCUMENT_CLASSIFIER_SYSTEM,
 )
 from db import get_corrections_for_doc_type
 from llm.engine import call_llm, call_llm_stream
@@ -869,43 +870,9 @@ def extract_nl(
 # Document classification
 # ---------------------------------------------------------------------------
 
-DOCUMENT_CLASSIFIER_SYSTEM = (
-    "You are a document classification expert. "
-    "Analyse the document text and classify it. "
-    "Valid doc_type values: invoice, receipt, resume, cv, contract, agreement, nda, report, "
-    "research paper, financial statement, balance sheet, income statement, medical record, "
-    "prescription, legal document, court filing, article, email, letter, general, "
-    "gst return, gstr-1, gstr-3b, offer letter, loan application, bank statement"
-)
-
-TEMPLATE_MAP = {
-    "invoice":              "invoice",
-    "receipt":              "invoice",
-    "resume":               "cv_resume",
-    "cv":                   "cv_resume",
-    "curriculum vitae":     "cv_resume",
-    "contract":             "contract",
-    "agreement":            "contract",
-    "nda":                  "contract",
-    "report":               "report",
-    "research paper":       "report",
-    "financial statement":  "financial",
-    "balance sheet":        "financial",
-    "income statement":     "financial",
-    "medical record":       "medical",
-    "prescription":         "medical",
-    "legal document":       "legal",
-    "court filing":         "legal",
-    "article":              "general",
-    "email":                "general",
-    "letter":               "general",
-    "general":              "general",
-}
-
-
 def _get_confidence_threshold() -> float:
     try:
-        return float(app_config.classification_confidence_threshold)
+        return float(app_config.classifier_confidence_threshold)
     except Exception:
         return 0.75
 
@@ -956,6 +923,7 @@ def _classify_from_context(
     """
     LLM-only classification — called by pipeline.py Stage 2.
     SANDBOXED: document content is wrapped before passing to LLM.
+    Uses DOCUMENT_CLASSIFIER_SYSTEM from prompts.py (not a local constant).
     """
     # ── SANDBOX ──
     sandboxed_context = sandbox_and_check(
