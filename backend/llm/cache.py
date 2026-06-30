@@ -22,7 +22,7 @@ Design (see FINAL_PLAN.md §0 for the full reasoning trail):
 from __future__ import annotations
 
 from core.logger import get_logger
-from db_llm_cache import get_cached, set_cached, record_hit
+from db_llm import get_cached, set_cached, record_hit
 from llm.hashing import compute_prompt_hash
 
 logger = get_logger("llm.cache")

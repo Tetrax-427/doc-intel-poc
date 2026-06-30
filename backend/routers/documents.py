@@ -33,7 +33,7 @@ from db import (
     get_summary, get_all_documents, delete_document_by_id,
     get_document_any_visibility, update_document_visibility,
 )
-from db_llm_cache import invalidate_for_document
+from db_llm import invalidate_for_document
 from db_audit import log_audit
 from ingestion import ingest_file, ingest_url
 

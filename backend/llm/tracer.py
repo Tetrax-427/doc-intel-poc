@@ -21,12 +21,12 @@ Design rules (do not relax these without updating FINAL_PLAN.md):
   cost-table miss, bad usage shape) must never break the actual LLM call or
   mask the real exception from it.
 - NEVER blocks meaningfully — DB write is a single synchronous insert, same
-  pattern as the rest of db.py/db_llm_calls.py. If this becomes a latency
+  pattern as the rest of db.py/db_llms.py. If this becomes a latency
   concern at scale, swap to a background thread/queue — out of scope for
   this phase.
 - Cost estimation is best-effort. Unknown provider/model → cost is None,
   not 0.0 — 0.0 silently understates spend in aggregates; None makes the
-  gap visible (db_llm_calls.get_summary already treats None as "skip" via
+  gap visible (db_llm.get_summary already treats None as "skip" via
   `or 0.0` at read time, which is the one place a 0-ish fallback is safe —
   it's a display concern there, not a stored-value concern here).
 """
@@ -37,7 +37,7 @@ import time
 from typing import Any
 
 from core.logger import get_logger
-from db_llm_calls import insert_llm_call
+from db_llm import insert_llm_call
 from llm.hashing import compute_prompt_hash
 
 logger = get_logger("llm.tracer")

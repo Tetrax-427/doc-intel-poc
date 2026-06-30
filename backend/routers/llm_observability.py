@@ -16,8 +16,7 @@ routing behavior, not assumed.
 """
 
 from core.auth import get_current_user_context, get_user_id
-from db_llm_calls import get_calls, get_call_by_id, get_summary
-from db_llm_cache import get_cache_stats
+from db_llm import get_calls, get_call_by_id, get_summary, get_cache_stats
 from fastapi import APIRouter, Depends
 
 router = APIRouter(prefix="/llm", tags=["LLM Observability"])
