@@ -13,20 +13,8 @@ Usage:
     from db_usage import get_user_usage, get_team_usage, get_org_usage
 """
 
-import os
 from datetime import datetime, timezone
-from supabase import create_client
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-def _sb():
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_KEY"),
-    )
-
+from db import get_supabase_admin
 
 def _current_month() -> str:
     """Return first day of current month as ISO string e.g. '2025-01-01'."""
@@ -52,7 +40,7 @@ def get_user_usage(user_id: str) -> dict:
 
     Non-blocking — returns zeros on any DB error.
     """
-    sb = _sb()
+    sb = get_supabase_admin()
 
     # Monthly LLM usage
     monthly = {"total_cost_usd": 0.0, "total_llm_calls": 0, "cache_hits": 0, "billable_cost_usd": 0.0}
@@ -140,7 +128,7 @@ def get_user_daily_breakdown(user_id: str, days: int = 30) -> list[dict]:
     Used for usage charts in the frontend.
     """
     try:
-        sb = _sb()
+        sb = get_supabase_admin()
         from datetime import timedelta, date
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -166,7 +154,7 @@ def get_team_usage(team_id: str) -> dict:
     Return usage summary for a team for the current month.
     Includes per-member breakdown.
     """
-    sb = _sb()
+    sb = get_supabase_admin()
 
     # Team monthly rollup
     team_monthly = {
@@ -226,7 +214,7 @@ def get_org_usage(org_id: str) -> dict:
     Return usage summary for an org for the current month.
     Includes per-team and per-member breakdown.
     """
-    sb = _sb()
+    sb = get_supabase_admin()
 
     # Org monthly rollup
     org_monthly = {

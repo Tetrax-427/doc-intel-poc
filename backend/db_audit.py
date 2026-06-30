@@ -22,27 +22,8 @@ Usage:
     )
 """
 
-import os
 from typing import Any
-from supabase import create_client
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-def _sb_admin():
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_KEY"),
-    )
-
-
-def _sb():
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_KEY"),
-    )
-
+from db import get_supabase_admin
 
 # ---------------------------------------------------------------------------
 # Valid action values (for reference — not enforced at DB level)
@@ -100,7 +81,7 @@ def log_audit(
         ip_address:    request IP (optional, for security audits).
     """
     try:
-        _sb_admin().table("audit_logs").insert({
+        get_supabase_admin().table("audit_logs").insert({
             "actor_id":     actor_id,
             "actor_role":   actor_role,
             "action":       action,
@@ -142,7 +123,7 @@ def get_audit_logs(
 
     try:
         query = (
-            _sb_admin()
+            get_supabase_admin()
             .table("audit_logs")
             .select("*")
             .eq("org_id", org_id)
@@ -173,7 +154,7 @@ def get_my_audit_logs(
     """Fetch audit logs for a specific user's own actions."""
     try:
         resp = (
-            _sb_admin()
+            get_supabase_admin()
             .table("audit_logs")
             .select("*")
             .eq("actor_id", user_id)

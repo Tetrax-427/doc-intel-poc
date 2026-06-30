@@ -20,7 +20,17 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY"),
 )
 
-
+def get_supabase_admin():
+    """
+    Service-role Supabase client — bypasses RLS.
+    Used by db_*.py modules that need to read/write across users
+    (org management, audit logs, usage aggregation, etc.) after
+    permission checks have already happened in the router layer.
+    """
+    return create_client(
+        os.getenv("SUPABASE_URL"),
+        os.getenv("SUPABASE_SERVICE_KEY"),
+    )
 # ── Documents ─────────────────────────────────────────────────────────────────
 
 def insert_document(

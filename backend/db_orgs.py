@@ -9,27 +9,9 @@ checks in the router layer.
 Reads use the anon client so RLS is enforced for user-facing queries.
 """
 
-import os
-from supabase import create_client
-from dotenv import load_dotenv
-
-load_dotenv()
+from db import get_supabase_admin
 
 
-def _sb():
-    """Anon client — RLS enforced."""
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_KEY"),
-    )
-
-
-def _sb_admin():
-    """Service role client — bypasses RLS for trusted writes."""
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_KEY"),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +23,7 @@ def create_org(name: str, slug: str, created_by: str) -> dict:
     Create a new org. Developer-only — called from POST /admin/orgs.
     Also creates an org_member row for created_by as org_admin.
     """
-    sb = _sb_admin()
+    sb = get_supabase_admin()
 
     result = sb.table("orgs").insert({
         "name":       name,
@@ -63,20 +45,20 @@ def create_org(name: str, slug: str, created_by: str) -> dict:
 
 
 def get_org_by_id(org_id: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("orgs").select("*").eq("id", org_id).limit(1).execute()
     return resp.data[0] if resp.data else None
 
 
 def get_org_by_slug(slug: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("orgs").select("*").eq("slug", slug).limit(1).execute()
     return resp.data[0] if resp.data else None
 
 
 def list_orgs() -> list[dict]:
     """List all orgs. Developer-only."""
-    sb = _sb_admin()
+    sb = get_supabase_admin()
     return sb.table("orgs").select("*").order("created_at", desc=True).execute().data or []
 
 
@@ -85,7 +67,7 @@ def list_orgs() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def create_team(org_id: str, name: str, created_by: str) -> dict:
-    sb     = _sb_admin()
+    sb     = get_supabase_admin()
     result = sb.table("teams").insert({
         "org_id":     org_id,
         "name":       name,
@@ -95,13 +77,13 @@ def create_team(org_id: str, name: str, created_by: str) -> dict:
 
 
 def get_team_by_id(team_id: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("teams").select("*").eq("id", team_id).limit(1).execute()
     return resp.data[0] if resp.data else None
 
 
 def list_teams_for_org(org_id: str) -> list[dict]:
-    sb = _sb_admin()
+    sb = get_supabase_admin()
     return (
         sb.table("teams")
         .select("*")
@@ -114,7 +96,7 @@ def list_teams_for_org(org_id: str) -> list[dict]:
 
 def delete_team(team_id: str) -> None:
     """Delete a team and cascade removes team_members via FK."""
-    _sb_admin().table("teams").delete().eq("id", team_id).execute()
+    get_supabase_admin().table("teams").delete().eq("id", team_id).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +108,7 @@ def add_org_member(
     user_id: str,
     role: str = "member",
 ) -> dict:
-    sb     = _sb_admin()
+    sb     = get_supabase_admin()
     result = sb.table("org_members").insert({
         "org_id":  org_id,
         "user_id": user_id,
@@ -137,12 +119,12 @@ def add_org_member(
 
 
 def remove_org_member(org_id: str, user_id: str) -> None:
-    _sb_admin().table("org_members").delete()\
+    get_supabase_admin().table("org_members").delete()\
         .eq("org_id", org_id).eq("user_id", user_id).execute()
 
 
 def update_org_member_role(org_id: str, user_id: str, role: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("org_members").update({"role": role})\
         .eq("org_id", org_id).eq("user_id", user_id).execute()
     return resp.data[0] if resp.data else None
@@ -154,7 +136,7 @@ def update_org_member_permissions(
     can_read_team_documents: bool | None = None,
     can_read_all_usage: bool | None = None,
 ) -> dict | None:
-    sb      = _sb_admin()
+    sb      = get_supabase_admin()
     updates = {}
     if can_read_team_documents is not None:
         updates["can_read_team_documents"] = can_read_team_documents
@@ -168,7 +150,7 @@ def update_org_member_permissions(
 
 
 def list_org_members(org_id: str) -> list[dict]:
-    sb = _sb_admin()
+    sb = get_supabase_admin()
     return (
         sb.table("org_members")
         .select("*")
@@ -180,19 +162,19 @@ def list_org_members(org_id: str) -> list[dict]:
 
 
 def get_org_member(org_id: str, user_id: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("org_members").select("*")\
         .eq("org_id", org_id).eq("user_id", user_id).limit(1).execute()
     return resp.data[0] if resp.data else None
 
 
 def suspend_org_member(org_id: str, user_id: str) -> None:
-    _sb_admin().table("org_members").update({"status": "suspended"})\
+    get_supabase_admin().table("org_members").update({"status": "suspended"})\
         .eq("org_id", org_id).eq("user_id", user_id).execute()
 
 
 def reactivate_org_member(org_id: str, user_id: str) -> None:
-    _sb_admin().table("org_members").update({"status": "active"})\
+    get_supabase_admin().table("org_members").update({"status": "active"})\
         .eq("org_id", org_id).eq("user_id", user_id).execute()
 
 
@@ -206,7 +188,7 @@ def add_team_member(
     user_id: str,
     role: str = "member",
 ) -> dict:
-    sb     = _sb_admin()
+    sb     = get_supabase_admin()
     result = sb.table("team_members").insert({
         "team_id": team_id,
         "org_id":  org_id,
@@ -217,19 +199,19 @@ def add_team_member(
 
 
 def remove_team_member(team_id: str, user_id: str) -> None:
-    _sb_admin().table("team_members").delete()\
+    get_supabase_admin().table("team_members").delete()\
         .eq("team_id", team_id).eq("user_id", user_id).execute()
 
 
 def update_team_member_role(team_id: str, user_id: str, role: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("team_members").update({"role": role})\
         .eq("team_id", team_id).eq("user_id", user_id).execute()
     return resp.data[0] if resp.data else None
 
 
 def list_team_members(team_id: str) -> list[dict]:
-    sb = _sb_admin()
+    sb = get_supabase_admin()
     return (
         sb.table("team_members")
         .select("*")
@@ -241,7 +223,7 @@ def list_team_members(team_id: str) -> list[dict]:
 
 
 def get_team_member(team_id: str, user_id: str) -> dict | None:
-    sb   = _sb_admin()
+    sb   = get_supabase_admin()
     resp = sb.table("team_members").select("*")\
         .eq("team_id", team_id).eq("user_id", user_id).limit(1).execute()
     return resp.data[0] if resp.data else None

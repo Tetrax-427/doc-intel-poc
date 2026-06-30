@@ -10,11 +10,7 @@ Usage:
     from db_quotas import set_quota, delete_quota, list_quotas_for_org
 """
 
-import os
-from supabase import create_client
-from dotenv import load_dotenv
-
-load_dotenv()
+from db import get_supabase_admin
 
 VALID_QUOTA_TYPES = {
     "max_documents",
@@ -24,11 +20,6 @@ VALID_QUOTA_TYPES = {
 }
 
 
-def _sb():
-    return create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_KEY"),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +61,7 @@ def set_quota(
     if len(scopes) != 1:
         raise ValueError("Exactly one of user_id, team_id, org_id must be provided.")
 
-    sb = _sb()
+    sb = get_supabase_admin()
 
     # Build the row
     row: dict = {
@@ -97,21 +88,21 @@ def set_quota(
 
 def delete_quota(quota_id: str) -> None:
     """Delete a quota by ID. Org admin only — enforced at router."""
-    _sb().table("quotas").delete().eq("id", quota_id).execute()
+    get_supabase_admin().table("quotas").delete().eq("id", quota_id).execute()
 
 
 def delete_quota_for_user(user_id: str, quota_type: str) -> None:
-    _sb().table("quotas").delete()\
+    get_supabase_admin().table("quotas").delete()\
         .eq("user_id", user_id).eq("quota_type", quota_type).execute()
 
 
 def delete_quota_for_team(team_id: str, quota_type: str) -> None:
-    _sb().table("quotas").delete()\
+    get_supabase_admin().table("quotas").delete()\
         .eq("team_id", team_id).eq("quota_type", quota_type).execute()
 
 
 def delete_quota_for_org(org_id: str, quota_type: str) -> None:
-    _sb().table("quotas").delete()\
+    get_supabase_admin().table("quotas").delete()\
         .eq("org_id", org_id).eq("quota_type", quota_type).execute()
 
 
@@ -124,7 +115,7 @@ def list_quotas_for_org(org_id: str) -> list[dict]:
     List all quotas scoped to an org: org-level + team-level + user-level
     quotas within the org. Used by org admin to see all quota configuration.
     """
-    sb = _sb()
+    sb = get_supabase_admin()
 
     # Get all teams in org first
     teams_resp = sb.table("teams").select("id").eq("org_id", org_id).execute()
@@ -163,6 +154,6 @@ def list_quotas_for_org(org_id: str) -> list[dict]:
 
 
 def get_quota_by_id(quota_id: str) -> dict | None:
-    sb   = _sb()
+    sb   = get_supabase_admin()
     resp = sb.table("quotas").select("*").eq("id", quota_id).limit(1).execute()
     return resp.data[0] if resp.data else None
