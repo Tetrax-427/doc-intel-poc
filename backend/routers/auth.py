@@ -15,7 +15,7 @@ Existing endpoints unchanged in behavior:
 import os
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, validator
-from core.auth import get_current_user_context, get_current_user, UserContext
+from core.auth import get_current_user_context, UserContext
 from core.rate_limiter import check_rate_limit
 from core.config import config as app_config
 from core.logger import get_logger
@@ -211,7 +211,7 @@ def signup(req: SignupRequest, request: Request):
 
 
 @router.post("/logout")
-def logout(user: UserContext = Depends(get_current_user)):
+def logout(user: UserContext = Depends(get_current_user_context)):
     logger.info("User logged out", user_id=user.user_id)
     return {"status": "logged_out"}
 

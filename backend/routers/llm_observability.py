@@ -15,7 +15,7 @@ path parameter. See FINAL_PLAN.md — this was checked against the real
 routing behavior, not assumed.
 """
 
-from core.auth import get_current_user, get_user_id
+from core.auth import get_current_user_context, get_user_id
 from db_llm_calls import get_calls, get_call_by_id, get_summary
 from db_llm_cache import get_cache_stats
 from fastapi import APIRouter, Depends
@@ -32,7 +32,7 @@ def list_calls(
     success: bool | None = None,
     limit: int = 50,
     offset: int = 0,
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_context),
 ):
     """
     Return recent llm_calls rows for the authenticated user, most recent
@@ -52,7 +52,7 @@ def list_calls(
 @router.get("/calls/summary")
 def calls_summary(
     document_id: str | None = None,
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_context),
 ):
     """
     Aggregate usage summary for the authenticated user — total calls,
@@ -64,7 +64,7 @@ def calls_summary(
 
 
 @router.get("/calls/{call_id}")
-def get_call(call_id: str, user=Depends(get_current_user)):
+def get_call(call_id: str, user=Depends(get_current_user_context)):
     """
     Return a single llm_calls row by id, scoped to the authenticated user.
     Returns null (not 404) if not found or not owned — matches the existing
@@ -76,7 +76,7 @@ def get_call(call_id: str, user=Depends(get_current_user)):
 
 
 @router.get("/cache/stats")
-def cache_stats(user=Depends(get_current_user)):
+def cache_stats(user=Depends(get_current_user_context)):
     """
     Aggregate Layer 2 cache stats for the authenticated user — total
     entries, total hits, estimated USD saved.

@@ -11,7 +11,7 @@ routes directly into routers/documents.py (both approaches work).
 
 from fastapi import APIRouter, Depends, Query
 from core.responses import internal_error
-from core.auth import get_current_user, get_user_id
+from core.auth import get_current_user_context, get_user_id
 from db_lineage import get_lineage_for_document, get_lineage_summary
 
 router = APIRouter(prefix="/documents", tags=["Lineage"])
@@ -22,7 +22,7 @@ def get_document_lineage(
     document_id: str,
     limit: int = Query(default=100, ge=1, le=500),
     event_type: str | None = Query(default=None, description="Filter by event_type"),
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_context),
 ):
     """
     Return the full audit trail for a document, newest-first.
@@ -51,7 +51,7 @@ def get_document_lineage(
 @router.get("/{document_id}/lineage/summary")
 def get_document_lineage_summary(
     document_id: str,
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_context),
 ):
     """
     Return event counts grouped by event_type for a document.

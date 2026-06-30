@@ -5,7 +5,6 @@ Supabase JWT authentication for DocIntel.
 Changes in this phase (Security + Org/Team):
   - UserContext extended with org_id, team_id, role, org_role, permissions
   - get_current_user_context() resolves org/team membership on every request
-  - get_current_user() retained for backward compat — returns same UserContext
   - Dev mode returns a full UserContext with safe defaults
 """
 
@@ -225,15 +224,6 @@ def _build_user_context(base: UserContext) -> UserContext:
 # FastAPI dependencies
 # ---------------------------------------------------------------------------
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> UserContext:
-    """
-    Original dependency — retained for backward compat.
-    Now returns a full UserContext with org/team fields resolved.
-    All existing callers continue to work unchanged.
-    """
-    return get_current_user_context(credentials)
 
 
 def get_current_user_context(
