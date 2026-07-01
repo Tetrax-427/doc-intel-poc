@@ -885,7 +885,8 @@ def classify_document(document_id: str, user_id: str = "system") -> dict:
         return {
             "doc_type": "general", "schema_template": "custom",
             "confidence": 0.0, "reasoning": "No document content found.",
-            "key_signals": [], "requires_human_review": True,
+            "key_signals": [], "requires_human_review": True, 
+            "stage_used": "stage2",
         }
     context = "\n\n".join([c["content"] for c in doc_chunks[:5]])[:2000]
     return classify_document_from_text(context, document_id=document_id, user_id=user_id)
@@ -1088,7 +1089,7 @@ def _classify_from_context(
     user_id: str = "system",
 ) -> dict:
     """
-    LLM-only classification — called by pipeline.py Stage 2.
+    LLM-only classification
     SANDBOXED: document content is wrapped before passing to LLM.
     Uses DOCUMENT_CLASSIFIER_SYSTEM from prompts.py (not a local constant).
     """

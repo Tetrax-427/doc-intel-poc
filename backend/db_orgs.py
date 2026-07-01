@@ -2,10 +2,6 @@
 db_orgs.py
 Database helpers for orgs, teams, org members, team members, and quotas.
 
-quota management is small (6
-functions) and lives in the same org/team domain, so it was folded in here
-to reduce file sprawl.
-
 All writes use the service-role client (bypasses RLS) since org/team/quota
 management is performed by trusted server-side code after permission
 checks in the router layer.
