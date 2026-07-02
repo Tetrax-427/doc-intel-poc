@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from db import get_supabase_admin, supabase
+from db import get_supabase_admin
 from core.logger import get_logger
 
 logger = get_logger("db_audit")
@@ -230,7 +230,7 @@ def get_lineage_for_document(
     effective_limit = min(limit, 500)
 
     query = (
-        supabase.table("lineage_logs")
+        get_supabase_admin().table("lineage_logs")
         .select("id, document_id, user_id, event_type, event_data, duration_ms, status, error_message, created_at")
         .eq("document_id", document_id)
         .eq("user_id", user_id)
@@ -250,7 +250,7 @@ def get_lineage_summary(document_id: str, user_id: str) -> dict[str, int]:
     Return event counts grouped by event_type for a document.
     """
     result = (
-        supabase.table("lineage_logs")
+        get_supabase_admin().table("lineage_logs")
         .select("event_type")
         .eq("document_id", document_id)
         .eq("user_id", user_id)

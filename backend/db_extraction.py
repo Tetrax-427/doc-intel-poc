@@ -8,7 +8,7 @@ E2: store_extraction_result() now accepts the enriched {value, bbox} shape
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from db import supabase
+from db import get_supabase_admin
 from core.logger import get_logger
 
 logger = get_logger("db_extraction")
@@ -39,7 +39,7 @@ def store_extraction_result(
         "user_id":      user_id,
         "created_at":   datetime.now(timezone.utc).isoformat(),
     }
-    response = supabase.table("extraction_results").insert(payload).execute()
+    response = get_supabase_admin().table("extraction_results").insert(payload).execute()
     row_id = response.data[0]["id"] if response.data else ""
     logger.info(
         "Extraction result stored",
@@ -64,7 +64,7 @@ def get_extraction_result_by_id(
     Returns the row dict or None if not found / not owned.
     """
     query = (
-        supabase.table("extraction_results")
+        get_supabase_admin().table("extraction_results")
         .select("*")
         .eq("id", extraction_id)
     )
@@ -85,7 +85,7 @@ def get_latest_extraction_for_document(
     Optionally filter by template_id.
     """
     query = (
-        supabase.table("extraction_results")
+        get_supabase_admin().table("extraction_results")
         .select("*")
         .eq("document_id", document_id)
         .order("created_at", desc=True)

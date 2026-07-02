@@ -58,7 +58,7 @@ def get_document(document_id: str, user_id: str = "anonymous") -> dict | None:
     """
     try:
         result = (
-            supabase.table("documents")
+            get_supabase_admin().table("documents")
             .select(
                 "id, name, summary_short, doc_type, classification_confidence, "
                 "requires_review, created_at, user_id, org_id, team_id, visibility"
@@ -85,7 +85,7 @@ def get_document_any_visibility(document_id: str) -> dict | None:
     """
     try:
         result = (
-            supabase.table("documents")
+            get_supabase_admin().table("documents")
             .select(
                 "id, name, summary_short, doc_type, classification_confidence, "
                 "requires_review, created_at, user_id, org_id, team_id, visibility"
@@ -113,7 +113,7 @@ def get_all_documents(
     can see (own + team + org depending on membership and visibility setting).
     """
     query = (
-        supabase.table("documents")
+        get_supabase_admin().table("documents")
         .select(
             "id, name, summary_short, doc_type, classification_confidence, "
             "requires_review, created_at, user_id, org_id, team_id, visibility"
@@ -148,7 +148,7 @@ def update_document_visibility(
             update_data["org_id"] = org_id
 
         result = (
-            supabase.table("documents")
+            get_supabase_admin().table("documents")
             .update(update_data)
             .eq("id", document_id)
             .eq("user_id", user_id)
@@ -174,15 +174,15 @@ def delete_document_by_id(document_id: str, user_id: str = "anonymous") -> None:
     documents they own. Chunks/logs are deleted by document_id only.
     Silently returns if not found (idempotent).
     """
-    supabase.table("chunks").delete().eq("document_id", document_id).execute()
-    supabase.table("extraction_results").delete().eq("document_id", document_id).execute()
-    supabase.table("lineage_logs").delete().eq("document_id", document_id).execute()
-    supabase.table("llm_cache").delete().eq("document_id", document_id).execute()
-    supabase.table("documents").delete().eq("id", document_id).eq("user_id", user_id).execute()
+    get_supabase_admin().table("chunks").delete().eq("document_id", document_id).execute()
+    get_supabase_admin().table("extraction_results").delete().eq("document_id", document_id).execute()
+    get_supabase_admin().table("lineage_logs").delete().eq("document_id", document_id).execute()
+    get_supabase_admin().table("llm_cache").delete().eq("document_id", document_id).execute()
+    get_supabase_admin().table("documents").delete().eq("id", document_id).eq("user_id", user_id).execute()
 
 
 def save_summary(document_id: str, summary: str, summary_short: str):
-    supabase.table("documents").update({
+    get_supabase_admin().table("documents").update({
         "summary":       summary,
         "summary_short": summary_short,
     }).eq("id", document_id).execute()
@@ -190,7 +190,7 @@ def save_summary(document_id: str, summary: str, summary_short: str):
 
 def get_summary(document_id: str) -> dict:
     result = (
-        supabase.table("documents")
+        get_supabase_admin().table("documents")
         .select("summary, summary_short")
         .eq("id", document_id)
         .execute()
@@ -203,7 +203,7 @@ def get_summary(document_id: str) -> dict:
 # ── Classification ────────────────────────────────────────────────────────────
 
 def save_classification(document_id: str, classification: dict):
-    supabase.table("documents").update({
+    get_supabase_admin().table("documents").update({
         "doc_type":                  classification.get("doc_type"),
         "classification_confidence": classification.get("confidence"),
         "classification_data":       classification,
@@ -213,7 +213,7 @@ def save_classification(document_id: str, classification: dict):
 
 def get_classification(document_id: str) -> dict | None:
     result = (
-        supabase.table("documents")
+        get_supabase_admin().table("documents")
         .select("doc_type, classification_confidence, classification_data, requires_review")
         .eq("id", document_id)
         .execute()
@@ -236,7 +236,7 @@ def insert_chunks(chunks: list[dict]):
 
 def get_chunks_by_document(document_id: str) -> list[dict]:
     result = (
-        supabase.table("chunks")
+        get_supabase_admin().table("chunks")
         .select("*")
         .eq("document_id", document_id)
         .execute()
@@ -247,7 +247,7 @@ def get_chunks_by_document(document_id: str) -> list[dict]:
 def get_parent_chunk(parent_chunk_id: str) -> dict | None:
     try:
         result = (
-            supabase.table("chunks")
+            get_supabase_admin().table("chunks")
             .select("id, content, metadata, document_id")
             .eq("id", parent_chunk_id)
             .limit(1)
@@ -266,7 +266,7 @@ def get_all_chunks(user_id: str) -> list[dict]:
     if not doc_ids:
         return []
     result = (
-        supabase.table("chunks")
+        get_supabase_admin().table("chunks")
         .select("*")
         .in_("document_id", doc_ids)
         .execute()
@@ -277,7 +277,7 @@ def get_all_chunks(user_id: str) -> list[dict]:
 # ── Chats ─────────────────────────────────────────────────────────────────────
 
 def save_message(document_id: str, role: str, content: str, sources: list = None):
-    supabase.table("chats").insert({
+    get_supabase_admin().table("chats").insert({
         "document_id": document_id,
         "role":        role,
         "content":     content,
@@ -287,7 +287,7 @@ def save_message(document_id: str, role: str, content: str, sources: list = None
 
 def get_chat_history(document_id: str) -> list[dict]:
     result = (
-        supabase.table("chats")
+        get_supabase_admin().table("chats")
         .select("*")
         .eq("document_id", document_id)
         .order("created_at")
@@ -308,7 +308,7 @@ def save_correction(
     evidence: str = "",
     note: str = "",
 ) -> None:
-    supabase.table("review_corrections").insert({
+    get_supabase_admin().table("review_corrections").insert({
         "document_id":     document_id,
         "doc_type":        doc_type,
         "field_name":      field_name,
@@ -326,7 +326,7 @@ def get_corrections_for_doc_type(
     limit: int = 5,
 ) -> list[dict]:
     result = (
-        supabase.table("review_corrections")
+        get_supabase_admin().table("review_corrections")
         .select("*")
         .eq("doc_type",   doc_type)
         .eq("field_name", field_name)
@@ -341,7 +341,7 @@ def get_corrections_for_doc_type(
 # ── API Keys ──────────────────────────────────────────────────────────────────
 
 def mark_api_key_rotating(key_id: str, grace_expires_at: str) -> None:
-    supabase.table("api_keys").update({
+    get_supabase_admin().table("api_keys").update({
         "status":           "rotating",
         "grace_expires_at": grace_expires_at,
     }).eq("id", key_id).execute()
@@ -349,7 +349,7 @@ def mark_api_key_rotating(key_id: str, grace_expires_at: str) -> None:
 
 def get_api_key_by_id(key_id: str, user_id: str) -> dict | None:
     resp = (
-        supabase.table("api_keys")
+        get_supabase_admin().table("api_keys")
         .select("*")
         .eq("id", key_id)
         .eq("user_id", user_id)
