@@ -20,7 +20,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, validator
 
 from core.responses import internal_error, not_found
-from db import supabase
+from db import get_supabase_admin
 from webhooks import send_webhook
 
 class CreateWebhookRequest(BaseModel):
@@ -57,7 +57,7 @@ router = APIRouter(tags=["Integration"])
 def webhook_logs():
     """Return the 50 most recent webhook delivery log entries."""
     result = (
-        supabase.table("webhook_logs")
+        get_supabase_admin().table("webhook_logs")
         .select("*")
         .order("created_at", desc=True)
         .limit(50)
@@ -70,7 +70,7 @@ def webhook_logs():
 def create_webhook(req: CreateWebhookRequest):
     """Register a new webhook endpoint."""
     try:
-        result = supabase.table("webhooks").insert({
+        result = get_supabase_admin().table("webhooks").insert({
             "name": req.name,
             "url": req.url,
             "events": req.events,
@@ -85,7 +85,7 @@ def create_webhook(req: CreateWebhookRequest):
 def list_webhooks():
     """List all registered webhooks."""
     result = (
-        supabase.table("webhooks")
+        get_supabase_admin().table("webhooks")
         .select("id, name, url, events, is_active, last_triggered, fail_count, created_at")
         .order("created_at", desc=True)
         .execute()
@@ -96,14 +96,14 @@ def list_webhooks():
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: str):
     """Permanently delete a webhook."""
-    supabase.table("webhooks").delete().eq("id", webhook_id).execute()
+    get_supabase_admin().table("webhooks").delete().eq("id", webhook_id).execute()
     return {"status": "deleted", "webhook_id": webhook_id}
 
 
 @router.post("/webhooks/{webhook_id}/test")
 def test_webhook(webhook_id: str):
     """Send a test ping to a webhook to verify it's reachable."""
-    result = supabase.table("webhooks").select("*").eq("id", webhook_id).execute()
+    result = get_supabase_admin().table("webhooks").select("*").eq("id", webhook_id).execute()
     if not result.data:
         return not_found("Webhook")
 

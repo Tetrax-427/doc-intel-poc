@@ -16,7 +16,7 @@ import ipaddress
 import httpx
 from datetime import datetime
 from dotenv import load_dotenv
-from db import supabase
+from db import get_supabase_admin
 
 load_dotenv()
 
@@ -122,7 +122,7 @@ def sign_payload(payload: str, secret: str) -> str:
 
 def get_active_webhooks(event: str) -> list[dict]:
     try:
-        result = supabase.table("webhooks")\
+        result = get_supabase_admin().table("webhooks")\
             .select("*")\
             .eq("is_active", True)\
             .contains("events", [event])\
@@ -135,7 +135,7 @@ def get_active_webhooks(event: str) -> list[dict]:
 
 def log_webhook(webhook_id: str, event: str, payload: dict, status: int, success: bool):
     try:
-        supabase.table("webhook_logs").insert({
+        get_supabase_admin().table("webhook_logs").insert({
             "webhook_id":      webhook_id,
             "event":           event,
             "payload":         payload,
@@ -144,15 +144,15 @@ def log_webhook(webhook_id: str, event: str, payload: dict, status: int, success
         }).execute()
 
         if not success:
-            current = supabase.table("webhooks")\
+            current = get_supabase_admin().table("webhooks")\
                 .select("fail_count").eq("id", webhook_id).execute()
             fail_count = current.data[0]["fail_count"] if current.data else 0
-            supabase.table("webhooks")\
+            get_supabase_admin().table("webhooks")\
                 .update({"fail_count": fail_count + 1})\
                 .eq("id", webhook_id)\
                 .execute()
         else:
-            supabase.table("webhooks")\
+            get_supabase_admin().table("webhooks")\
                 .update({
                     "last_triggered": datetime.utcnow().isoformat(),
                     "fail_count":     0,
