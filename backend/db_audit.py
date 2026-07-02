@@ -208,7 +208,7 @@ def store_lineage_event(
     if error_message:
         payload["error_message"] = error_message
 
-    supabase.table("lineage_logs").insert(payload).execute()
+    get_supabase_admin().table("lineage_logs").insert(payload).execute()
 
 
 def get_lineage_for_document(

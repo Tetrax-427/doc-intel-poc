@@ -40,7 +40,7 @@ def insert_document(
     team_id: str | None = None,
     visibility: str = "private",
 ) -> str:
-    result = supabase.table("documents").insert({
+    result = get_supabase_admin().table("documents").insert({
         "name":       name,
         "user_id":    user_id,
         "org_id":     org_id,
@@ -231,7 +231,7 @@ def insert_chunks(chunks: list[dict]):
     batch_size = 500
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
-        supabase.table("chunks").insert(batch).execute()
+        get_supabase_admin().table("chunks").insert(batch).execute()
 
 
 def get_chunks_by_document(document_id: str) -> list[dict]:

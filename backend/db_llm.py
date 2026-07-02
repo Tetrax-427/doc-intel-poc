@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from db import supabase
+from db import supabase, get_supabase_admin
 
 
 # ===========================================================================
@@ -37,7 +37,7 @@ def insert_llm_call(record: dict) -> None:
     llm/tracer.py). This function does no validation/defaulting — it's a thin
     write. Raises on failure; caller (tracer.py) decides how to handle that.
     """
-    supabase.table("llm_calls").insert(record).execute()
+    get_supabase_admin().table("llm_calls").insert(record).execute()
 
 
 # ── Reads — all manually scoped by user_id ───────────────────────────────────

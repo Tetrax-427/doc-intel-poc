@@ -130,15 +130,12 @@ def build_extraction_model(fields: dict[str, str]) -> type[BaseModel]:
 # ---------------------------------------------------------------------------
 
 def _get_instructor_client(raw_client, provider: str):
-    """
-    Wrap a raw provider client with Instructor.
-
-    Raises:
-        LLMConfigError: if the provider has no Instructor adapter.
-    """
     provider = provider.strip().lower()
 
-    if provider in ("groq", "openai"):
+    if provider == "groq":
+        return instructor.from_groq(raw_client, mode=instructor.Mode.JSON)
+
+    if provider == "openai":
         return instructor.from_openai(raw_client)
 
     if provider == "anthropic":
@@ -148,7 +145,6 @@ def _get_instructor_client(raw_client, provider: str):
         f"Instructor adapter not available for provider '{provider}'.",
         provider=provider,
     )
-
 
 # ---------------------------------------------------------------------------
 # Usage extraction — defensive, multi-shape
