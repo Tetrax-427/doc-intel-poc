@@ -6,7 +6,7 @@ Endpoints: GET /   GET /health   GET /usage   GET /tasks/{task_id}
 from datetime import datetime
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from db import supabase
+from db import get_supabase_admin
 from ingestion import get_embed_model
 from llm.engine import LLM_PROVIDER, LLM_MODEL
 from llm.fallback import SUPPORTED_PROVIDERS, get_fallback_chain
@@ -59,7 +59,7 @@ def root():
 def health_check():
     checks: dict = {}
     try:
-        supabase.table("documents").select("id").limit(1).execute()
+        get_supabase_admin().table("documents").select("id").limit(1).execute()
         checks["database"] = {"status": "healthy"}
     except Exception as exc:
         checks["database"] = {"status": "unhealthy", "error": str(exc)}

@@ -17,7 +17,7 @@ import hashlib
 import secrets
 from datetime import date, datetime, timezone, timedelta
 from dotenv import load_dotenv
-from db import supabase
+from db import get_supabase_admin
 
 load_dotenv()
 
@@ -70,7 +70,7 @@ def create_api_key(
     if org_id:
         row["org_id"] = org_id
 
-    supabase.table("api_keys").insert(row).execute()
+    get_supabase_admin().table("api_keys").insert(row).execute()
 
     return {
         "key":        key,
@@ -99,7 +99,7 @@ def validate_api_key(key: str) -> tuple[bool, str]:
         key_hash = hashlib.sha256(key.encode()).hexdigest()
 
         result = (
-            supabase.table("api_keys")
+            get_supabase_admin().table("api_keys")
             .select("*")
             .eq("key_hash", key_hash)
             .execute()
@@ -115,7 +115,7 @@ def validate_api_key(key: str) -> tuple[bool, str]:
         if status == "active":
             today = date.today().isoformat()
             if record.get("last_reset") != today:
-                supabase.table("api_keys").update({
+                get_supabase_admin().table("api_keys").update({
                     "calls_today": 0,
                     "last_reset":  today,
                 }).eq("id", record["id"]).execute()
@@ -124,7 +124,7 @@ def validate_api_key(key: str) -> tuple[bool, str]:
             if record["calls_today"] >= record["rate_limit"]:
                 return False, f"Rate limit exceeded ({record['rate_limit']} calls/day)"
 
-            supabase.table("api_keys").update({
+            get_supabase_admin().table("api_keys").update({
                 "calls_today": record["calls_today"] + 1,
             }).eq("id", record["id"]).execute()
             return True, "valid"
@@ -175,7 +175,7 @@ def rotate_api_key(key_id: str) -> dict:
     ).isoformat()
 
     new_key, new_prefix, new_hash = generate_api_key()
-    new_result = supabase.table("api_keys").insert({
+    new_result = get_supabase_admin().table("api_keys").insert({
         "name":       old_record["name"] + " (rotated)",
         "key_hash":   new_hash,
         "key_prefix": new_prefix,
@@ -189,7 +189,7 @@ def rotate_api_key(key_id: str) -> dict:
     mark_api_key_rotating(key_id, grace_expires_at=grace_expiry)
 
     if new_id:
-        supabase.table("api_keys").update({
+        get_supabase_admin().table("api_keys").update({
             "rotated_to": new_id,
         }).eq("id", key_id).execute()
 
@@ -214,7 +214,7 @@ def rotate_api_key(key_id: str) -> dict:
 
 def list_api_keys() -> list[dict]:
     result = (
-        supabase.table("api_keys")
+        get_supabase_admin().table("api_keys")
         .select(
             "id, name, key_prefix, status, scope, org_id, rate_limit, "
             "calls_today, created_at, grace_expires_at, rotated_to"
@@ -227,7 +227,7 @@ def list_api_keys() -> list[dict]:
 
 def revoke_api_key(key_id: str) -> None:
     """Hard-revoke a key — instantly invalid, no grace period."""
-    supabase.table("api_keys").update({
+    get_supabase_admin().table("api_keys").update({
         "status":           "deleted",
         "grace_expires_at": None,
     }).eq("id", key_id).execute()

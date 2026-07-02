@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from db import supabase, get_supabase_admin
+from db import get_supabase_admin
 
 
 # ===========================================================================
@@ -57,7 +57,7 @@ def get_calls(
     """
     try:
         query = (
-            supabase.table("llm_calls")
+            get_supabase_admin().table("llm_calls")
             .select("*")
             .eq("user_id", user_id)
         )
@@ -85,7 +85,7 @@ def get_call_by_id(call_id: str, user_id: str) -> dict | None:
     """
     try:
         result = (
-            supabase.table("llm_calls")
+            get_supabase_admin().table("llm_calls")
             .select("*")
             .eq("id", call_id)
             .eq("user_id", user_id)
@@ -128,7 +128,7 @@ def get_summary(user_id: str, document_id: str | None = None) -> dict:
 
     try:
         query = (
-            supabase.table("llm_calls")
+            get_supabase_admin().table("llm_calls")
             .select("call_type, total_tokens, estimated_cost_usd, latency_ms, cache_hit")
             .eq("user_id", user_id)
         )
@@ -184,7 +184,7 @@ def get_cached(user_id: str, provider: str, model: str, cache_key: str) -> dict 
     """
     try:
         result = (
-            supabase.table("llm_cache")
+            get_supabase_admin().table("llm_cache")
             .select("*")
             .eq("user_id", user_id)
             .eq("provider", provider)
@@ -211,7 +211,7 @@ def record_hit(cache_row_id: str) -> None:
         # (hit_count is a stats nicety, not a correctness-critical counter —
         # a lost increment under rare concurrent access is fine).
         current = (
-            supabase.table("llm_cache")
+            get_supabase_admin().table("llm_cache")
             .select("hit_count")
             .eq("id", cache_row_id)
             .limit(1)
@@ -220,7 +220,7 @@ def record_hit(cache_row_id: str) -> None:
         if not current.data:
             return
         new_count = (current.data[0].get("hit_count") or 0) + 1
-        supabase.table("llm_cache").update({
+        get_supabase_admin().table("llm_cache").update({
             "hit_count": new_count,
             "last_hit_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", cache_row_id).execute()
@@ -240,7 +240,7 @@ def set_cached(record: dict) -> None:
     concurrent identical requests), the newer write wins rather than erroring.
     Raises on failure; caller (llm/cache.py) decides how to handle that.
     """
-    supabase.table("llm_cache").upsert(
+    get_supabase_admin().table("llm_cache").upsert(
         record,
         on_conflict="user_id,provider,model,cache_key",
     ).execute()
@@ -260,7 +260,7 @@ def invalidate_for_document(document_id: str, user_id: str) -> int:
     """
     try:
         result = (
-            supabase.table("llm_cache")
+            get_supabase_admin().table("llm_cache")
             .delete()
             .eq("document_id", document_id)
             .eq("user_id", user_id)
@@ -285,7 +285,7 @@ def get_cache_stats(user_id: str) -> dict:
     empty = {"total_entries": 0, "total_hits": 0, "estimated_saved_usd": 0.0}
     try:
         result = (
-            supabase.table("llm_cache")
+            get_supabase_admin().table("llm_cache")
             .select("hit_count, original_cost_usd")
             .eq("user_id", user_id)
             .execute()
