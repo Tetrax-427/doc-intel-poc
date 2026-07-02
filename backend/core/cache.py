@@ -144,30 +144,12 @@ def set_vision_description(image_path: str, doc_type: str, description: str):
 
 
 # ---------------------------------------------------------------------------
-# Classification cache  (TTL: 1 hour)
+# NOTE: Classification cache removed.
+# get_classification / set_classification / make_text_hash were previously
+# here but have been removed. Classification caching is now handled by the
+# unified LLM Layer 2 cache (llm_cache table via llm/cache.py), which is
+# per-user-scoped, provider/model-aware, and integrated with tracing.
 # ---------------------------------------------------------------------------
-# Classifications can change if the LLM or prompt changes — shorter TTL.
-# Key is a hash of the document text so different content always gets a fresh call.
-
-_CLASSIFICATION_TTL = 3_600  # 1 hour
-
-
-def get_classification(text_hash: str) -> dict | None:
-    """Return cached classification result, or None on cache miss."""
-    return _cache.get(cache_key("cls", text_hash))
-
-
-def set_classification(text_hash: str, result: dict):
-    """Cache a classification result for 1 hour."""
-    _cache.set(cache_key("cls", text_hash), result, ttl_seconds=_CLASSIFICATION_TTL)
-
-
-def make_text_hash(text: str) -> str:
-    """
-    Hash document text for use as a classification cache key.
-    Truncate to first 2000 chars — that's all classify_document() uses.
-    """
-    return hashlib.md5(text[:2000].encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -175,19 +157,12 @@ def make_text_hash(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def cache_stats() -> dict:
-    """
-    Return a snapshot of current cache state.
-    Useful for debugging and monitoring endpoints.
-    """
     return {
         "total_entries": _cache.size(),
     }
 
 
 def clear_all():
-    """
-    Wipe the entire cache.
-    Used in tests and can be wired to an admin endpoint.
-    """
+    """Wipe the entire cache."""
     _cache.clear()
     logger.info("Cache cleared")

@@ -1,3 +1,5 @@
+## DELETE THE FILES, ONCE EVERYTHING IS WORKING...
+
 from datetime import datetime
 from dotenv import load_dotenv
 from db import supabase

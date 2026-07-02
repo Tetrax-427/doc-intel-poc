@@ -1,27 +1,47 @@
 """
 FastAPI application entry point.
 
-Responsibilities:
-- Create the app instance
-- Register CORS middleware
-- Register API-key auth middleware
-- Mount all routers
-- Run startup warmup (embedding model pre-load + task queue start)
+Changes in this phase (Security + Org/Team):
+  - Startup env var check — server refuses to start if REQUIRED_ENV_VARS missing
+  - Registered new routers: admin, orgs, usage
+  - Org-scoped API key support in existing api-keys endpoints
 
-All route logic lives in routers/. Nothing else belongs here.
+Existing:
+  F2: POST /api-keys/{key_id}/rotate
+  F3: CORS origins driven by CORS_ALLOWED_ORIGINS env var
 """
 
 import os
-from fastapi import FastAPI, Security, HTTPException
+from fastapi import FastAPI, Security, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from core.queue import task_queue
 from ingestion import get_embed_model
 from routers.auth import router as auth_router
 from routers import system, documents, query, extraction, export, integration
+from routers.lineage import router as lineage_router
+from routers.admin import router as admin_router
+from routers.orgs import router as orgs_router
+from routers.usage import router as usage_router
+from routers.llm_observability import router as llm_observability_router
 
 load_dotenv()
+
+# ── Startup env check ─────────────────────────────────────────────────────────
+# Fail fast if required env vars are missing.
+# This runs at import time so Railway deployment fails visibly rather than
+# serving broken requests.
+
+from core.config import REQUIRED_ENV_VARS as _REQUIRED_ENV_VARS
+
+_missing = [k for k in _REQUIRED_ENV_VARS if not os.getenv(k, "").strip()]
+if _missing:
+    raise RuntimeError(
+        f"[startup] Missing required environment variables: {_missing}. "
+        f"Server cannot start. Set these in your .env / Railway env vars."
+    )
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -46,30 +66,30 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Fix 5 — CORS: specific domain in prod, wildcard only in dev
-_streamlit_url = os.getenv("STREAMLIT_URL", "").strip()
-ALLOWED_ORIGINS = (
-    [
-        _streamlit_url,
-        "http://localhost:8501",
-        "http://127.0.0.1:8501",
-    ]
-    if _streamlit_url
-    else ["*"]   # dev fallback — set STREAMLIT_URL in Railway to lock down
-)
+# ── CORS ──────────────────────────────────────────────────────────────────────
+
+from core.config import config as app_config
+
+_cors_origins = app_config.get_cors_origins()
+_is_dev_mode  = not os.getenv("SUPABASE_JWT_SECRET", "").strip()
+_use_wildcard = _is_dev_mode and _cors_origins == ["http://localhost:8501"]
+
+ALLOWED_ORIGINS    = ["*"] if _use_wildcard else _cors_origins
+_allow_credentials = not _use_wildcard
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=bool(_streamlit_url),  # only send credentials in prod
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Developer-Key"],
 )
 
 
+# ── Startup ───────────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 async def warmup():
-    # Task queue — guarded import; queue.py may not exist yet
     try:
         task_queue.start()
         print("[startup] Task queue started.")
@@ -82,6 +102,10 @@ async def warmup():
     get_embed_model()
     print("[startup] Embedding model ready.")
 
+    print(f"[startup] CORS — origins: {ALLOWED_ORIGINS}")
+    print(f"[startup] Dev mode: {_is_dev_mode}")
+    print(f"[startup] Required env vars: OK")
+
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 
@@ -92,3 +116,57 @@ app.include_router(extraction.router)
 app.include_router(export.router)
 app.include_router(integration.router)
 app.include_router(auth_router)
+app.include_router(lineage_router)
+app.include_router(admin_router)
+app.include_router(orgs_router)
+app.include_router(usage_router)
+app.include_router(llm_observability_router)
+
+# ── API Key endpoints ─────────────────────────────────────────────────────────
+
+class CreateApiKeyRequest(BaseModel):
+    name:       str
+    rate_limit: int = 100
+    scope:      str = "personal"   # 'personal' | 'org'
+    org_id:     str | None = None  # required when scope='org'
+
+
+@app.post("/api-keys", tags=["API Keys"])
+def create_api_key_endpoint(
+    req: CreateApiKeyRequest,
+    user=Depends(verify_api_key),
+):
+    """Create a new API key. Set scope='org' + org_id for org-scoped keys."""
+    from api_keys import create_api_key
+    return create_api_key(
+        name=req.name,
+        rate_limit=req.rate_limit,
+        scope=req.scope,
+        org_id=req.org_id,
+    )
+
+
+@app.get("/api-keys", tags=["API Keys"])
+def list_api_keys_endpoint(user=Depends(verify_api_key)):
+    from api_keys import list_api_keys
+    return list_api_keys()
+
+
+@app.post("/api-keys/{key_id}/rotate", tags=["API Keys"])
+def rotate_api_key_endpoint(key_id: str, user=Depends(verify_api_key)):
+    """
+    Rotate an API key. Old key stays valid for the configured grace period.
+    """
+    from api_keys import rotate_api_key
+    try:
+        return rotate_api_key(key_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.delete("/api-keys/{key_id}", tags=["API Keys"])
+def revoke_api_key_endpoint(key_id: str, user=Depends(verify_api_key)):
+    """Immediately revoke an API key. No grace period."""
+    from api_keys import revoke_api_key
+    revoke_api_key(key_id)
+    return {"status": "revoked", "key_id": key_id}
