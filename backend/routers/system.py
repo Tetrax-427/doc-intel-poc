@@ -22,12 +22,14 @@ router = APIRouter(tags=["System"])
 
 _MODEL_CATALOGUE: dict[str, list[str]] = {
     "groq": [
-        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+        "openai/gpt-oss-120b",
+        "groq/compound",
+        "openai/gpt-oss-20b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
         "llama-3.1-8b-instant",
-        "llama3-70b-8192",
-        "llama3-8b-8192",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it",
+        "groq/compound-mini",
+        "llama-3.3-70b-versatile",  # keep for backward compat
     ],
     "openai": [
         "gpt-4o",

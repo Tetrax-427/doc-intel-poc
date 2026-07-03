@@ -63,11 +63,24 @@ _MAX_STORED_TEXT_CHARS = 4000
 # ---------------------------------------------------------------------------
 
 _COST_PER_MILLION: dict[tuple[str, str], tuple[float, float]] = {
-    ("groq", "llama-3.3-70b-versatile"): (0.59, 0.79),
-    ("openai", "gpt-4o-mini"): (0.15, 0.60),
-    ("openai", "gpt-4o"): (2.50, 10.00),
-    ("anthropic", "claude-haiku-4-5-20251001"): (1.00, 5.00),
-    ("anthropic", "claude-sonnet-4-6"): (3.00, 15.00),
+    # (provider, model): (input_cost, output_cost) per million tokens
+
+    # Default model
+    ("groq", "qwen/qwen3-32b"):                              (0.29,  0.59),
+
+    # fallback chain
+    ("groq", "openai/gpt-oss-120b"):                         (0.15,  0.60),
+    ("groq", "groq/compound"):                               (0.15,  0.60),  # estimate — same tier as gpt-oss-120b
+    ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"):   (0.11,  0.34),
+    ("groq", "openai/gpt-oss-20b"):                          (0.075, 0.30),
+    ("groq", "llama-3.1-8b-instant"):                        (0.05,  0.08),
+    ("groq", "groq/compound-mini"):                          (0.075, 0.30),  # estimate — same tier as gpt-oss-20b
+
+    ("groq", "llama-3.3-70b-versatile"):                     (0.59,  0.79),
+    ("openai", "gpt-4o-mini"):                               (0.15,  0.60),
+    ("openai", "gpt-4o"):                                    (2.50, 10.00),
+    ("anthropic", "claude-haiku-4-5-20251001"):              (1.00,  5.00),
+    ("anthropic", "claude-sonnet-4-6"):                      (3.00, 15.00),
 }
 
 

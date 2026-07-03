@@ -13,7 +13,7 @@ Existing endpoints unchanged in behavior:
 """
 
 import os
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Header
 from pydantic import BaseModel, validator
 from core.auth import get_current_user_context, UserContext
 from core.rate_limiter import check_rate_limit
@@ -406,3 +406,54 @@ def delete_account(user: UserContext = Depends(get_current_user_context)):
             status_code=500,
             detail=f"Account deletion failed: {e}",
         )
+        
+class SystemTokenRequest(BaseModel):
+    email: str
+    password: str
+    expires_in_days: int = 30
+
+    @validator("expires_in_days")
+    def valid_expiry(cls, v):
+        if v < 1 or v > 365:
+            raise ValueError("expires_in_days must be between 1 and 365")
+        return v
+
+
+@router.post("/auth/system-token")
+def create_system_token(
+    req: SystemTokenRequest,
+    x_developer_key: str = Header(None, alias="X-Developer-Key"),
+):
+    """
+    Generate a session token for a system user.
+    Gated by X-Developer-Key header.
+    Use the returned refresh_token to get new access tokens when expired.
+    """
+    developer_key = os.getenv("DEVELOPER_API_KEY", "").strip()
+    if not developer_key:
+        raise HTTPException(status_code=503, detail="DEVELOPER_API_KEY not configured.")
+    if x_developer_key != developer_key:
+        raise HTTPException(status_code=401, detail="Invalid developer key.")
+
+    try:
+        sb  = _get_supabase()
+        res = sb.auth.sign_in_with_password({
+            "email":    req.email,
+            "password": req.password,
+        })
+
+        if not res.session:
+            raise HTTPException(status_code=401, detail="Invalid credentials.")
+
+        return {
+            "access_token":  res.session.access_token,
+            "refresh_token": res.session.refresh_token,
+            "token_type":    "bearer",
+            "user_id":       res.user.id,
+            "email":         res.user.email,
+            "note":          "Use POST /auth/refresh with refresh_token to renew when access_token expires.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Login failed: {e}")
