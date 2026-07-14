@@ -53,7 +53,7 @@ async def compare_documents(
     user=Depends(get_current_user),
 ):
     """
-    Compare two document versions and return a word-level, page/paragraph
+    Compare two document versions and return a word-level, page/chunk
     -mapped diff. v1 scope: PDF and DOCX only — no scanned PDFs (no vision
     fallback), no LlamaParse routing.
     """

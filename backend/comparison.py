@@ -7,9 +7,10 @@ parsed documents (PDF or DOCX for v1).
 ASSUMPTIONS — adjust these imports/field names to match your actual code,
 since this was written from the codebase guide, not the live source:
   - core.document.Document has a `.pages` attribute: List[DocumentPage]
-  - DocumentPage has `.text: str`, `.page_number: int`, and a NEW field
-    `.position_type: Literal["page", "paragraph"]` (see note in
-    core/document.py — needs adding for DOCX, which has no real pages)
+  - DocumentPage has `.text: str`, `.page_num: int`, and a NEW field
+    `.position_type: Literal["page", "chunk"]` (see note in
+    core/document.py — "chunk" because docx_parser.py splits DOCX into
+    arbitrary 3000-char blocks, not real pages or even real paragraphs)
   - llm.engine.call_llm(prompt: str, **kwargs) -> str exists and matches
     your existing signature
 
@@ -45,7 +46,7 @@ class DiffSegment:
 class ComparisonResult:
     segments: List[DiffSegment]
     stats: dict
-    position_type: str  # "page", "paragraph", or "mixed" if doc types differ
+    position_type: str  # "page", "chunk", or "mixed" if doc types differ
     summary: Optional[str] = None
 
 
@@ -68,11 +69,11 @@ def tokenize(text: str) -> List[str]:
 
 def flatten_document(document: Document) -> Tuple[str, List[Tuple[int, int]], str]:
     """
-    Concatenate all pages/paragraphs into one string. Returns:
+    Concatenate all pages/chunks into one string. Returns:
       - full_text: the concatenated text
       - offsets: list of (char_offset_start, position_number), ascending,
-        used to map a diff segment back to a page (PDF) or paragraph (DOCX)
-      - position_type: "page" or "paragraph"
+        used to map a diff segment back to a page (PDF) or chunk (DOCX)
+      - position_type: "page" or "chunk"
     """
     full_text = ""
     offsets: List[Tuple[int, int]] = []
@@ -80,14 +81,14 @@ def flatten_document(document: Document) -> Tuple[str, List[Tuple[int, int]], st
 
     for p in document.pages:
         position_type = getattr(p, "position_type", "page")
-        offsets.append((len(full_text), p.page_number))
+        offsets.append((len(full_text), p.page_num))
         full_text += p.text + "\n"
 
     return full_text, offsets, position_type
 
 
 def position_for_offset(char_offset: int, offsets: List[Tuple[int, int]]) -> Optional[int]:
-    """Binary search: which page/paragraph does this character offset fall on."""
+    """Binary search: which page/chunk does this character offset fall on."""
     if not offsets:
         return None
     starts = [o[0] for o in offsets]

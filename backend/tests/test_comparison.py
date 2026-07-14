@@ -16,7 +16,7 @@ from comparison import diff_documents, normalize, tokenize
 
 @dataclass
 class FakePage:
-    page_number: int
+    page_num: int
     text: str
     position_type: str = "page"
 
@@ -28,7 +28,7 @@ class FakeDocument:
 
 def make_doc(pages_text, position_type="page"):
     return FakeDocument(pages=[
-        FakePage(page_number=i + 1, text=t, position_type=position_type)
+        FakePage(page_num=i + 1, text=t, position_type=position_type)
         for i, t in enumerate(pages_text)
     ])
 
@@ -109,17 +109,17 @@ def test_page_numbers_are_tracked_across_pages():
     assert added_segments and added_segments[0].page_b == 2
 
 
-def test_docx_uses_paragraph_position_type():
-    doc_a = make_doc(["Para one.", "Para two."], position_type="paragraph")
-    doc_b = make_doc(["Para one.", "Para two changed."], position_type="paragraph")
+def test_docx_uses_chunk_position_type():
+    doc_a = make_doc(["Chunk one.", "Chunk two."], position_type="chunk")
+    doc_b = make_doc(["Chunk one.", "Chunk two changed."], position_type="chunk")
     result = diff_documents(doc_a, doc_b)
 
-    assert result.position_type == "paragraph"
+    assert result.position_type == "chunk"
 
 
 def test_mismatched_position_types_reported_as_mixed():
     doc_a = make_doc(["Page text."], position_type="page")
-    doc_b = make_doc(["Para text."], position_type="paragraph")
+    doc_b = make_doc(["Chunk text."], position_type="chunk")
     result = diff_documents(doc_a, doc_b)
 
     assert result.position_type == "mixed"

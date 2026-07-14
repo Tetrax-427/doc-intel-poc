@@ -101,6 +101,7 @@ class DocxParser(BaseParser):
                 entities=[],
                 word_count=len(chunk.split()),
                 ocr_confidence=1.0,
+                position_type="chunk",  # not a real page — see core/document.py note
             ))
 
         duration_ms = int((time.time() - start) * 1000)
