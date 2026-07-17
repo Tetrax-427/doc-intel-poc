@@ -4,9 +4,9 @@ backend/routers/comparison.py
 POST /compare — diff two document versions (DOCX / non-scanned PDF for v1).
 
 ASSUMPTIONS — adjust to match your actual code:
-  - core.auth.get_current_user / get_user_id are the standard auth deps
+  - core.auth.get_current_user_context / get_user_id are the standard auth deps
     used by your other routers (e.g. routers/documents.py)
-  - parsers.router.AutoRouter().route(file_path) -> parser instance,
+  - parsers.router.AutoRouter(config).route(file_path) -> parser instance,
     parser.parse(file_path, config) -> Document  (same as ingestion.py uses)
   - core.config.config is importable as in every other backend file
 
@@ -20,7 +20,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
-from core.auth import get_current_user, get_user_id
+from core.auth import get_current_user_context, get_user_id
 from core.config import config
 from core.logger import get_logger
 from parsers.router import AutoRouter
@@ -50,7 +50,7 @@ async def compare_documents(
     file_a: UploadFile = File(...),
     file_b: UploadFile = File(...),
     include_summary: bool = Form(default=False),
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_context),
 ):
     """
     Compare two document versions and return a word-level, page/chunk
@@ -69,7 +69,7 @@ async def compare_documents(
     path_b = _save_upload_to_temp(file_b)
 
     try:
-        auto_router = AutoRouter()
+        auto_router = AutoRouter(config)
 
         parser_a = auto_router.route(path_a)
         parser_b = auto_router.route(path_b)
