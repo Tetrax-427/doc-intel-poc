@@ -222,7 +222,9 @@ class DocumentPage:
     ocr_confidence: float
     reading_order: list = field(default_factory=list)
     reading_order_bboxes: list = field(default_factory=list)
-
+    position_type: str = "page"
+    
+    
     def to_dict(self) -> dict:
         return {
             "page_num":             self.page_num,
