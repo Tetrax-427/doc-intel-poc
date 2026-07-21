@@ -1,49 +1,50 @@
 """
 api_client.py
 --------------
-Thin HTTP wrapper around the DocIntel FastAPI backend.
+HTTP wrapper around the DocIntel FastAPI backend, built on httpx (supports
+both sync and async cleanly, so one library covers everything instead of
+mixing `requests` + `httpx`).
 
-CONFIRMED CONTRACTS (verified against live responses, not guessed):
+CONFIRMED CONTRACTS (verified against real backend code/responses):
 
-POST {base_url}/upload
-    multipart file upload -> {"document_id": ..., ...}
+POST /auth/login    {"email","password"} -> {"access_token","refresh_token","token_type","user":{"id","email"}}
+POST /auth/refresh  {"refresh_token"}     -> {"access_token","refresh_token","token_type"}
+POST /auth/logout   (bearer token)        -> {"status":"logged_out"}
+GET  /auth/me       (bearer token)        -> {"user_id","email",...}
+POST /auth/reset-password  {"access_token","new_password"} -> {"status":"password_updated"}
+    NOTE: there is no dedicated "change password with old password" endpoint.
+    We compose it: call /auth/login with the OLD password first (this both
+    verifies it's correct and yields a fresh access_token), then call
+    /auth/reset-password with that access_token + the new password.
 
-POST {base_url}/extract/nl   (schema preview mode)
+POST /upload   (multipart file, bearer token)
+    SYNCHRONOUS - fully processes (parse, classify, summarize) before
+    returning. No task_id/polling involved.
+    -> {"document_id": ..., ...}
+
+POST /extract/nl   (schema preview mode)
     request:  {"document_id": "", "instruction": "...", "preview_only": true}
     response: {"schema": {"field_name": "field description", ...}, "extracted": null, "validation": null}
-    document_id is unused when preview_only=true, so we always send "".
 
-POST {base_url}/extract
-    request:  {"document_id": "...", "fields": {"field_name": "field description", ...}}
-              (no per-field type, no doc_type - the backend doesn't accept either)
-    response: {
-        "extracted": {"field_name": {"value": ..., "bbox": ...}, ...},
-        "validation": {...},          # not used by this app
-        "business_validation": {...}, # not used by this app
-        "extraction_id": "..."
-    }
+POST /extract
+    request:  {"document_id": "...", "fields": {"field_name": "description", ...}}
+    response: {"extracted": {"field_name": {"value": ..., "bbox": ...}, ...}, "validation": {...}, ...}
+    fields is a flat dict of {name: description} - no per-field type, no doc_type.
 
-POST {base_url}/extract/batch   (defined, not currently used by the UI - see README)
-    request:  {"document_ids": [...], "fields": {"field_name": "description", ...}}
+GET /templates -> {"templates": [...]}  (list also tolerated)
+GET /health    -> 200 OK
 
-GET {base_url}/templates -> {"templates": [...]}  (list also tolerated)
-GET {base_url}/health    -> 200 OK
-
-AUTH: JWT only, via Authorization: Bearer <token>. Token comes from
-config_store.get_auth_token() (env var), never entered in the UI.
-
-All functions raise `ApiError` with a readable message on failure so the
-Streamlit layer can surface it instead of crashing.
+All sync methods raise `ApiError` with a readable message on failure.
 """
-import requests
+import httpx
 
-# Per-operation default timeouts (seconds). "light" calls (health, templates)
-# should fail fast; upload/extract can take a while for real documents.
-DEFAULT_TIMEOUTS = {
-    "light": 30,
-    "upload": 180,
-    "extract": 180,
-    "batch": 300,
+# Per-operation default timeouts (seconds), used as a floor even if the
+# configured timeout is lower - health/auth calls should still fail fast,
+# but never wait less than these for the heavier operations.
+MIN_TIMEOUTS = {
+    "light": 10,
+    "upload": 60,
+    "extract": 60,
 }
 
 
@@ -69,59 +70,96 @@ def extract_value(field_value):
 
 
 class ApiError(Exception):
-    pass
+    def __init__(self, message, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _raise_for_response(resp: httpx.Response, method: str, path: str):
+    if resp.status_code < 400:
+        return
+    detail = resp.text
+    try:
+        detail = resp.json().get("detail", resp.text)
+    except Exception:
+        pass
+    raise ApiError(f"{method} {path} failed [{resp.status_code}]: {detail}", status_code=resp.status_code)
+
+
+def _parse_json(resp: httpx.Response) -> dict:
+    if not resp.content:
+        return {}
+    try:
+        return resp.json()
+    except ValueError:
+        return {"raw": resp.text}
 
 
 class DocIntelClient:
-    def __init__(self, base_url: str, jwt_token: str = "", timeout: int | None = None):
-        self.base_url = base_url.rstrip("/")
-        self.jwt_token = jwt_token.strip()
-        # If the caller passes an explicit timeout (e.g. from the sidebar),
-        # it overrides the per-operation defaults for every call.
-        self.timeout_override = timeout
+    """Synchronous client for auth, health, templates, and schema preview -
+    all quick, one-off calls that don't need to run concurrently."""
 
-    def _headers(self, json_mode: bool = True):
+    def __init__(self, base_url: str, access_token: str = "", timeout: int | None = None):
+        self.base_url = base_url.rstrip("/")
+        self.access_token = access_token.strip()
+        self.timeout = timeout or 60
+
+    def _headers(self, json_mode: bool = True, auth: bool = True):
         headers = {}
         if json_mode:
             headers["Content-Type"] = "application/json"
-        if self.jwt_token:
-            headers["Authorization"] = f"Bearer {self.jwt_token}"
+        if auth and self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
         return headers
 
     def _request(self, method: str, path: str, op: str = "light", **kwargs):
         url = f"{self.base_url}{path}"
-        timeout = self.timeout_override or DEFAULT_TIMEOUTS.get(op, 60)
+        timeout = max(self.timeout, MIN_TIMEOUTS.get(op, 10))
         try:
-            resp = requests.request(method, url, timeout=timeout, **kwargs)
-        except requests.exceptions.Timeout:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.request(method, url, **kwargs)
+        except httpx.TimeoutException:
             raise ApiError(
-                f"{method} {path} timed out after {timeout}s. The backend may still be "
-                f"working (large file, slow parser, or a slow LLM call) - it's often still "
-                f"running server-side even though this request gave up. Try increasing the "
-                f"timeout in the sidebar's Advanced settings, or check your backend logs to "
-                f"see if it actually completed."
+                f"{method} {path} timed out after {timeout}s. The backend may still be working "
+                f"(large file, slow parser, or a slow LLM call) - increase DOCINTEL_TIMEOUT if this "
+                f"keeps happening, or check your backend logs to see if it actually completed."
             )
-        except requests.exceptions.RequestException as e:
+        except httpx.HTTPError as e:
             raise ApiError(f"Could not reach {url}: {e}")
 
-        if not resp.ok:
-            detail = resp.text
-            try:
-                detail = resp.json().get("detail", resp.text)
-            except Exception:
-                pass
-            raise ApiError(f"{method} {path} failed [{resp.status_code}]: {detail}")
+        _raise_for_response(resp, method, path)
+        return _parse_json(resp)
 
-        if resp.content:
-            try:
-                return resp.json()
-            except ValueError:
-                return {"raw": resp.text}
-        return {}
+    # ---- Auth ----
+    def login(self, email: str, password: str) -> dict:
+        return self._request(
+            "POST", "/auth/login", op="light",
+            json={"email": email, "password": password}, headers=self._headers(auth=False),
+        )
 
+    def refresh(self, refresh_token: str) -> dict:
+        return self._request(
+            "POST", "/auth/refresh", op="light",
+            json={"refresh_token": refresh_token}, headers=self._headers(auth=False),
+        )
+
+    def logout(self) -> dict:
+        return self._request("POST", "/auth/logout", op="light", headers=self._headers(json_mode=False))
+
+    def me(self) -> dict:
+        return self._request("GET", "/auth/me", op="light", headers=self._headers(json_mode=False))
+
+    def reset_password(self, access_token: str, new_password: str) -> dict:
+        return self._request(
+            "POST", "/auth/reset-password", op="light",
+            json={"access_token": access_token, "new_password": new_password},
+            headers=self._headers(auth=False),
+        )
+
+    # ---- Health / templates / schema preview ----
     def health(self) -> bool:
         try:
-            self._request("GET", "/health", op="light", headers=self._headers(json_mode=False))
+            self._request("GET", "/health", op="light", headers=self._headers(json_mode=False, auth=False))
             return True
         except ApiError:
             return False
@@ -132,25 +170,56 @@ class DocIntelClient:
             return data
         return data.get("templates", [])
 
-    def upload_document(self, file_bytes: bytes, filename: str) -> dict:
-        files = {"file": (filename, file_bytes)}
-        headers = self._headers(json_mode=False)
-        return self._request("POST", "/upload", op="upload", files=files, headers=headers)
-
     def preview_nl_schema(self, instruction: str) -> dict:
-        """
-        Turns a natural-language instruction into a field schema WITHOUT
-        needing any uploaded document. Returns the raw {field_name:
-        description} dict from `response["schema"]`.
-        """
         payload = {"document_id": "", "instruction": instruction, "preview_only": True}
         result = self._request("POST", "/extract/nl", op="light", json=payload, headers=self._headers())
         return result.get("schema", {})
 
-    def extract_fields(self, document_id: str, fields: list) -> dict:
-        payload = {"document_id": document_id, "fields": fields_to_payload(fields)}
-        return self._request("POST", "/extract", op="extract", json=payload, headers=self._headers())
 
-    def extract_batch(self, document_ids: list, fields: list) -> dict:
-        payload = {"document_ids": document_ids, "fields": fields_to_payload(fields)}
-        return self._request("POST", "/extract/batch", op="batch", json=payload, headers=self._headers())
+class AsyncDocIntelClient:
+    """
+    Async client used only by the parallel upload+extract pipeline
+    (see batch_runner.py). Kept separate from DocIntelClient so the sync
+    call sites (login, schema preview, etc.) stay simple.
+    """
+
+    def __init__(self, base_url: str, access_token: str, timeout: int):
+        self.base_url = base_url.rstrip("/")
+        self.access_token = access_token.strip()
+        self.timeout = timeout
+
+    def _headers(self, json_mode: bool = True):
+        headers = {}
+        if json_mode:
+            headers["Content-Type"] = "application/json"
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        return headers
+
+    async def upload_document(self, client: httpx.AsyncClient, file_bytes: bytes, filename: str) -> dict:
+        url = f"{self.base_url}/upload"
+        timeout = max(self.timeout, MIN_TIMEOUTS["upload"])
+        try:
+            resp = await client.post(
+                url, files={"file": (filename, file_bytes)},
+                headers=self._headers(json_mode=False), timeout=timeout,
+            )
+        except httpx.TimeoutException:
+            raise ApiError(f"Upload of {filename} timed out after {timeout}s.")
+        except httpx.HTTPError as e:
+            raise ApiError(f"Could not reach {url}: {e}")
+        _raise_for_response(resp, "POST", "/upload")
+        return _parse_json(resp)
+
+    async def extract_fields(self, client: httpx.AsyncClient, document_id: str, fields: list) -> dict:
+        url = f"{self.base_url}/extract"
+        timeout = max(self.timeout, MIN_TIMEOUTS["extract"])
+        payload = {"document_id": document_id, "fields": fields_to_payload(fields)}
+        try:
+            resp = await client.post(url, json=payload, headers=self._headers(), timeout=timeout)
+        except httpx.TimeoutException:
+            raise ApiError(f"Extraction for document {document_id} timed out after {timeout}s.")
+        except httpx.HTTPError as e:
+            raise ApiError(f"Could not reach {url}: {e}")
+        _raise_for_response(resp, "POST", "/extract")
+        return _parse_json(resp)

@@ -5,8 +5,9 @@ A standalone Streamlit app that talks to an existing DocIntel FastAPI
 backend to run repeatable, schema-based extraction over batches of
 documents and collect the results into downloadable tables.
 
-Auth: set DOCINTEL_JWT_TOKEN as an environment variable before running.
-There is no in-app way to enter or view it - see config_store.py.
+Auth: interactive sign-in only (POST /auth/login). Tokens live in
+st.session_state for the duration of the browser session - nothing is
+persisted to disk, and there is no env-var token fallback.
 
 Run with:
     streamlit run app.py
@@ -17,8 +18,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from api_client import ApiError, DocIntelClient, extract_value
-from config_store import load_config, get_auth_token
+from api_client import ApiError, DocIntelClient
+from batch_runner import run_batch
+from config_store import get_base_url, get_timeout, get_max_parallel_uploads
 from results_store import list_tables, load_table, save_table, delete_table, to_excel_bytes
 from schema_store import list_schema_names, get_schema, save_schema, delete_schema
 
@@ -30,33 +32,127 @@ st.set_page_config(page_title="DocIntel Extraction Helper", layout="wide")
 # ----------------------------------------------------------------------
 # Session state
 # ----------------------------------------------------------------------
-if "manual_fields" not in st.session_state:
-    st.session_state.manual_fields = [dict(EMPTY_FIELD_ROW)]
-if "last_run_df" not in st.session_state:
-    st.session_state.last_run_df = None
-if "last_run_schema_name" not in st.session_state:
-    st.session_state.last_run_schema_name = None
-if "nl_previewed_instruction" not in st.session_state:
-    st.session_state.nl_previewed_instruction = None
-if "nl_preview_fields" not in st.session_state:
-    st.session_state.nl_preview_fields = []
+for key, default in [
+    ("access_token", None),
+    ("refresh_token", None),
+    ("user_email", None),
+    ("manual_fields", [dict(EMPTY_FIELD_ROW)]),
+    ("last_run_df", None),
+    ("last_run_schema_name", None),
+    ("nl_previewed_instruction", None),
+    ("nl_preview_fields", []),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 def get_client() -> DocIntelClient:
-    # Base URL and timeout come straight from env vars (DOCINTEL_BASE_URL,
-    # DOCINTEL_TIMEOUT) / .streamlit/secrets.toml - no UI for either.
-    cfg = load_config()
-    return DocIntelClient(cfg["base_url"], jwt_token=get_auth_token(), timeout=cfg.get("timeout") or None)
+    return DocIntelClient(get_base_url(), access_token=st.session_state.access_token or "", timeout=get_timeout())
 
 
-st.title("📄 DocIntel Extraction Helper")
-st.caption("Define an extraction schema once, run it over batches of documents, and build up a results table.")
+def _clear_session():
+    for k in ("access_token", "refresh_token", "user_email"):
+        st.session_state[k] = None
 
-if not get_auth_token():
-    st.warning(
-        "DOCINTEL_JWT_TOKEN is not set in the environment (.env or shell export). "
-        "Requests will fail auth until it's set."
-    )
+
+def ensure_valid_session() -> bool:
+    """Confirms the current token still works; tries one silent refresh if not."""
+    client = get_client()
+    try:
+        client.me()
+        return True
+    except ApiError as e:
+        if e.status_code == 401 and st.session_state.refresh_token:
+            try:
+                refreshed = client.refresh(st.session_state.refresh_token)
+                st.session_state.access_token = refreshed["access_token"]
+                st.session_state.refresh_token = refreshed.get("refresh_token", st.session_state.refresh_token)
+                return True
+            except ApiError:
+                pass
+        _clear_session()
+        return False
+
+
+def render_login():
+    st.title("📄 DocIntel Extraction Helper")
+    st.subheader("Sign in")
+    with st.form("login_form"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+    if submitted:
+        if not email.strip() or not password:
+            st.error("Enter both email and password.")
+        else:
+            try:
+                client = DocIntelClient(get_base_url(), timeout=get_timeout())
+                result = client.login(email.strip(), password)
+                st.session_state.access_token = result["access_token"]
+                st.session_state.refresh_token = result.get("refresh_token")
+                st.session_state.user_email = result.get("user", {}).get("email", email.strip())
+                st.rerun()
+            except ApiError as e:
+                st.error(f"Sign in failed: {e}")
+
+
+# ----------------------------------------------------------------------
+# Auth gate
+# ----------------------------------------------------------------------
+if not st.session_state.access_token:
+    render_login()
+    st.stop()
+
+if not ensure_valid_session():
+    st.warning("Your session expired. Please sign in again.")
+    render_login()
+    st.stop()
+
+# ----------------------------------------------------------------------
+# Top bar - account controls (no sidebar)
+# ----------------------------------------------------------------------
+top_l, top_r = st.columns([4, 1])
+with top_l:
+    st.title("📄 DocIntel Extraction Helper")
+    st.caption("Define an extraction schema once, run it over batches of documents, and build up a results table.")
+with top_r:
+    st.write("")
+    st.caption(f"Signed in as **{st.session_state.user_email}**")
+    if st.button("Sign out", use_container_width=True):
+        try:
+            get_client().logout()
+        except ApiError:
+            pass  # best-effort - clear local session regardless
+        _clear_session()
+        st.rerun()
+
+with st.expander("🔒 Change password"):
+    with st.form("change_password_form"):
+        old_password = st.text_input("Current password", type="password")
+        new_password = st.text_input("New password", type="password")
+        confirm_password = st.text_input("Confirm new password", type="password")
+        change_submitted = st.form_submit_button("Change password")
+    if change_submitted:
+        if not old_password or not new_password:
+            st.error("Fill in both current and new password.")
+        elif new_password != confirm_password:
+            st.error("New password and confirmation don't match.")
+        elif len(new_password) < 8:
+            st.error("New password must be at least 8 characters.")
+        else:
+            try:
+                verify_client = DocIntelClient(get_base_url(), timeout=get_timeout())
+                verify_result = verify_client.login(st.session_state.user_email, old_password)
+                verify_client.reset_password(verify_result["access_token"], new_password)
+                # That login was already a fresh valid session - keep using it.
+                st.session_state.access_token = verify_result["access_token"]
+                st.session_state.refresh_token = verify_result.get("refresh_token")
+                st.success("Password changed.")
+            except ApiError as e:
+                if e.status_code == 401:
+                    st.error("Current password is incorrect.")
+                else:
+                    st.error(f"Could not change password: {e}")
 
 tab_schema, tab_run, tab_tables = st.tabs(["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables"])
 
@@ -177,7 +273,7 @@ with tab_schema:
                     st.rerun()
 
 # ----------------------------------------------------------------------
-# TAB 2 - Run extraction
+# TAB 2 - Run extraction (parallel, pipelined upload -> extract per file)
 # ----------------------------------------------------------------------
 with tab_run:
     schema_names = list_schema_names()
@@ -223,34 +319,29 @@ with tab_run:
                 table_name = f"{chosen_schema_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
                 dest_mode = "New table"
 
+        max_parallel = get_max_parallel_uploads()
+        st.caption(f"Running up to {max_parallel} file(s) at a time (set via DOCINTEL_MAX_PARALLEL_UPLOADS).")
+
         run_disabled = not files_to_process
         if st.button("▶️ Run extraction", type="primary", disabled=run_disabled):
-            client = get_client()
-            rows = []
             progress = st.progress(0.0)
             status = st.empty()
-            errors = []
 
-            for i, (fname, fbytes) in enumerate(files_to_process, start=1):
-                status.write(f"Processing {fname} ({i}/{len(files_to_process)})...")
-                try:
-                    up = client.upload_document(fbytes, fname)
-                    doc_id = up.get("document_id")
+            def _on_progress(completed, total, fname, ok):
+                progress.progress(completed / total)
+                mark = "✅" if ok else "❌"
+                status.write(f"{mark} {fname} ({completed}/{total})")
 
-                    result = client.extract_fields(doc_id, schema["fields"])
-                    extracted = result.get("extracted", {})
-
-                    row = {"file_name": fname}
-                    if isinstance(extracted, dict):
-                        for field_name, field_value in extracted.items():
-                            row[field_name] = extract_value(field_value)
-                    else:
-                        row["extracted_raw"] = str(extracted)
-                    rows.append(row)
-                except ApiError as e:
-                    errors.append(f"{fname}: {e}")
-                    rows.append({"file_name": fname, "error": str(e)})
-                progress.progress(i / len(files_to_process))
+            with st.spinner(f"Processing {len(files_to_process)} file(s), up to {max_parallel} at a time..."):
+                rows, errors = run_batch(
+                    base_url=get_base_url(),
+                    access_token=st.session_state.access_token,
+                    timeout=get_timeout(),
+                    files=files_to_process,
+                    fields=schema["fields"],
+                    max_parallel=max_parallel,
+                    progress_cb=_on_progress,
+                )
 
             status.write("Done.")
             df = pd.DataFrame(rows)
