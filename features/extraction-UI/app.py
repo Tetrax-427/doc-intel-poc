@@ -320,7 +320,7 @@ with tab_run:
                 dest_mode = "New table"
 
         max_parallel = get_max_parallel_uploads()
-        st.caption(f"Running up to {max_parallel} file(s) at a time (set via DOCINTEL_MAX_PARALLEL_UPLOADS).")
+        # st.caption(f"Running up to {max_parallel} file(s) at a time (set via DOCINTEL_MAX_PARALLEL_UPLOADS).")
 
         run_disabled = not files_to_process
         if st.button("▶️ Run extraction", type="primary", disabled=run_disabled):
@@ -332,7 +332,7 @@ with tab_run:
                 mark = "✅" if ok else "❌"
                 status.write(f"{mark} {fname} ({completed}/{total})")
 
-            with st.spinner(f"Processing {len(files_to_process)} file(s), up to {max_parallel} at a time..."):
+            with st.spinner(f"Processing {len(files_to_process)} file(s)...."):
                 rows, errors = run_batch(
                     base_url=get_base_url(),
                     access_token=st.session_state.access_token,
