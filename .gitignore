@@ -27,3 +27,11 @@ desktop.ini
 
 # Logs
 *.log
+
+.venv/
+venv/
+**/[._]venv/
+
+**/.xlsx
+*.csv
+**data/
