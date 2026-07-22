@@ -1,5 +1,23 @@
+"""
+schemas/validator.py — Field-level confidence scoring, format validation, and
+deterministic verification for nested/dynamic extraction schemas.
+
+"""
+
 import re
-from datetime import datetime
+from datetime import date, datetime
+
+from core.logger import get_logger
+
+logger = get_logger("schemas.validator")
+
+# Date formats we can parse for verification purposes — broader than
+# validate_date()'s formats below since extracted date strings vary a lot
+# more than form-filled dates (e.g. "2019-06" year-month only).
+_PARSE_FORMATS = [
+    "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+    "%B %d, %Y", "%d %B %Y", "%Y-%m", "%m/%Y", "%B %Y", "%Y",
+]
 
 
 # --- Field type validators ---
@@ -68,6 +86,48 @@ def detect_field_type(field_name: str) -> str:
     return "text"
 
 
+# --- Nested-value confidence helpers ---
+# for schemas.dynamic.SchemaSpec fields whose values are lists of objects
+# (e.g. past_companies) or single nested objects, rather than flat scalars/
+# lists of strings. score_confidence() below dispatches into these by shape.
+
+def score_nested_list_confidence(items: list) -> float:
+    """
+    Confidence for a list-of-objects field (e.g. past_companies: [{...}, {...}]):
+    the average non-null-field ratio across all items. An item missing half its
+    sub-fields drags the field's overall confidence down proportionally, rather
+    than the list being scored as "non-empty = 0.9" regardless of content.
+    Empty list -> 0.0 (same convention as an empty flat list).
+    """
+    if not items:
+        return 0.0
+    ratios = []
+    for item in items:
+        if not isinstance(item, dict) or not item:
+            ratios.append(0.0)
+            continue
+        # Ignore the injected _verification block itself when scoring
+        # completeness — it's derived metadata, not an extracted field.
+        real_fields = {k: v for k, v in item.items() if k != "_verification"}
+        if not real_fields:
+            ratios.append(0.0)
+            continue
+        non_null = sum(1 for v in real_fields.values() if v not in (None, "", []))
+        ratios.append(non_null / len(real_fields))
+    return round(sum(ratios) / len(ratios), 2) if ratios else 0.0
+
+
+def score_nested_object_confidence(value: dict) -> float:
+    """Confidence for a single nested-object field: ratio of its non-null sub-fields."""
+    if not value:
+        return 0.0
+    real_fields = {k: v for k, v in value.items() if k != "_verification"}
+    if not real_fields:
+        return 0.0
+    non_null = sum(1 for v in real_fields.values() if v not in (None, "", []))
+    return round(non_null / len(real_fields), 2) if real_fields else 0.0
+
+
 # --- Confidence scorer ---
 
 def score_confidence(value, field_name: str, field_type: str) -> float:
@@ -75,7 +135,11 @@ def score_confidence(value, field_name: str, field_type: str) -> float:
     if value is None:
         return 0.0
     if isinstance(value, list):
+        if value and isinstance(value[0], dict):
+            return score_nested_list_confidence(value)
         return 0.9 if len(value) > 0 else 0.0
+    if isinstance(value, dict):
+        return score_nested_object_confidence(value)
     if isinstance(value, (int, float)):
         return 0.95
 
@@ -125,6 +189,13 @@ def validate_extraction(extracted: dict, fields_schema: dict) -> dict:
     """
     Takes extracted fields and original schema.
     Returns enriched result with confidence scores and validation status per field.
+
+    Works unchanged for nested/dynamic schema fields (schemas.dynamic.SchemaSpec) —
+    fields_schema here only needs {name: description} at the TOP level, which is
+    what retrieval.extract_dynamic_fields() passes. Per-field confidence for
+    list/object values is handled inside score_confidence() above; format
+    validation (email/phone/date/amount/url) only ever applies to flat string
+    values now — nested values skip straight to their shape-based confidence.
     """
     results = {}
     overall_scores = []
@@ -138,7 +209,7 @@ def validate_extraction(extracted: dict, fields_schema: dict) -> dict:
 
         # Run format validation
         validation_note = ""
-        if value and field_type in ["email", "phone", "date", "amount", "url"]:
+        if value and isinstance(value, str) and field_type in ["email", "phone", "date", "amount", "url"]:
             validators = {
                 "email": validate_email,
                 "phone": validate_phone,
@@ -170,3 +241,192 @@ def validate_extraction(extracted: dict, fields_schema: dict) -> dict:
         "found_count": sum(1 for r in results.values() if r["status"] == "FOUND"),
         "total_count": len(results)
     }
+
+
+# ---------------------------------------------------------------------------
+# NEW — date-derived verification for nested list fields
+# ---------------------------------------------------------------------------
+#
+# Called by retrieval.extract_dynamic_fields() after the LLM extraction call
+# returns. This is deterministic Python, not an LLM call — the model never
+# computes durations itself (prompts.EXTRACTION_SYSTEM_NESTED forbids it);
+# these functions compute them from the extracted start/end dates and use
+# that to VERIFY any stated duration the LLM did pull from the text, rather
+# than replacing it.
+
+def _parse_date_loose(value: str | None) -> date | None:
+    """Best-effort parse of an extracted date string against _PARSE_FORMATS."""
+    if not value or not str(value).strip():
+        return None
+    cleaned = str(value).strip()
+    for fmt in _PARSE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def compute_duration(start_date: str | None, end_date: str | None) -> str | None:
+    """
+    Compute a human-readable duration ("1y 9m") from two extracted date
+    strings. end_date=None (or unparseable, e.g. "Present"/"Current") is
+    treated as "ongoing" and computed against today.
+
+    Args:
+        start_date: Raw extracted start date string, any _PARSE_FORMATS shape.
+        end_date:   Raw extracted end date string, or None/unparseable for
+                    an ongoing/current role.
+
+    Returns:
+        "Xy Ym" string, or None if start_date itself couldn't be parsed
+        (nothing to compute from).
+    """
+    start = _parse_date_loose(start_date)
+    if start is None:
+        return None
+
+    end = _parse_date_loose(end_date) if end_date else None
+    if end is None:
+        end = date.today()
+
+    months = (end.year - start.year) * 12 + (end.month - start.month)
+    if end.day < start.day:
+        months -= 1
+    months = max(months, 0)
+
+    years, remaining_months = divmod(months, 12)
+    parts = []
+    if years:
+        parts.append(f"{years}y")
+    if remaining_months or not years:
+        parts.append(f"{remaining_months}m")
+    return " ".join(parts)
+
+
+def detect_verifiable_pairs(item_fields: list) -> dict:
+    """
+    Inspect a list-item's sub-field specs (schemas.dynamic.FieldSpec objects,
+    or plain dicts with the same shape) to find a start/end date pair and
+    (optionally) a stated-duration field, by naming convention — this is what
+    makes verification schema-agnostic instead of hardcoded to "past_companies".
+
+    Args:
+        item_fields: The `properties` list of a type="list" FieldSpec — i.e.
+                     the sub-field specs describing one item's shape.
+
+    Returns:
+        {"start_key": str, "end_key": str, "duration_key": str | None}
+        or {} if no start/end date pair is found (verification is skipped
+        for that field by the orchestrator below).
+    """
+    def _name(f):
+        return (f.name if hasattr(f, "name") else f.get("name", "")).lower()
+
+    def _type(f):
+        return (f.type if hasattr(f, "type") else f.get("type", "")).lower()
+
+    def _orig_name(f):
+        return f.name if hasattr(f, "name") else f.get("name", "")
+
+    start_key, end_key, duration_key = None, None, None
+
+    for f in item_fields:
+        name, ftype = _name(f), _type(f)
+        is_date_like = ftype == "date" or any(k in name for k in ("date", "dob"))
+
+        if is_date_like and any(k in name for k in ("start", "from", "begin", "joined", "joining")):
+            start_key = _orig_name(f)
+        elif is_date_like and any(k in name for k in ("end", "to", "till", "until", "left", "relieving")):
+            end_key = _orig_name(f)
+        elif any(k in name for k in ("duration", "total_time", "tenure", "time_spent")):
+            duration_key = _orig_name(f)
+
+    if not (start_key and end_key):
+        return {}
+    return {"start_key": start_key, "end_key": end_key, "duration_key": duration_key}
+
+
+def verify_item(item: dict, pair: dict) -> dict:
+    """
+    Build the _verification block for a single extracted list item.
+
+    Args:
+        item: One extracted item dict (e.g. one past_companies entry).
+        pair: Output of detect_verifiable_pairs() for this list's item shape.
+
+    Returns:
+        {
+          "start_date": <as extracted, for traceability>,
+          "end_date":   <as extracted, or None>,
+          "total_time_computed": "1y 9m" | None,
+          "total_time_stated":   <LLM-extracted stated duration> | None,
+          "match": true | false | None   # None when there's nothing stated to compare against
+        }
+    """
+    start_val = item.get(pair["start_key"])
+    end_val = item.get(pair["end_key"])
+    computed = compute_duration(start_val, end_val)
+
+    stated = item.get(pair["duration_key"]) if pair.get("duration_key") else None
+
+    match = None
+    if stated and computed:
+        # Loose comparison — normalise whitespace/case, since stated formats
+        # vary ("1 yr 9 months" vs "1y 9m"). Exact-string match is the only
+        # thing we can safely assert without re-parsing free-text durations;
+        # anything looser risks false "match" confirmations.
+        match = stated.strip().lower().replace(" ", "") == computed.strip().lower().replace(" ", "")
+
+    return {
+        "start_date": start_val,
+        "end_date": end_val,
+        "total_time_computed": computed,
+        "total_time_stated": stated,
+        "match": match,
+    }
+
+
+def verify_dynamic_extraction(extracted: dict, spec) -> dict:
+    """
+    Orchestrator — walks a SchemaSpec's fields, finds every type="list" field
+    with a verifiable start/end date pair, and attaches a `_verification`
+    block to each item in that list within `extracted`. Called once, right
+    after the LLM extraction call returns and before response wrapping.
+
+    Args:
+        extracted: The raw `.model_dump()` dict from the dynamic extraction
+                   model (schemas.dynamic.spec_to_model result instance).
+        spec:      The schemas.dynamic.SchemaSpec used for this extraction.
+
+    Returns:
+        The same `extracted` dict, mutated in place, with `_verification`
+        added to each item of every verifiable list field. Fields with no
+        detectable start/end date pair are left untouched — this is a
+        best-effort enrichment, never a hard requirement.
+    """
+    for field in spec.fields:
+        if field.type != "list" or not field.properties:
+            continue
+
+        pair = detect_verifiable_pairs(field.properties)
+        if not pair:
+            continue
+
+        items = extracted.get(field.name)
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if isinstance(item, dict):
+                item["_verification"] = verify_item(item, pair)
+
+        logger.info(
+            "Attached date verification",
+            field=field.name,
+            item_count=len(items),
+            start_key=pair["start_key"],
+            end_key=pair["end_key"],
+        )
+
+    return extracted
