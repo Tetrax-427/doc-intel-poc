@@ -13,10 +13,10 @@ The old combined QA_PROMPT / QA_PROMPT_MULTI / etc. constants are kept as
 aliases below to avoid breaking any code outside retrieval.py that still
 imports them — they will be removed in a future cleanup pass.
 
-Dynamic/complex schema extraction:
-  - SCHEMA_GEN_SYSTEM — used by schemas.dynamic.generate_schema_spec()
+CHANGED in this phase (dynamic/complex schema extraction):
+  - Added SCHEMA_GEN_SYSTEM — used by schemas.dynamic.generate_schema_spec()
     to turn a free-text description into a recursive SchemaSpec.
-  - EXTRACTION_SYSTEM_NESTED — used by retrieval.extract_dynamic_fields()
+  - Added EXTRACTION_SYSTEM_NESTED — used by retrieval.extract_dynamic_fields()
     for extraction against nested/dynamic schemas (lists of objects, nested
     objects). EXTRACTION_SYSTEM (flat) is unchanged and still used by
     retrieval.extract_fields() for template/flat-dict extraction.
@@ -152,6 +152,15 @@ EXTRACTION_SYSTEM_NESTED = (
     "do not merge, deduplicate, or summarise multiple occurrences into one entry\n"
     "- For nested object or list-item fields, use each sub-field's description to "
     "determine which entity's data belongs in which sub-field\n"
+    "- When the document states multiple distinct pieces of information together in "
+    "one phrase (e.g. a comma-separated or slash-separated value), split them across "
+    "their respective declared fields according to each field's description — never "
+    "put an entire compound phrase into one field while leaving a sibling field null "
+    "if part of that phrase belongs there.\n"
+    "  Example: fields 'course' (\"Course or degree pursued\") and 'branch' "
+    "(\"Specialization or branch of study\") are declared separately, and the "
+    "document says \"M.Tech, CSE\" — extract course=\"M.Tech\" and branch=\"CSE\", "
+    "NOT course=\"M.Tech, CSE\" with branch left null.\n"
     "- If a field or sub-field is not found, use null (or an empty list for list fields) — "
     "never omit a field entirely\n"
     "- Do NOT guess, infer, or compute values. In particular, never calculate durations, "

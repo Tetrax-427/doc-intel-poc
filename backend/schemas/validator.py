@@ -459,10 +459,22 @@ def detect_verifiable_pairs(item_fields: list) -> dict:
 
 def verify_item(item: dict, pair: dict) -> dict:
     """
-    Build the _verification block for a single extracted list item.
+    Build the _verification block for a single extracted list item, and
+    (NEW) backfill the stated-duration field itself when it's null and a
+    duration was successfully computed from start/end dates.
+
+    Backfilling is deliberately narrow: it only fires when the LLM found
+    nothing to extract for that field (null/empty) — it never overwrites a
+    stated value, even one that disagrees with the computed one (that case
+    is surfaced via "match": false instead, for a human/rule to judge).
+    The `"backfilled": true` flag in the returned dict is what distinguishes
+    a filled-in computed value from a genuinely extracted one — callers that
+    care about provenance (e.g. an audit trail) should check it rather than
+    assuming every non-null duration field came from the document.
 
     Args:
         item: One extracted item dict (e.g. one past_companies entry).
+              Mutated in place: item[pair["duration_key"]] may be set.
         pair: Output of detect_verifiable_pairs() for this list's item shape.
 
     Returns:
@@ -470,15 +482,19 @@ def verify_item(item: dict, pair: dict) -> dict:
           "start_date": <as extracted, for traceability>,
           "end_date":   <as extracted, or None>,
           "total_time_computed": "1y 9m" | None,
-          "total_time_stated":   <LLM-extracted stated duration> | None,
-          "match": true | false | None   # None when there's nothing stated to compare against
+          "total_time_stated":   <LLM-extracted stated duration, BEFORE any
+                                  backfill — None if nothing was stated>,
+          "match": true | false | None,  # None when there's nothing stated to compare against
+          "backfilled": true | false,    # True if the duration field was empty
+                                         # and got filled with the computed value
         }
     """
     start_val = item.get(pair["start_key"])
     end_val = item.get(pair["end_key"])
     computed = compute_duration(start_val, end_val)
 
-    stated = item.get(pair["duration_key"]) if pair.get("duration_key") else None
+    duration_key = pair.get("duration_key")
+    stated = item.get(duration_key) if duration_key else None
 
     match = None
     if stated and computed:
@@ -488,11 +504,17 @@ def verify_item(item: dict, pair: dict) -> dict:
         # anything looser risks false "match" confirmations.
         match = stated.strip().lower().replace(" ", "") == computed.strip().lower().replace(" ", "")
 
+    backfilled = False
+    if duration_key and not stated and computed:
+        item[duration_key] = computed
+        backfilled = True
+
     return {
         "start_date": start_val,
         "end_date": end_val,
         "total_time_computed": computed,
         "total_time_stated": stated,
+        "backfilled": backfilled,
         "match": match,
     }
 
