@@ -1,7 +1,25 @@
 """
 schemas/validator.py — Field-level confidence scoring, format validation, and
-deterministic verification for nested/dynamic extraction schemas.
+(NEW) deterministic verification for nested/dynamic extraction schemas.
 
+Dynamic/complex schema extraction):
+  - score_confidence() now handles list-of-dict and single-dict values
+    (nested schema fields) via score_nested_list_confidence() /
+    score_nested_object_confidence(), instead of only flat scalars/lists
+    of strings.
+  - validate_extraction() only runs format validation (email/phone/date/
+    amount/url regex checks) against flat string values — nested list/dict
+    values skip straight to their shape-based confidence score.
+  - NEW: date-derived verification for nested list fields (e.g. past_companies
+    with start_date/end_date). This is VERIFICATION, not extraction — the LLM
+    still only extracts what's stated in the document (see
+    prompts.EXTRACTION_SYSTEM_NESTED, which explicitly forbids the LLM from
+    computing durations itself). These functions run AFTER extraction and
+    compute a duration deterministically from extracted start/end dates,
+    then compare it against any stated duration the LLM did extract —
+    surfacing agreement/disagreement rather than silently overwriting
+    anything. See verify_dynamic_extraction() for the orchestrator, called
+    from retrieval.extract_dynamic_fields() right after the LLM call.
 """
 
 import re
@@ -69,25 +87,38 @@ def validate_url(value: str) -> tuple[bool, str]:
 # --- Field type detector ---
 
 def detect_field_type(field_name: str) -> str:
-    """Guess validation type from field name"""
+    """
+    Guess validation type from field name.
+
+    CHANGED: matches whole snake_case tokens instead of raw substrings.
+    Substring matching previously misclassified "candidate_name" as a date
+    field (it contains "date" inside "candi-date") and would similarly
+    misclassify any field containing "total" as an amount — both caught
+    during testing of the dynamic/nested schema work. All existing template
+    field names (schemas/templates.py) are snake_case with underscore
+    separators, so this is a strict correctness fix with no behaviour change
+    for any field already being classified correctly.
+    """
     name = field_name.lower()
-    if any(k in name for k in ["email", "mail"]):
+    tokens = set(name.split("_"))
+
+    if tokens & {"email", "mail"}:
         return "email"
-    if any(k in name for k in ["phone", "mobile", "contact", "tel"]):
+    if tokens & {"phone", "mobile", "contact", "tel"}:
         return "phone"
-    if any(k in name for k in ["date", "dob", "birth", "expiry", "issued", "deadline"]):
+    if tokens & {"date", "dob", "birth", "expiry", "issued", "deadline"}:
         return "date"
-    if any(k in name for k in ["amount", "salary", "price", "cost", "fee", "total", "balance", "ctc"]):
+    if tokens & {"amount", "salary", "price", "cost", "fee", "total", "balance", "ctc"}:
         return "amount"
-    if any(k in name for k in ["url", "website", "linkedin", "link"]):
+    if tokens & {"url", "website", "linkedin", "link"}:
         return "url"
-    if any(k in name for k in ["skills", "experience", "education", "languages", "items"]):
+    if tokens & {"skills", "experience", "education", "languages", "items"}:
         return "list"
     return "text"
 
 
 # --- Nested-value confidence helpers ---
-# for schemas.dynamic.SchemaSpec fields whose values are lists of objects
+# NEW — for schemas.dynamic.SchemaSpec fields whose values are lists of objects
 # (e.g. past_companies) or single nested objects, rather than flat scalars/
 # lists of strings. score_confidence() below dispatches into these by shape.
 
@@ -135,10 +166,15 @@ def score_confidence(value, field_name: str, field_type: str) -> float:
     if value is None:
         return 0.0
     if isinstance(value, list):
+        # CHANGED: list of dicts (nested schema list-of-objects) gets its own
+        # scorer instead of the flat "non-empty = 0.9" heuristic below, since
+        # a list of half-populated items should score lower than a list of
+        # fully-populated ones.
         if value and isinstance(value[0], dict):
             return score_nested_list_confidence(value)
         return 0.9 if len(value) > 0 else 0.0
     if isinstance(value, dict):
+        # NEW: single nested-object field (schemas.dynamic type="object")
         return score_nested_object_confidence(value)
     if isinstance(value, (int, float)):
         return 0.95
@@ -207,7 +243,9 @@ def validate_extraction(extracted: dict, fields_schema: dict) -> dict:
         status = get_status(confidence)
         overall_scores.append(confidence)
 
-        # Run format validation
+        # Run format validation — only meaningful for flat string values;
+        # nested list/dict values are skipped (their confidence already
+        # reflects sub-field completeness via score_confidence() above).
         validation_note = ""
         if value and isinstance(value, str) and field_type in ["email", "phone", "date", "amount", "url"]:
             validators = {
@@ -329,18 +367,49 @@ def detect_verifiable_pairs(item_fields: list) -> dict:
     def _orig_name(f):
         return f.name if hasattr(f, "name") else f.get("name", "")
 
+    def _tokens(name: str) -> set[str]:
+        # CHANGED: token-based matching instead of substring search. Substring
+        # matching on the raw name caused two false positives found during
+        # testing: "candidate_name" contains "date" (candi-DATE), and
+        # "total_time_spent" contains "to" (TO-tal), which previously made
+        # duration fields get misdetected as the *end* date field. Splitting
+        # on "_" and matching whole tokens avoids both.
+        return set(name.split("_"))
+
+    _DURATION_KEYWORDS = {"duration", "tenure"}
+    _DURATION_PHRASES = ("total_time", "time_spent")  # matched as substrings deliberately — these are compound, checked before tokenising
+    _START_KEYWORDS = {"start", "from", "begin", "joined", "joining"}
+    _END_KEYWORDS = {"end", "till", "until", "left", "relieving"}
+    # "to" deliberately excluded from end keywords — too short, collides with
+    # "total", "tools", etc. as a substring/token in compound names.
+
     start_key, end_key, duration_key = None, None, None
 
     for f in item_fields:
         name, ftype = _name(f), _type(f)
-        is_date_like = ftype == "date" or any(k in name for k in ("date", "dob"))
+        tokens = _tokens(name)
 
-        if is_date_like and any(k in name for k in ("start", "from", "begin", "joined", "joining")):
-            start_key = _orig_name(f)
-        elif is_date_like and any(k in name for k in ("end", "to", "till", "until", "left", "relieving")):
-            end_key = _orig_name(f)
-        elif any(k in name for k in ("duration", "total_time", "tenure", "time_spent")):
+        # Duration/stated-tenure fields are checked FIRST and exclusively —
+        # a field like "total_time_spent" must never fall through to the
+        # start/end checks below.
+        if any(p in name for p in _DURATION_PHRASES) or (tokens & _DURATION_KEYWORDS):
             duration_key = _orig_name(f)
+            continue
+
+        # CHANGED: no longer requires type=="date" or "date"/"dob" in the name —
+        # schemas frequently use type="string" for "start_time"/"end_time", or
+        # type="integer" for "start_year"/"end_year". Any field whose type is
+        # date/string/integer/number AND whose name token matches a start/end
+        # keyword now qualifies. Booleans and lists are excluded so a field
+        # like "is_current" or a nested list can't be mistaken for a date.
+        is_temporal_type = ftype in ("date", "string", "integer", "number", "")
+        if not is_temporal_type:
+            continue
+
+        if tokens & _START_KEYWORDS:
+            start_key = _orig_name(f)
+        elif tokens & _END_KEYWORDS:
+            end_key = _orig_name(f)
 
     if not (start_key and end_key):
         return {}

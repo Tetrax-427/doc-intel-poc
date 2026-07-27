@@ -3,29 +3,31 @@ llm/structured.py — Instructor-powered structured output for DocIntel.
 
 Public API:
     call_structured(raw_client, provider, model, system, user,
-                    response_model, temperature, call_type)
+                    response_model, temperature, call_type, max_retries)
         -> (BaseModel, usage_dict | None)
     build_extraction_model(fields: dict[str, str]) -> type[BaseModel]
 
 Pydantic models (used by retrieval.py call sites):
     DocumentClassification
     QueryExpansion
-    ExtractionResult       (dynamic — built by build_extraction_model)
+    ExtractionResult       (dynamic — built by build_extraction_model, flat schemas)
     DocumentSummary
     TableItem / TableList
     SchemaResult
 
-CHANGED from the previous version:
-- messages: list[dict] -> system: str, user: str (mandatory split — see
-  FINAL_PLAN.md §0/§2). Internally builds the provider-correct message shape.
-- Returns (result, usage) instead of bare result. usage is a plain dict
-  {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
-  or None if the installed Instructor/provider SDK version doesn't expose
-  usage in a shape we recognise. This is the fix for the bug in the original
-  plan docs where every structured call silently logged zero cost — see
-  _extract_usage() below for exactly what's tried.
-- log_usage() / llm.usage import removed — superseded by llm/tracer.py,
-  which the caller (llm/engine.py) wraps around this function.
+CHANGED in this phase (dynamic/complex schema extraction):
+  - call_structured() gains a `max_retries` param, passed straight through to
+    Instructor's own `.create(max_retries=...)`. Instructor uses this to
+    re-prompt the model with the Pydantic validation error when the response
+    fails to validate — this matters far more for nested/dynamic schemas
+    (schemas.dynamic.spec_to_model) than for the flat ExtractionResult models,
+    since nested list-of-object shapes are easier for the LLM to get wrong on
+    the first try. Default stays 0 (no behaviour change for existing callers);
+    retrieval.extract_dynamic_fields() passes max_retries=2 explicitly.
+  - engine.call_llm() / engine._call_single_provider() thread max_retries
+    through to here (see llm/engine.py CHANGED note).
+
+Everything else below is unchanged from the previous version.
 """
 
 from __future__ import annotations
@@ -87,16 +89,22 @@ class TableList(BaseModel):
 
 class SchemaResult(BaseModel):
     """
-    Response model for nl_to_schema().
+    Legacy response model for the old flat nl_to_schema() path.
+    Superseded by schemas.dynamic.SchemaSpec for new NL extraction requests
+    (see retrieval.extract_nl()), but kept here since it's still a valid,
+    lightweight shape for any caller that only needs a flat field list.
     Field names are dynamic, so we allow extra fields.
-    The model is effectively a typed dict.
     """
     model_config = ConfigDict(extra="allow")
 
 
 # ---------------------------------------------------------------------------
-# Dynamic extraction model factory
+# Dynamic extraction model factory — FLAT schemas
 # ---------------------------------------------------------------------------
+# For nested/complex schemas (lists of objects, nested objects), see
+# schemas.dynamic.spec_to_model() instead — this factory only ever produces
+# flat Optional[str] fields and is kept for template-based / flat custom
+# extraction (retrieval.extract_fields()).
 
 def build_extraction_model(fields: dict[str, str]) -> type[BaseModel]:
     """
@@ -225,13 +233,10 @@ def call_structured(
     temperature: float = 0.0,
     max_tokens: int = 1000,
     call_type: str = "structured",
+    max_retries: int = 0,
 ) -> tuple[BaseModel, dict | None]:
     """
     Make an LLM call and coerce the response into response_model via Instructor.
-
-    Instructor handles its own internal retry logic for validation errors.
-    This function does NOT retry — the outer fallback loop in engine.py
-    catches StructuredOutputError and tries the next provider.
 
     Args:
         raw_client:     Raw Groq / OpenAI / Anthropic client (from fallback.build_client).
@@ -243,12 +248,21 @@ def call_structured(
         temperature:    Sampling temperature (default 0.0 for structured tasks).
         max_tokens:     Max response tokens.
         call_type:      Label for tracing.
+        max_retries:    Passed straight to Instructor's own `.create(max_retries=...)`.
+                        Instructor re-prompts the model with the Pydantic validation
+                        error on each retry — this is Instructor's internal retry
+                        loop, separate from the provider-fallback loop in engine.py.
+                        Default 0 (no retry) preserves prior behaviour for existing
+                        callers; pass >0 for schemas where first-pass validation
+                        failures are more likely (e.g. nested/dynamic schemas via
+                        schemas.dynamic.spec_to_model()).
 
     Returns:
         (validated_instance, usage_dict_or_None)
 
     Raises:
-        StructuredOutputError: if Instructor fails to coerce the response.
+        StructuredOutputError: if Instructor fails to coerce the response
+                                (including after exhausting max_retries).
         LLMConfigError:        if provider has no Instructor adapter.
     """
     instructor_client = _get_instructor_client(raw_client, provider)
@@ -288,6 +302,9 @@ def call_structured(
             "response_model": response_model,
         }
 
+    if max_retries:
+        kwargs["max_retries"] = max_retries
+
     try:
         result = instructor_client.messages.create(**kwargs) \
             if provider == "anthropic" \
@@ -302,6 +319,7 @@ def call_structured(
             provider=provider,
             model=model,
             response_model=response_model.__name__,
+            max_retries=max_retries,
             error=str(exc),
         )
         raise StructuredOutputError(

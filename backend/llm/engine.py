@@ -56,6 +56,12 @@ def call_llm(
     model: str = None,
     # Structured output
     response_model: type[BaseModel] = None,
+    # CHANGED: Instructor's internal re-ask-on-validation-failure retry count.
+    # Distinct from MAX_RETRIES above, which governs the provider-fallback
+    # rate-limit backoff loop in _call_single_provider(). Only meaningful
+    # when response_model is set; ignored otherwise. Default 0 preserves
+    # existing behaviour for every current call site.
+    structured_max_retries: int = 0,
     # Tracing context
     user_id: str = "system",
     document_id: str | None = None,
@@ -80,6 +86,11 @@ def call_llm(
         provider:       Override provider for this call only.
         model:          Override model for this call only.
         response_model: Pydantic BaseModel for structured output.
+        structured_max_retries: Instructor's re-ask-on-validation-error retry
+                        count (see llm/structured.py call_structured). Pass a
+                        higher value (e.g. 2) for schemas more likely to need
+                        a self-correction pass, such as nested/dynamic
+                        extraction schemas from schemas.dynamic.spec_to_model().
         user_id:        Owning user — required for correct tracing/cache scoping.
         document_id:    Document this call relates to, if any.
         session_id:     Reserved for future chat-session grouping.
@@ -165,6 +176,7 @@ def call_llm(
                     call_type=call_type,
                     response_model=response_model,
                     json_mode=json_mode,
+                    structured_max_retries=structured_max_retries,
                 )
                 response_text = _stringify_result(result)
                 if TRACING_ENABLED:
@@ -234,6 +246,7 @@ def _call_single_provider(
     call_type: str,
     response_model: type[BaseModel] | None,
     json_mode: bool,
+    structured_max_retries: int = 0,
 ) -> tuple[str | dict | BaseModel, dict | None]:
     client = build_client(provider)
 
@@ -248,6 +261,7 @@ def _call_single_provider(
                     response_model=response_model,
                     temperature=temperature, max_tokens=max_tokens,
                     call_type=call_type,
+                    max_retries=structured_max_retries,
                 )
                 return result, usage
 

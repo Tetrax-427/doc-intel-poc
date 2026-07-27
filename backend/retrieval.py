@@ -9,6 +9,19 @@ Changes in this phase (Security):
   - sanitize_llm_output() applied to query_document() and
       query_document_stream() responses
   - org_id/team_id threaded through to call_llm() where available
+
+Dynamic/complex schema extraction:
+  - NEW: extract_dynamic_fields() — extraction against a schemas.dynamic.SchemaSpec
+    (nested objects, repeating lists of objects). Mirrors extract_fields() but uses
+    EXTRACTION_SYSTEM_NESTED and a recursively-built Pydantic model instead of the
+    flat build_extraction_model(). SANDBOXED at the document-content call site, same
+    as extract_fields().
+  - CHANGED: nl_to_schema() is now a thin deprecated wrapper (kept only for any
+    external caller still importing it directly) — extract_nl() no longer calls it.
+  - CHANGED: extract_nl() now calls schemas.dynamic.generate_schema_spec() +
+    extract_dynamic_fields() instead of the old flat nl_to_schema() + extract_fields()
+    pair. This means /extract/nl now produces nested/complex schemas natively —
+    no separate endpoint needed.
 """
 
 import os
@@ -25,6 +38,7 @@ from prompts import (
     CLASSIFIER_SYSTEM,
     QUERY_EXPANSION_SYSTEM,
     EXTRACTION_SYSTEM,
+    EXTRACTION_SYSTEM_NESTED,
     DOCUMENT_CLASSIFIER_SYSTEM,
     KEYWORD_SIGNALS,
     EMBEDDING_EXEMPLARS,
@@ -41,13 +55,19 @@ from llm.structured import (
     SchemaResult,
     build_extraction_model,
 )
+from schemas.dynamic import (
+    SchemaSpec,
+    generate_schema_spec,
+    spec_to_model,
+    spec_to_field_descriptions,
+)
 from hyde import (
     generate_hyde_passage,
     generate_query_variants,
     merge_and_dedupe,
     normalise_retrieval_mode,
 )
-from schemas.validator import validate_extraction
+from schemas.validator import validate_extraction, verify_dynamic_extraction
 from validation.engine import ValidationEngine
 
 load_dotenv()
@@ -636,7 +656,7 @@ def find_field_bbox(field_value: str | None, document_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Field extraction — SANDBOXED at document content
+# Field extraction — flat schemas — SANDBOXED at document content
 # ---------------------------------------------------------------------------
 
 def extract_fields(
@@ -730,6 +750,131 @@ def extract_fields(
 
 
 # ---------------------------------------------------------------------------
+# Field extraction — nested/dynamic schemas — SANDBOXED at document content
+# ---------------------------------------------------------------------------
+#
+# NEW. Mirrors extract_fields() above but operates on a schemas.dynamic.SchemaSpec
+# instead of a flat {name: description} dict — this is what powers both:
+#   - POST /extract with an inline `nested_schema` (routers/extraction.py)
+#   - POST /extract/nl, via extract_nl() below, for every NL instruction
+#
+# Uses EXTRACTION_SYSTEM_NESTED (prompts.py) and a recursively-built Pydantic
+# model (schemas.dynamic.spec_to_model) so lists-of-objects and nested objects
+# are validated by Instructor the same way flat fields are.
+
+def extract_dynamic_fields(
+    document_id: str,
+    spec: SchemaSpec,
+    user_id: str = "system",
+    org_id: str | None = None,
+    team_id: str | None = None,
+) -> dict:
+    all_chunks = get_chunks_by_document(document_id)
+
+    context_chunks = [
+        c for c in all_chunks
+        if c.get("metadata", {}).get("chunk_level", "flat") in ("parent", "flat")
+    ]
+    if not context_chunks:
+        context_chunks = all_chunks
+
+    context = "\n\n".join([c["content"] for c in context_chunks[:10]])
+
+    # Correction feedback loop reuses the same doc_type-keyed lookup as
+    # extract_fields() — corrections apply to top-level field names, which is
+    # exactly what build_correction_examples() keys on. Nested/list sub-fields
+    # aren't individually correctable yet (see plan item: correction loop
+    # compatibility) — top-level fields on dynamic schemas still benefit.
+    field_desc           = spec_to_field_descriptions(spec)
+    top_level_fields      = {f.name: f.description for f in spec.fields}
+    correction_examples  = build_correction_examples("dynamic", top_level_fields)
+
+    # ── SANDBOX: wrap document content before passing to LLM ──
+    sandboxed_context = sandbox_and_check(
+        context,
+        user_id=user_id,
+        document_id=document_id,
+        label="extract_dynamic_fields",
+    )
+
+    user_content = (
+        f"{correction_examples}"
+        f"Fields to extract:\n{field_desc}\n\n"
+        f"{sandboxed_context}"
+    )
+
+    DynamicModel = spec_to_model(spec)
+
+    try:
+        result_model = call_llm(
+            system=EXTRACTION_SYSTEM_NESTED,
+            user=user_content,
+            temperature=0.0,
+            call_type="extract_dynamic",
+            response_model=DynamicModel,
+            # Nested/list-of-object shapes are more likely to fail validation
+            # on the first pass than flat fields — let Instructor re-ask with
+            # the validation error before falling back to the next provider.
+            structured_max_retries=2,
+            user_id=user_id,
+            document_id=document_id,
+            org_id=org_id,
+            team_id=team_id,
+        )
+        raw_extracted = result_model.model_dump()
+    except Exception as exc:
+        return {
+            "extracted": {"error": str(exc)},
+            "validation": None,
+            "business_validation": {},
+            "schema_used": spec.model_dump(),
+        }
+
+    # NEW — deterministic verification pass (schemas.validator.verify_dynamic_extraction).
+    # Walks every type="list" field with a detectable start/end date pair and attaches
+    # a `_verification` block to each item (computed duration vs. any stated duration
+    # the LLM extracted). This is verification of extracted data, not extraction itself —
+    # see prompts.EXTRACTION_SYSTEM_NESTED, which forbids the LLM from computing values.
+    raw_extracted = verify_dynamic_extraction(raw_extracted, spec)
+
+    # Response shaping:
+    #   - flat string fields  -> wrapped {"value": ..., "bbox": ...} for bbox highlighting,
+    #     same convention as extract_fields()
+    #   - list/object fields  -> returned as raw nested JSON (no bbox wrapping — bbox only
+    #     makes sense against a single flat string span, not a nested structure)
+    # plain_values is built alongside, unwrapped either way, for validate_extraction()/
+    # ValidationEngine() below.
+    extracted: dict = {}
+    plain_values: dict = {}
+    for field_name, value in raw_extracted.items():
+        if isinstance(value, str):
+            extracted[field_name] = {"value": value, "bbox": find_field_bbox(value, document_id)}
+            plain_values[field_name] = value
+        else:
+            extracted[field_name] = value
+            plain_values[field_name] = value
+
+    validation = validate_extraction(plain_values, top_level_fields)
+
+    business_validation = {}
+    try:
+        engine = ValidationEngine()
+        # doc_type="dynamic" routes through validation/rulesets/generic.py —
+        # schema-agnostic rules, since field names aren't known in advance
+        # for user-defined schemas (see validation/engine.py RULESET_MAP).
+        business_validation = engine.validate(plain_values, doc_type="dynamic")
+    except Exception:
+        pass
+
+    return {
+        "extracted":           extracted,
+        "validation":          validation,
+        "business_validation": business_validation,
+        "schema_used":         spec.model_dump(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Table extraction — SANDBOXED
 # ---------------------------------------------------------------------------
 
@@ -818,8 +963,13 @@ def generate_summary(
 
 
 # ---------------------------------------------------------------------------
-# NL to schema
+# NL to schema — DEPRECATED flat path (kept for backward compatibility only)
 # ---------------------------------------------------------------------------
+#
+# CHANGED: extract_nl() below no longer calls this — it calls
+# schemas.dynamic.generate_schema_spec() instead, which supports nested/complex
+# schemas natively. This function is kept only in case any external caller
+# still imports nl_to_schema() directly for a flat-only preview.
 
 def nl_to_schema(instruction: str, user_id: str = "system") -> dict:
     try:
@@ -851,19 +1001,32 @@ def extract_nl(
     org_id: str | None = None,
     team_id: str | None = None,
 ) -> dict:
-    schema = nl_to_schema(instruction, user_id=user_id)
-    if "error" in schema:
+    """
+    CHANGED: now generates a schemas.dynamic.SchemaSpec (supports nested objects
+    and repeating lists of objects) instead of a flat field dict, and extracts
+    via extract_dynamic_fields(). This is what lets /extract/nl handle requests
+    like "candidate name, and for each past company: name, start date, end date,
+    office location" without any per-domain code.
+    """
+    try:
+        spec = generate_schema_spec(instruction, user_id=user_id)
+    except Exception as exc:
         return {
             "error": "Could not parse instruction into schema",
             "instruction": instruction,
             "schema": None, "extracted": None,
             "validation": None, "business_validation": {},
         }
-    result = extract_fields(document_id, schema, user_id=user_id, org_id=org_id, team_id=team_id)
+
+    result = extract_dynamic_fields(
+        document_id, spec, user_id=user_id, org_id=org_id, team_id=team_id,
+    )
+
     return {
-        "instruction": instruction, "schema": schema,
-        "extracted": result.get("extracted"),
-        "validation": result.get("validation"),
+        "instruction":         instruction,
+        "schema":              spec.model_dump(),
+        "extracted":           result.get("extracted"),
+        "validation":          result.get("validation"),
         "business_validation": result.get("business_validation"),
     }
 

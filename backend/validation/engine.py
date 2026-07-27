@@ -5,6 +5,11 @@ logger = get_logger("validation")
 
 # Maps doc_type strings (from classify_document) to ruleset module paths.
 # Unknown types return an empty rule list — no false failures on unrecognised docs.
+#
+# CHANGED in this phase: added "dynamic" -> validation.rulesets.generic.
+# retrieval.extract_dynamic_fields() passes doc_type="dynamic" for every
+# nested/user-defined schema extraction (since field names aren't known in
+# advance, the doc-type-specific rulesets below don't apply).
 RULESET_MAP: dict[str, str] = {
     "invoice":          "validation.rulesets.invoice",
     "receipt":          "validation.rulesets.invoice",   # reuse invoice ruleset
@@ -19,6 +24,7 @@ RULESET_MAP: dict[str, str] = {
     "nda":              "validation.rulesets.contract",
     "bank_statement":   "validation.rulesets.bank_statement",
     "loan_application": "validation.rulesets.loan_application",
+    "dynamic":          "validation.rulesets.generic",
 }
 
 
