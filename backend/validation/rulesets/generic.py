@@ -8,13 +8,17 @@ Wired in via validation/engine.py's RULESET_MAP under "dynamic" — every
 extract_dynamic_fields() call passes doc_type="dynamic" to ValidationEngine,
 which routes here.
 
-NOTE: written against the BaseRule/ValidationResult contract inferred from
-validation/engine.py (rule.get_name(), rule.get_code(), rule.validate(dict)
--> list[ValidationResult], and ValidationResult.status/.blocking/.to_dict()).
-Please verify these two imports against the actual validation/rules/base.py
-before running — that file wasn't in the files reviewed for this change, so
-the constructor signature below is a best-effort match to the existing
-ruleset pattern rather than a confirmed one.
+CHANGED — FIXED in this revision: the previous version constructed
+ValidationResult with the wrong keyword set (rule_name instead of rule;
+missing field, expected, actual, severity — all required, no defaults on
+this dataclass). Every construction call was raising TypeError, and
+ValidationEngine._load_rules()'s try/except was silently swallowing it —
+rules_run showed 3 but results were always empty, with no visible error.
+Confirmed against the real validation/rules/base.py contract:
+
+    ValidationResult(field, rule, rule_code, status, expected, actual,
+                      message, severity, blocking)
+    BaseRule.validate(fields: dict) -> list[ValidationResult], never raises.
 """
 
 from validation.rules.base import BaseRule, ValidationResult
@@ -27,6 +31,8 @@ class ListItemConsistencyRule(BaseRule):
     failure mode where the LLM extracts an early item fully but degrades
     on later ones in a long repeating structure (e.g. a resume with 6+
     past roles, where item 5 loses the office location).
+
+    One ValidationResult per item with at least one missing sub-field.
     """
 
     def get_name(self) -> str:
@@ -35,9 +41,9 @@ class ListItemConsistencyRule(BaseRule):
     def get_code(self) -> str:
         return "GENERIC_001"
 
-    def validate(self, extracted: dict) -> list[ValidationResult]:
+    def validate(self, fields: dict) -> list[ValidationResult]:
         results = []
-        for field_name, value in extracted.items():
+        for field_name, value in fields.items():
             if not isinstance(value, list) or not value or not isinstance(value[0], dict):
                 continue
 
@@ -57,11 +63,15 @@ class ListItemConsistencyRule(BaseRule):
                 ]
                 if missing:
                     results.append(ValidationResult(
+                        field=f"{field_name}[{i}]",
+                        rule=self.get_name(),
                         rule_code=self.get_code(),
-                        rule_name=self.get_name(),
                         status="WARNING",
+                        expected="all sub-fields populated",
+                        actual=f"missing: {', '.join(missing)}",
+                        message=f"{field_name}[{i}] is missing: {', '.join(missing)}",
+                        severity="WARNING",
                         blocking=False,
-                        message=f"{field_name}[{i}] missing: {', '.join(missing)}",
                     ))
         return results
 
@@ -70,7 +80,7 @@ class TopLevelCompletenessRule(BaseRule):
     """
     Flags top-level fields that came back entirely null/empty — a generic
     completeness signal that works for any schema, independent of doc type
-    or field names.
+    or field names. One ValidationResult per empty field.
     """
 
     def get_name(self) -> str:
@@ -79,17 +89,21 @@ class TopLevelCompletenessRule(BaseRule):
     def get_code(self) -> str:
         return "GENERIC_002"
 
-    def validate(self, extracted: dict) -> list[ValidationResult]:
+    def validate(self, fields: dict) -> list[ValidationResult]:
         results = []
-        empty_fields = [k for k, v in extracted.items() if v in (None, "", [])]
-        if empty_fields:
-            results.append(ValidationResult(
-                rule_code=self.get_code(),
-                rule_name=self.get_name(),
-                status="WARNING",
-                blocking=False,
-                message=f"No value found for: {', '.join(empty_fields)}",
-            ))
+        for field_name, value in fields.items():
+            if value in (None, "", []):
+                results.append(ValidationResult(
+                    field=field_name,
+                    rule=self.get_name(),
+                    rule_code=self.get_code(),
+                    status="WARNING",
+                    expected="non-empty value",
+                    actual="empty or null",
+                    message=f"No value found for '{field_name}'",
+                    severity="WARNING",
+                    blocking=False,
+                ))
         return results
 
 
@@ -108,9 +122,9 @@ class DateVerificationMismatchRule(BaseRule):
     def get_code(self) -> str:
         return "GENERIC_003"
 
-    def validate(self, extracted: dict) -> list[ValidationResult]:
+    def validate(self, fields: dict) -> list[ValidationResult]:
         results = []
-        for field_name, value in extracted.items():
+        for field_name, value in fields.items():
             if not isinstance(value, list):
                 continue
             for i, item in enumerate(value):
@@ -118,17 +132,22 @@ class DateVerificationMismatchRule(BaseRule):
                     continue
                 verification = item.get("_verification")
                 if verification and verification.get("match") is False:
+                    stated = verification.get("total_time_stated")
+                    computed = verification.get("total_time_computed")
                     results.append(ValidationResult(
+                        field=f"{field_name}[{i}]",
+                        rule=self.get_name(),
                         rule_code=self.get_code(),
-                        rule_name=self.get_name(),
                         status="WARNING",
-                        blocking=False,
+                        expected=f"stated duration matches computed ({computed})",
+                        actual=f"stated={stated!r}",
                         message=(
-                            f"{field_name}[{i}]: stated duration "
-                            f"'{verification.get('total_time_stated')}' does not match "
-                            f"computed '{verification.get('total_time_computed')}' "
-                            f"from {verification.get('start_date')}–{verification.get('end_date')}"
+                            f"{field_name}[{i}]: stated duration {stated!r} does not match "
+                            f"computed {computed!r} (from {verification.get('start_date')}"
+                            f"–{verification.get('end_date')})"
                         ),
+                        severity="WARNING",
+                        blocking=False,
                     ))
         return results
 

@@ -2,7 +2,7 @@
 schemas/validator.py — Field-level confidence scoring, format validation, and
 (NEW) deterministic verification for nested/dynamic extraction schemas.
 
-Dynamic/complex schema extraction):
+CHANGED in this phase (dynamic/complex schema extraction):
   - score_confidence() now handles list-of-dict and single-dict values
     (nested schema fields) via score_nested_list_confidence() /
     score_nested_object_confidence(), instead of only flat scalars/lists
@@ -36,6 +36,16 @@ _PARSE_FORMATS = [
     "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
     "%B %d, %Y", "%d %B %Y", "%Y-%m", "%m/%Y", "%B %Y", "%Y",
 ]
+
+# Month name/abbreviation -> number, for the "Month'YY" pattern below
+# (e.g. "Sept'25", "May'25") — common in resume date ranges but not
+# parseable by any strptime format string since it's a 4-letter
+# non-standard abbreviation ("Sept" isn't a valid %b token) glued to a
+# 2-digit year with no day component.
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
 # --- Field type validators ---
@@ -293,15 +303,46 @@ def validate_extraction(extracted: dict, fields_schema: dict) -> dict:
 # than replacing it.
 
 def _parse_date_loose(value: str | None) -> date | None:
-    """Best-effort parse of an extracted date string against _PARSE_FORMATS."""
+    """
+    Best-effort parse of an extracted date string.
+
+    CHANGED: found during testing on real resume data — dates written as
+    "Sept'25", "May'25", "Jul'24" (month name/abbreviation + apostrophe +
+    2-digit year, day omitted) were silently unparseable, since "Sept" isn't
+    a valid strptime %b token (4 letters, non-standard) and there's no day
+    component. This is a common resume date-range format, so it's handled
+    explicitly via _MONTH_MAP before falling back to _PARSE_FORMATS.
+
+    Note: python's dateutil.parser with fuzzy=True was tried and rejected —
+    it misparses "Sept'25" as day=25 of the *current* year (reads the
+    2-digit token as a day, not a year), which is silently wrong rather
+    than cleanly unparseable. Explicit pattern matching avoids that.
+    """
     if not value or not str(value).strip():
         return None
     cleaned = str(value).strip()
-    for fmt in _PARSE_FORMATS:
-        try:
-            return datetime.strptime(cleaned, fmt).date()
-        except ValueError:
-            continue
+
+    # "Month'YY" / "Month YY" / "Month, YY" — day omitted, defaults to the 1st
+    m = re.match(r"^([A-Za-z]{3,9})[\s'\u2019]*,?\s*(\d{2}|\d{4})$", cleaned)
+    if m:
+        month_token, year_token = m.group(1).lower()[:3], m.group(2)
+        if month_token in _MONTH_MAP:
+            year = int(year_token)
+            if len(year_token) == 2:
+                year = 2000 + year  # resume dates are assumed post-2000
+            try:
+                return date(year, _MONTH_MAP[month_token], 1)
+            except ValueError:
+                pass
+
+    # Explicit formats — tried against the raw string and an
+    # apostrophe-stripped variant (covers "Sept 25" style inputs too)
+    for candidate in (cleaned, cleaned.replace("'", " ").replace("\u2019", " ")):
+        for fmt in _PARSE_FORMATS:
+            try:
+                return datetime.strptime(candidate.strip(), fmt).date()
+            except ValueError:
+                continue
     return None
 
 
