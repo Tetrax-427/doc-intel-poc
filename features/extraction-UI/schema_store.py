@@ -3,16 +3,27 @@ schema_store.py
 ----------------
 Saves/loads reusable extraction schemas to a local JSON file.
 
-A schema is always fields-based - whether it was built manually or derived
-from an NL instruction preview, both end up in the same shape (the backend
-only accepts a flat {field_name: description} dict for extraction, so
-there's no separate "type" or "doc_type" to track):
+Fields now support nesting for list-of-object data (e.g. work experience,
+education). Each field is:
+
+{
+  "name": "candidate_work_experience",
+  "type": "string" | "list",
+  "description": "...",
+  "properties": null  # or a list of sub-fields (same shape) when type == "list"
+}
+
+Flat/scalar-only schemas (properties always null) still work unchanged -
+this is additive, not a breaking change.
 
 {
   "mode": "fields",
   "fields": [
-     {"name": "invoice_number", "description": "The invoice number"},
-     {"name": "total_amount", "description": "Total amount due"}
+     {"name": "candidate_name", "type": "string", "description": "...", "properties": null},
+     {"name": "candidate_work_experience", "type": "list", "description": "...", "properties": [
+         {"name": "company_name", "type": "string", "description": "...", "properties": null},
+         ...
+     ]}
   ],
   "created_at": "2026-07-02T10:00:00"
 }
@@ -31,6 +42,27 @@ def _ensure_store():
         SCHEMA_FILE.write_text("{}")
 
 
+def normalize_field(field: dict) -> dict:
+    """
+    Fills in defaults so every field, at every nesting level, always has
+    name/type/description/properties - regardless of whether it came from
+    manual entry (no "type" key yet) or an NL preview (already typed).
+    """
+    name = field.get("name", "")
+    ftype = field.get("type") or "string"
+    description = field.get("description") or ""
+    properties = field.get("properties")
+    if ftype == "list" and properties:
+        properties = [normalize_field(p) for p in properties]
+    else:
+        properties = None
+    return {"name": name, "type": ftype, "description": description, "properties": properties}
+
+
+def normalize_fields(fields: list) -> list:
+    return [normalize_field(f) for f in fields]
+
+
 def load_schemas() -> dict:
     _ensure_store()
     try:
@@ -42,6 +74,7 @@ def load_schemas() -> dict:
 def save_schema(name: str, schema: dict):
     schemas = load_schemas()
     schema = dict(schema)
+    schema["fields"] = normalize_fields(schema.get("fields", []))
     schema["created_at"] = schema.get("created_at") or datetime.now(timezone.utc).isoformat()
     schemas[name] = schema
     _ensure_store()
@@ -55,8 +88,28 @@ def delete_schema(name: str):
 
 
 def get_schema(name: str) -> dict | None:
-    return load_schemas().get(name)
+    schema = load_schemas().get(name)
+    if schema is not None:
+        schema = dict(schema)
+        schema["fields"] = normalize_fields(schema.get("fields", []))
+    return schema
 
 
 def list_schema_names() -> list:
     return sorted(load_schemas().keys())
+
+
+def flatten_fields_for_table(fields: list, prefix: str = "") -> list:
+    """
+    Produces a flat row list for st.table preview of a saved schema -
+    list fields show as one summary row plus indented sub-field rows,
+    so the "Saved schemas" expander stays readable without a tree widget.
+    """
+    rows = []
+    for f in fields:
+        ftype = f.get("type", "string")
+        label = f"{prefix}{f.get('name', '')}" + ("  [list]" if ftype == "list" else "")
+        rows.append({"name": label, "type": ftype, "description": f.get("description", "")})
+        if ftype == "list" and f.get("properties"):
+            rows.extend(flatten_fields_for_table(f["properties"], prefix=prefix + "  ↳ "))
+    return rows

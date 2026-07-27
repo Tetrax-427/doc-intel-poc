@@ -20,7 +20,7 @@ import asyncio
 
 import httpx
 
-from api_client import AsyncDocIntelClient, ApiError, extract_value
+from api_client import AsyncDocIntelClient, ApiError
 
 
 def _run_coro(coro):
@@ -67,25 +67,23 @@ def _run_coro(coro):
         return box["result"]
 
 
-async def _process_one(async_client, http_client, semaphore, fname, fbytes, fields, progress_state, progress_cb):
+async def _process_one(async_client, http_client, semaphore, fname, fbytes, fields, schema_name, progress_state, progress_cb):
     async with semaphore:
         try:
             up = await async_client.upload_document(http_client, fbytes, fname)
             doc_id = up.get("document_id")
 
-            result = await async_client.extract_fields(http_client, doc_id, fields)
+            result = await async_client.extract_fields(http_client, doc_id, fields, schema_name=schema_name)
             extracted = result.get("extracted", {})
 
-            row = {"file_name": fname}
-            if isinstance(extracted, dict):
-                for field_name, field_value in extracted.items():
-                    row[field_name] = extract_value(field_value)
-            else:
-                row["extracted_raw"] = str(extracted)
-
+            # Keep extracted RAW/nested here (no flattening) - app.py's
+            # render_nested_result / flatten_results_for_export call
+            # extract_value() themselves, since a "list" field's value is a
+            # list of dicts that a flat row can't hold anyway.
+            row = {"filename": fname, "extracted": extracted}
             ok, error_msg = True, None
         except ApiError as e:
-            row = {"file_name": fname, "error": str(e)}
+            row = {"filename": fname, "extracted": {}, "error": str(e)}
             ok, error_msg = False, f"{fname}: {e}"
 
     progress_state["completed"] += 1
@@ -94,7 +92,7 @@ async def _process_one(async_client, http_client, semaphore, fname, fbytes, fiel
     return row, error_msg
 
 
-async def _run_batch_async(base_url, access_token, timeout, files, fields, max_parallel, progress_cb):
+async def _run_batch_async(base_url, access_token, timeout, files, fields, schema_name, max_parallel, progress_cb):
     async_client = AsyncDocIntelClient(base_url, access_token, timeout)
     semaphore = asyncio.Semaphore(max_parallel)
     progress_state = {"completed": 0, "total": len(files)}
@@ -102,7 +100,7 @@ async def _run_batch_async(base_url, access_token, timeout, files, fields, max_p
     limits = httpx.Limits(max_connections=max_parallel, max_keepalive_connections=max_parallel)
     async with httpx.AsyncClient(limits=limits) as http_client:
         tasks = [
-            _process_one(async_client, http_client, semaphore, fname, fbytes, fields, progress_state, progress_cb)
+            _process_one(async_client, http_client, semaphore, fname, fbytes, fields, schema_name, progress_state, progress_cb)
             for fname, fbytes in files
         ]
         results = await asyncio.gather(*tasks)
@@ -113,13 +111,15 @@ async def _run_batch_async(base_url, access_token, timeout, files, fields, max_p
 
 
 def run_batch(base_url: str, access_token: str, timeout: int, files: list, fields: list,
-              max_parallel: int, progress_cb=None):
+              max_parallel: int, schema_name: str = "extraction_schema", progress_cb=None):
     """
     files: list of (filename, file_bytes)
-    fields: schema fields, list of {name, description}
+    fields: schema fields, list of {name, type, description, properties} (nested-capable)
+    schema_name: forwarded into the nested_schema wrapper sent to /extract
     progress_cb: optional callable(completed, total, filename, ok)
 
-    Returns (rows, errors) - rows is a list of dicts ready for a DataFrame,
+    Returns (rows, errors) - rows is a list of
+    {"filename": ..., "extracted": {...raw nested extracted dict...}, "error"?: str},
     errors is a list of "filename: message" strings for any failed files.
     """
-    return _run_coro(_run_batch_async(base_url, access_token, timeout, files, fields, max_parallel, progress_cb))
+    return _run_coro(_run_batch_async(base_url, access_token, timeout, files, fields, schema_name, max_parallel, progress_cb))
