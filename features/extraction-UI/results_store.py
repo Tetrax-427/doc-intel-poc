@@ -2,8 +2,9 @@
 results_store.py
 -----------------
 Stores extraction results as local CSV "tables" under data/tables/.
-Each table is one CSV file. Supports creating a new table or appending
-to an existing one (columns are unioned; missing values become blank).
+Each table is one CSV file. Supports creating a new table, appending
+to an existing one (columns are unioned; missing values become blank),
+and renaming a table.
 """
 import io
 from pathlib import Path
@@ -66,6 +67,27 @@ def delete_table(name: str):
     path = table_path(name)
     if path.exists():
         path.unlink()
+
+
+def rename_table(old_name: str, new_name: str) -> str:
+    """
+    Renames a table's underlying CSV file. Returns the actual new name used
+    (sanitized via _safe_name, same as table_path) so the caller can select
+    it in the UI afterwards. Raises FileNotFoundError if old_name doesn't
+    exist, and ValueError if new_name is empty/blank or collides with an
+    existing table.
+    """
+    old_path = table_path(old_name)
+    if not old_path.exists():
+        raise FileNotFoundError(f"Table '{old_name}' does not exist.")
+    safe_new = _safe_name(new_name)
+    if not safe_new:
+        raise ValueError("New table name can't be empty.")
+    new_path = table_path(safe_new)
+    if new_path.exists() and new_path != old_path:
+        raise ValueError(f"A table named '{safe_new}' already exists.")
+    old_path.rename(new_path)
+    return safe_new
 
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Extraction Results") -> bytes:

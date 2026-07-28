@@ -15,13 +15,18 @@ Run with:
 from datetime import datetime, timezone
 from pathlib import Path
 
+import html as html_lib
+import io
+
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
 
 from api_client import ApiError, DocIntelClient, extract_value
 from batch_runner import run_batch
 from config_store import get_base_url, get_timeout, get_max_parallel_uploads
-from results_store import list_tables, load_table, save_table, delete_table, to_excel_bytes
+from results_store import list_tables, load_table, save_table, delete_table, rename_table, to_excel_bytes
 from schema_store import (
     list_schema_names, get_schema, save_schema, delete_schema,
     normalize_field, flatten_fields_for_table,
@@ -163,30 +168,152 @@ def clean_fields_for_save(fields: list, require_include: bool = False) -> list:
 # Nested results rendering - one document per expander: scalar fields as
 # a key/value summary, each list field as its own sub-table underneath.
 # ----------------------------------------------------------------------
-def render_nested_result(filename: str, extracted: dict, error: str | None = None):
-    with st.expander(f"📄 {filename}", expanded=False):
-        if error:
-            st.error(error)
-            return
-        scalar_row = {}
-        list_fields = {}
-        for field_name, raw_value in extracted.items():
-            value = extract_value(raw_value)
-            if isinstance(value, list):
-                list_fields[field_name] = value
-            else:
-                scalar_row[field_name] = value
+def build_document_rows(extracted: dict):
+    """
+    Shapes one document's extracted data into the Excel-style layout:
+    - scalar fields -> one value, only on row 0 (blank on later rows -> merge target)
+    - each list field -> its own sub-columns ("field.subfield"), one row per
+      item; rows beyond that field's own item count are blank
+    Row count for the document = max(len of any list field, 1).
+    Returns (columns, rows, scalar_col_names).
+    """
+    scalar, list_fields = {}, {}
+    for field_name, raw_value in extracted.items():
+        value = extract_value(raw_value)
+        if isinstance(value, list):
+            list_fields[field_name] = value
+        else:
+            scalar[field_name] = value
 
-        if scalar_row:
-            st.table(pd.DataFrame([scalar_row]))
+    list_columns = {}
+    for fname, items in list_fields.items():
+        cols, seen = [], set()
+        for item in items:
+            if isinstance(item, dict):
+                for k in item.keys():
+                    if k not in seen:
+                        seen.add(k)
+                        cols.append(k)
+        list_columns[fname] = cols or ["value"]
 
-        for field_name, items in list_fields.items():
-            count = len(items)
-            st.caption(f"**{field_name}** — {count} item(s)")
-            if count:
-                st.dataframe(pd.DataFrame(items), use_container_width=True)
+    max_len = max([len(v) for v in list_fields.values()] + [1])
+    rows = []
+    for i in range(max_len):
+        row = dict(scalar) if i == 0 else {k: None for k in scalar}
+        for fname, items in list_fields.items():
+            cols = list_columns[fname]
+            item = items[i] if i < len(items) else None
+            if item is None:
+                for c in cols:
+                    row[f"{fname}.{c}"] = None
+            elif isinstance(item, dict):
+                for c in cols:
+                    row[f"{fname}.{c}"] = item.get(c)
             else:
-                st.info("None found.")
+                row[f"{fname}.value"] = item
+        rows.append(row)
+
+    scalar_col_names = list(scalar.keys())
+    list_col_names = [f"{fname}.{c}" for fname, cols in list_columns.items() for c in cols]
+    return scalar_col_names + list_col_names, rows, scalar_col_names
+
+
+def _shaped_docs(results: list):
+    """Runs build_document_rows for every successful result and unions columns/scalar-col-set across docs."""
+    docs, columns, scalar_cols_all = [], [], set()
+    for r in results:
+        if r.get("error"):
+            continue
+        cols, rows, scalar_cols = build_document_rows(r.get("extracted", {}))
+        docs.append((r.get("filename", "unknown"), rows, scalar_cols))
+        for c in cols:
+            if c not in columns:
+                columns.append(c)
+        scalar_cols_all.update(scalar_cols)
+    return docs, columns, scalar_cols_all
+
+
+def render_merged_results_table(results: list):
+    """Renders the whole run as one Excel-style HTML table: one column per field, filename + scalar fields
+    row-span-merged down each document's block of rows, list fields filling their own rows underneath."""
+    errored = [r for r in results if r.get("error")]
+    docs, columns, scalar_cols_all = _shaped_docs(results)
+
+    if not docs:
+        st.info("No successful extractions to display.")
+    else:
+        header_cols = ["filename"] + columns
+        parts = [
+            "<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:0.85rem'>",
+            "<thead><tr>" + "".join(
+                f"<th style='padding:6px 8px;background:#262730;color:white;text-align:left;position:sticky;top:0'>{html_lib.escape(c)}</th>"
+                for c in header_cols
+            ) + "</tr></thead><tbody>",
+        ]
+        for filename, rows, scalar_cols in docs:
+            n = len(rows)
+            for i, row in enumerate(rows):
+                parts.append("<tr>")
+                if i == 0:
+                    parts.append(
+                        f"<td rowspan='{n}' style='padding:6px 8px;vertical-align:top;font-weight:600;border:1px solid #444'>{html_lib.escape(filename)}</td>"
+                    )
+                for c in columns:
+                    if c in scalar_cols:
+                        if i == 0:
+                            val = row.get(c)
+                            parts.append(
+                                f"<td rowspan='{n}' style='padding:6px 8px;vertical-align:top;border:1px solid #444'>{'' if val is None else html_lib.escape(str(val))}</td>"
+                            )
+                        # else: cell is covered by the rowspan above - emit nothing
+                    else:
+                        val = row.get(c)
+                        parts.append(
+                            f"<td style='padding:6px 8px;border:1px solid #444'>{'' if val is None else html_lib.escape(str(val))}</td>"
+                        )
+                parts.append("</tr>")
+        parts.append("</tbody></table></div>")
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+    if errored:
+        with st.expander(f"⚠️ {len(errored)} file(s) had errors"):
+            for r in errored:
+                st.write(f"- {r.get('filename', 'unknown')}: {r['error']}")
+
+
+def to_excel_bytes_merged(results: list, sheet_name: str = "Extraction Results") -> bytes:
+    """Same layout as render_merged_results_table, but as a real .xlsx with actual merged cells
+    (openpyxl merge_cells) instead of HTML rowspan - opens correctly in Excel/Sheets."""
+    docs, columns, scalar_cols_all = _shaped_docs(results)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31] or "Sheet1"
+
+    header = ["filename"] + columns
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    current_row = 2
+    for filename, rows, scalar_cols in docs:
+        n = len(rows)
+        start_row = current_row
+        for i, row in enumerate(rows):
+            ws.append([filename if i == 0 else None] + [row.get(c) for c in columns])
+        end_row = start_row + n - 1
+        if n > 1:
+            ws.merge_cells(start_row=start_row, start_column=1, end_row=end_row, end_column=1)
+            for idx, c in enumerate(columns, start=2):
+                if c in scalar_cols:
+                    ws.merge_cells(start_row=start_row, start_column=idx, end_row=end_row, end_column=idx)
+        for r in range(start_row, end_row + 1):
+            ws.cell(row=r, column=1).alignment = Alignment(vertical="top")
+        current_row = end_row + 1
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
 
 def flatten_results_for_export(results: list) -> pd.DataFrame:
@@ -304,6 +431,40 @@ with tab_schema:
                         st.rerun()
         else:
             st.info("No schemas saved yet — build one on the right.")
+
+        st.subheader("Load from engine templates")
+        st.caption("Pulls pre-built schemas from GET /templates so you don't have to redefine common ones by hand.")
+        if st.button("🔄 Fetch templates"):
+            try:
+                with st.spinner("Fetching templates..."):
+                    templates = get_client().get_templates()
+                st.session_state["_fetched_templates"] = templates
+            except ApiError as e:
+                st.error(str(e))
+
+        templates = st.session_state.get("_fetched_templates")
+        if templates:
+            # ASSUMPTION: each template item has a name (name/template_name)
+            # and a fields list (name/type/description/properties, same
+            # shape as everywhere else in this app). Adjust the key lookups
+            # below if the real /templates response differs.
+            for i, tpl in enumerate(templates):
+                tpl_name = tpl.get("name") or tpl.get("template_name") or f"template_{i}"
+                tpl_fields = tpl.get("fields") or tpl.get("schema", {}).get("fields", [])
+                with st.expander(f"📋 {tpl_name}"):
+                    if tpl.get("description"):
+                        st.caption(tpl["description"])
+                    if tpl_fields:
+                        st.table(pd.DataFrame(flatten_fields_for_table(normalize_fields(tpl_fields))))
+                    else:
+                        st.json(tpl)  # unrecognized shape - show raw so it can still be inspected
+                    save_as = st.text_input("Save as schema name", value=tpl_name, key=f"tpl_save_name_{i}")
+                    if st.button("💾 Save this template as a schema", key=f"tpl_save_{i}", disabled=not tpl_fields):
+                        save_schema(save_as.strip() or tpl_name, {"mode": "fields", "fields": normalize_fields(tpl_fields)})
+                        st.success(f"Saved '{save_as or tpl_name}'.")
+                        st.rerun()
+        elif "_fetched_templates" in st.session_state:
+            st.info("No templates returned by the engine.")
 
     with right:
         st.subheader("Create a new schema")
@@ -479,13 +640,11 @@ with tab_run:
 
         if st.session_state.last_run_results is not None:
             st.subheader("Latest run results")
-            for r in st.session_state.last_run_results:
-                render_nested_result(r.get("filename", "unknown"), r.get("extracted", {}), r.get("error"))
+            render_merged_results_table(st.session_state.last_run_results)
 
-            flat_df = flatten_results_for_export(st.session_state.last_run_results)
             st.download_button(
-                "⬇️ Download this run as Excel (flattened)",
-                data=to_excel_bytes(flat_df),
+                "⬇️ Download this run as Excel (merged cells)",
+                data=to_excel_bytes_merged(st.session_state.last_run_results, sheet_name=st.session_state.last_run_schema_name or "Results"),
                 file_name=f"{st.session_state.last_run_schema_name or 'results'}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
@@ -502,6 +661,16 @@ with tab_tables:
         df = load_table(selected_table)
         st.write(f"{len(df)} row(s)")
         st.dataframe(df, use_container_width=True)
+
+        with st.expander("✏️ Rename table"):
+            new_name = st.text_input("New name", value=selected_table, key=f"rename_{selected_table}")
+            if st.button("Rename", key=f"rename_btn_{selected_table}"):
+                try:
+                    renamed_to = rename_table(selected_table, new_name)
+                    st.success(f"Renamed to '{renamed_to}'.")
+                    st.rerun()
+                except (FileNotFoundError, ValueError) as e:
+                    st.error(str(e))
 
         c1, c2 = st.columns(2)
         with c1:

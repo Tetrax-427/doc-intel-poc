@@ -97,7 +97,7 @@ class Config:
     # Applied when no explicit quota is set for the user/team/org.
     # Org admins can override these per-user/team/org via POST /usage/quotas.
 
-    default_max_documents: int          # 50
+    default_max_documents: int          # 500
     default_max_uploads_per_day: int    # 20
     default_max_llm_cost_month: float   # $5.00
     default_max_queries_per_day: int    # 100
@@ -237,7 +237,7 @@ def load_config() -> Config:
     rate_limit_query_per_minute  = int(os.getenv("RATE_LIMIT_QUERY_PER_MINUTE",  "60"))
 
     # Quota defaults
-    default_max_documents      = int(os.getenv("DEFAULT_MAX_DOCUMENTS",       "50"))
+    default_max_documents      = int(os.getenv("DEFAULT_MAX_DOCUMENTS",       "500"))
     default_max_uploads_per_day= int(os.getenv("DEFAULT_MAX_UPLOADS_PER_DAY", "20"))
     default_max_llm_cost_month = float(os.getenv("DEFAULT_MAX_LLM_COST_MONTH","5.00"))
     default_max_queries_per_day= int(os.getenv("DEFAULT_MAX_QUERIES_PER_DAY", "100"))
