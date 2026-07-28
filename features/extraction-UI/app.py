@@ -84,25 +84,36 @@ def ensure_valid_session() -> bool:
 
 
 def render_login():
-    st.title("📄 DocIntel Extraction Helper")
-    st.subheader("Sign in")
-    with st.form("login_form"):
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary")
-    if submitted:
-        if not email.strip() or not password:
-            st.error("Enter both email and password.")
-        else:
-            try:
-                client = DocIntelClient(get_base_url(), timeout=get_timeout())
-                result = client.login(email.strip(), password)
-                st.session_state.access_token = result["access_token"]
-                st.session_state.refresh_token = result.get("refresh_token")
-                st.session_state.user_email = result.get("user", {}).get("email", email.strip())
-                st.rerun()
-            except ApiError as e:
-                st.error(f"Sign in failed: {e}")
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stForm"] { max-width: 400px; margin: 0 auto; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown("<div style='text-align:center'>📄</div>", unsafe_allow_html=True)
+        st.markdown("<h2 style='text-align:center'>DocIntel Extraction Helper</h2>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align:center;color:gray'>Sign in to continue</p>", unsafe_allow_html=True)
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if submitted:
+            if not email.strip() or not password:
+                st.error("Enter both email and password.")
+            else:
+                try:
+                    client = DocIntelClient(get_base_url(), timeout=get_timeout())
+                    result = client.login(email.strip(), password)
+                    st.session_state.access_token = result["access_token"]
+                    st.session_state.refresh_token = result.get("refresh_token")
+                    st.session_state.user_email = result.get("user", {}).get("email", email.strip())
+                    st.rerun()
+                except ApiError as e:
+                    st.error(f"Sign in failed: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -410,7 +421,26 @@ with st.expander("🔒 Change password"):
                 else:
                     st.error(f"Could not change password: {e}")
 
-tab_schema, tab_run, tab_tables = st.tabs(["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables"])
+tab_labels = ["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables"]
+st.markdown(
+    """
+    <style>
+    .stTabs [data-baseweb="tab-list"] { gap: 32px; border-bottom: 2px solid #444; }
+    .stTabs [data-baseweb="tab"] {
+        padding: 10px 4px;
+        font-size: 1.05rem;
+        font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        border-bottom: 3px solid #ff4b4b;
+        color: #ff4b4b;
+        font-weight: 700;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+tab_schema, tab_run, tab_tables = st.tabs(tab_labels)
 
 # ----------------------------------------------------------------------
 # TAB 1 - Schema builder
