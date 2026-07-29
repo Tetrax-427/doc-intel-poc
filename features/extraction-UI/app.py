@@ -236,7 +236,7 @@ def _shaped_docs(results: list):
         if r.get("error"):
             continue
         cols, rows, scalar_cols = build_document_rows(r.get("extracted", {}))
-        docs.append((r.get("filename", "unknown"), rows, scalar_cols))
+        docs.append((r.get("filename", "unknown"), r.get("document_id", ""), rows, scalar_cols))
         for c in cols:
             if c not in columns:
                 columns.append(c)
@@ -253,7 +253,7 @@ def render_merged_results_table(results: list):
     if not docs:
         st.info("No successful extractions to display.")
     else:
-        header_cols = ["filename"] + columns
+        header_cols = ["filename", "document_id"] + columns
         parts = [
             "<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:0.85rem'>",
             "<thead><tr>" + "".join(
@@ -261,13 +261,16 @@ def render_merged_results_table(results: list):
                 for c in header_cols
             ) + "</tr></thead><tbody>",
         ]
-        for filename, rows, scalar_cols in docs:
+        for filename, document_id, rows, scalar_cols in docs:
             n = len(rows)
             for i, row in enumerate(rows):
                 parts.append("<tr>")
                 if i == 0:
                     parts.append(
                         f"<td rowspan='{n}' style='padding:6px 8px;vertical-align:top;font-weight:600;border:1px solid #444'>{html_lib.escape(filename)}</td>"
+                    )
+                    parts.append(
+                        f"<td rowspan='{n}' style='padding:6px 8px;vertical-align:top;color:#888;font-size:0.75rem;border:1px solid #444'>{html_lib.escape(document_id)}</td>"
                     )
                 for c in columns:
                     if c in scalar_cols:
@@ -301,25 +304,27 @@ def to_excel_bytes_merged(results: list, sheet_name: str = "Extraction Results")
     ws = wb.active
     ws.title = sheet_name[:31] or "Sheet1"
 
-    header = ["filename"] + columns
+    header = ["filename", "document_id"] + columns
     ws.append(header)
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
     current_row = 2
-    for filename, rows, scalar_cols in docs:
+    for filename, document_id, rows, scalar_cols in docs:
         n = len(rows)
         start_row = current_row
         for i, row in enumerate(rows):
-            ws.append([filename if i == 0 else None] + [row.get(c) for c in columns])
+            ws.append([filename if i == 0 else None, document_id if i == 0 else None] + [row.get(c) for c in columns])
         end_row = start_row + n - 1
         if n > 1:
             ws.merge_cells(start_row=start_row, start_column=1, end_row=end_row, end_column=1)
-            for idx, c in enumerate(columns, start=2):
+            ws.merge_cells(start_row=start_row, start_column=2, end_row=end_row, end_column=2)
+            for idx, c in enumerate(columns, start=3):
                 if c in scalar_cols:
                     ws.merge_cells(start_row=start_row, start_column=idx, end_row=end_row, end_column=idx)
         for r in range(start_row, end_row + 1):
             ws.cell(row=r, column=1).alignment = Alignment(vertical="top")
+            ws.cell(row=r, column=2).alignment = Alignment(vertical="top")
         current_row = end_row + 1
 
     buffer = io.BytesIO()
@@ -337,8 +342,9 @@ def flatten_results_for_export(results: list) -> pd.DataFrame:
     rows = []
     for r in results:
         filename = r.get("filename")
+        document_id = r.get("document_id")
         if r.get("error"):
-            rows.append({"filename": filename, "error": r["error"]})
+            rows.append({"filename": filename, "document_id": document_id, "error": r["error"]})
             continue
         extracted = r.get("extracted", {})
         scalar = {}
@@ -351,14 +357,14 @@ def flatten_results_for_export(results: list) -> pd.DataFrame:
                 scalar[field_name] = value
 
         if not list_fields:
-            rows.append({"filename": filename, **scalar})
+            rows.append({"filename": filename, "document_id": document_id, **scalar})
             continue
 
         primary_field, primary_items = next(iter(list_fields.items()))
         if not primary_items:
-            rows.append({"filename": filename, **scalar})
+            rows.append({"filename": filename, "document_id": document_id, **scalar})
         for item in primary_items:
-            row = {"filename": filename, **scalar}
+            row = {"filename": filename, "document_id": document_id, **scalar}
             row.update({f"{primary_field}.{k}": v for k, v in item.items()})
             rows.append(row)
     return pd.DataFrame(rows)

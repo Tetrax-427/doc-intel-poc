@@ -69,6 +69,7 @@ def _run_coro(coro):
 
 async def _process_one(async_client, http_client, semaphore, fname, fbytes, fields, schema_name, progress_state, progress_cb):
     async with semaphore:
+        doc_id = None
         try:
             up = await async_client.upload_document(http_client, fbytes, fname)
             doc_id = up.get("document_id")
@@ -80,10 +81,13 @@ async def _process_one(async_client, http_client, semaphore, fname, fbytes, fiel
             # render_nested_result / flatten_results_for_export call
             # extract_value() themselves, since a "list" field's value is a
             # list of dicts that a flat row can't hold anyway.
-            row = {"filename": fname, "extracted": extracted}
+            row = {"filename": fname, "document_id": doc_id, "extracted": extracted}
             ok, error_msg = True, None
         except ApiError as e:
-            row = {"filename": fname, "extracted": {}, "error": str(e)}
+            # doc_id may still be None here if upload itself failed before
+            # this point - keep it in the row either way so a partial
+            # failure (upload ok, extract failed) still carries a usable id.
+            row = {"filename": fname, "document_id": doc_id, "extracted": {}, "error": str(e)}
             ok, error_msg = False, f"{fname}: {e}"
 
     progress_state["completed"] += 1
