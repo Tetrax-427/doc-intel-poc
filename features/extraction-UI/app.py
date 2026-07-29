@@ -390,12 +390,36 @@ def render_agent_result(result: dict):
             st.write(value)
 
 
+def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
+    """
+    pandas.DataFrame.where(pd.notnull(df), None) does NOT reliably turn NaN
+    into None for float64 columns - pandas converts None back to NaN when
+    writing into a numeric column, so the NaN survives to_dict(). httpx's
+    JSON encoder calls json.dumps(..., allow_nan=False), which raises
+    ValueError on any leftover NaN/Infinity - so every value needs an
+    explicit, type-level check here rather than relying on pandas' fill.
+    """
+    import math
+
+    def _clean(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        if v is pd.NaT:
+            return None
+        return v
+
+    return [{k: _clean(v) for k, v in row.items()} for row in records]
+
+
 def flatten_results_for_export(results: list) -> pd.DataFrame:
     """
-    Denormalized flat export: scalar fields repeat across one row per
-    list-item. If a document has multiple list fields, rows are the
-    cross product's first list only (kept simple - the per-document
-    nested view above is the source of truth; this is just for Excel).
+    Denormalized flat export: scalar fields repeat/blank per build_document_rows'
+    row shaping, and EVERY list field gets its own sub-columns - reuses the
+    exact same row-shaping logic as the merged view/Excel export (build_document_rows)
+    so the saved CSV table is never missing a list field just because it wasn't
+    the first one encountered. (Previously this had its own simplified
+    single-list-field implementation that silently dropped every other list
+    field and under-counted rows - fixed by reusing build_document_rows here.)
     """
     rows = []
     for r in results:
@@ -404,27 +428,9 @@ def flatten_results_for_export(results: list) -> pd.DataFrame:
         if r.get("error"):
             rows.append({"filename": filename, "document_id": document_id, "error": r["error"]})
             continue
-        extracted = r.get("extracted", {})
-        scalar = {}
-        list_fields = {}
-        for field_name, raw_value in extracted.items():
-            value = extract_value(raw_value)
-            if isinstance(value, list):
-                list_fields[field_name] = value
-            else:
-                scalar[field_name] = value
-
-        if not list_fields:
-            rows.append({"filename": filename, "document_id": document_id, **scalar})
-            continue
-
-        primary_field, primary_items = next(iter(list_fields.items()))
-        if not primary_items:
-            rows.append({"filename": filename, "document_id": document_id, **scalar})
-        for item in primary_items:
-            row = {"filename": filename, "document_id": document_id, **scalar}
-            row.update({f"{primary_field}.{k}": v for k, v in item.items()})
-            rows.append(row)
+        _cols, doc_rows, _scalar_cols = build_document_rows(r.get("extracted", {}))
+        for doc_row in doc_rows:
+            rows.append({"filename": filename, "document_id": document_id, **doc_row})
     return pd.DataFrame(rows)
 
 
@@ -831,8 +837,8 @@ with tab_agents:
 
             invoke_disabled = valid_subset.empty or not task_text.strip() or st.session_state.agent_run_id is not None
             if st.button("▶️ Run agent", type="primary", disabled=invoke_disabled):
-                document_ids = valid_subset["document_id"].tolist()
-                csv_data = valid_subset.where(pd.notnull(valid_subset), None).to_dict("records")
+                document_ids = valid_subset["document_id"].drop_duplicates().tolist()
+                csv_data = _sanitize_records_for_json(valid_subset.to_dict("records"))
                 try:
                     client = get_client()
                     invoke_result = client.invoke_agent(agent_name, task_text.strip(), document_ids, csv_data)

@@ -19,25 +19,66 @@ logger = get_logger("agents.tools.candidate_data")
 def build_candidate_dataset(document_ids: list[str], csv_data: list[dict]) -> list[dict]:
     """
     Merges the batch's document_ids with whatever CSV rows were supplied,
-    matched by document_id (CSV rows are expected to carry a "document_id"
-    column - see Extraction Helper note below). Every document_id gets an
-    entry even if no CSV row matched, so downstream stages always have a
-    consistent list to iterate and can fall back to RAG for a candidate
-    with no CSV data at all.
+    matched by document_id. Every document_id gets an entry even if no CSV
+    row matched, so downstream stages always have a consistent list to
+    iterate and can fall back to RAG for a candidate with no CSV data at all.
 
-    NOTE: Extraction Helper's current CSV export doesn't include
-    document_id as a column (it's keyed on filename) - this is a
-    prerequisite follow-up on the extraction_UI side before this merge
-    is fully wired end-to-end. Until then, callers can pass csv_data=[]
-    and every candidate falls back to RAG for everything.
+    IMPORTANT: the Extraction Helper's merged-cell CSV export puts ONE ROW
+    PER LIST-FIELD ITEM (e.g. a candidate with 2 education entries and 3
+    work entries spans 3 rows, with scalar columns only filled on the first
+    row and "prefix.suffix" columns like "education.institute_name" filled
+    only up to each list field's own row count). A naive "one row per
+    document_id" merge silently keeps only the LAST row and loses every
+    earlier list item. This reconstructs the nested lists properly: groups
+    all rows for a document_id, then for each "prefix.suffix" column group
+    rebuilds prefix -> [{suffix: value}, ...] (skipping rows with no data
+    for that prefix - those are the blank filler rows beyond that field's
+    own count), and takes the first non-null value for any non-prefixed
+    (scalar) column.
     """
-    csv_by_doc_id = {row["document_id"]: row for row in csv_data if row.get("document_id")}
+    rows_by_doc: dict[str, list[dict]] = {}
+    for row in csv_data:
+        doc_id = row.get("document_id")
+        if doc_id:
+            rows_by_doc.setdefault(doc_id, []).append(row)
+
     dataset = []
     for doc_id in document_ids:
-        row = csv_by_doc_id.get(doc_id, {})
-        candidate = dict(row)
-        candidate["document_id"] = doc_id
-        candidate["_csv_matched"] = doc_id in csv_by_doc_id
+        rows = rows_by_doc.get(doc_id, [])
+        candidate = {"document_id": doc_id, "_csv_matched": bool(rows)}
+
+        if not rows:
+            dataset.append(candidate)
+            continue
+
+        all_columns = {c for row in rows for c in row.keys()}
+        list_prefixes = {c.split(".", 1)[0] for c in all_columns if "." in c}
+        scalar_columns = {c for c in all_columns if "." not in c and c != "document_id"}
+
+        # Scalar fields: first non-null value across this candidate's rows.
+        for col in scalar_columns:
+            for row in rows:
+                v = row.get(col)
+                if v not in (None, ""):
+                    candidate[col] = v
+                    break
+
+        # List fields: rebuild prefix -> [{suffix: value}, ...], one item per
+        # row that actually had non-null data under that prefix.
+        for prefix in list_prefixes:
+            items = []
+            suffix_cols = [c for c in all_columns if c.startswith(prefix + ".")]
+            for row in rows:
+                item = {}
+                for col in suffix_cols:
+                    v = row.get(col)
+                    if v not in (None, ""):
+                        item[col[len(prefix) + 1:]] = v
+                if item:
+                    items.append(item)
+            if items:
+                candidate[prefix] = items
+
         dataset.append(candidate)
     return dataset
 
@@ -77,6 +118,24 @@ def get_field(
     value = candidate.get(field_name)
     if value not in (None, "", [], {}):
         return {"value": value, "source": "csv"}
+
+    # Exact key miss - build_candidate_dataset() names top-level keys after
+    # THAT SCHEMA's own field name (e.g. "education", "past_companies"),
+    # which may not match this agent's field_name guess (e.g.
+    # "candidate_education") at all. Before falling back to RAG, try
+    # substring-matching candidate's own keys against a normalized version
+    # of field_name, so the CSV fast path still works across differently-
+    # named schemas instead of silently degrading to RAG for every candidate.
+    normalized = field_name.replace("candidate_", "").split(".")[0]
+    if normalized:
+        matches = {
+            k: v for k, v in candidate.items()
+            if normalized.lower() in k.lower() and v not in (None, "", [], {})
+        }
+        if len(matches) == 1:
+            return {"value": next(iter(matches.values())), "source": "csv"}
+        elif matches:
+            return {"value": matches, "source": "csv"}
 
     if fallback_question:
         result = verify_via_rag(candidate["document_id"], fallback_question, user_id=user_id)

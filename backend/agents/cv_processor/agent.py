@@ -24,6 +24,7 @@ from agents.cv_processor.prompts import (
     PLAN_EVALUATION_SYSTEM,
     JUDGE_MERGE_SYSTEM,
     FINALIZE_SUMMARY_SYSTEM,
+    PROJECT_HIGHLIGHT_SYSTEM,
 )
 
 logger = get_logger("agents.cv_processor")
@@ -56,6 +57,7 @@ class PlanDraft(BaseModel):
 
 class RankedCandidate(BaseModel):
     document_id: str
+    candidate_name: str = Field(description="Copy the candidate's name through exactly as given")
     rank: int = Field(description="1 = best")
     overall_score: float = Field(ge=0, le=10)
     summary_reasoning: str
@@ -63,6 +65,17 @@ class RankedCandidate(BaseModel):
 
 class RankingResult(BaseModel):
     ranked: list[RankedCandidate]
+
+
+class ProjectHighlight(BaseModel):
+    document_id: str
+    best_project: str = ""
+    technologies: list[str] = []
+    skill_context: str = ""
+
+
+class ProjectHighlightBatch(BaseModel):
+    highlights: list[ProjectHighlight]
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +109,7 @@ def plan_evaluation(run_id: str, state: dict) -> dict:
 
     task = state["task"]
     user_id = state.get("_user_id", "system")
+    n_candidates = len(state["input_data"].get("document_ids", []))
 
     plan_draft_raw = state.get("plan_draft_raw")
 
@@ -104,7 +118,10 @@ def plan_evaluation(run_id: str, state: dict) -> dict:
         try:
             draft: PlanDraft = call_llm(
                 system=PLAN_EVALUATION_SYSTEM,
-                user=f"Task:\n{task}",
+                user=(
+                    f"{n_candidates} candidate(s) have already been selected for evaluation "
+                    f"(candidate selection is not part of your task).\n\nTask:\n{task}"
+                ),
                 temperature=0.0,
                 call_type="agent_plan",
                 response_model=PlanDraft,
@@ -243,7 +260,7 @@ def merge_scores(run_id: str, state: dict) -> dict:
     per_candidate_summary = []
     for c in candidates:
         doc_id = c["document_id"]
-        entry = {"document_id": doc_id}
+        entry = {"document_id": doc_id, "candidate_name": c.get("candidate_name") or doc_id}
         for crit_name, crit_scores in criterion_scores.items():
             entry[crit_name] = crit_scores.get(doc_id, {"score": 0.0, "reasoning": "No score available."})
         per_candidate_summary.append(entry)
@@ -278,19 +295,88 @@ def merge_scores(run_id: str, state: dict) -> dict:
 # Stage: finalize_response (fixed output contract)
 # ---------------------------------------------------------------------------
 
+def _get_project_highlights(candidates: list[dict], target_entries: list[dict], plan: dict, task: str, user_id: str = "system") -> dict:
+    """
+    One batched call extracting each shown candidate's best/most relevant
+    project + technologies used + how the required skill(s) were applied.
+    Only called for candidates actually shown to the requester (top +
+    honorable mentions), not the full evaluated set - keeps this to a
+    bounded, small number of extra LLM calls regardless of batch size.
+    """
+    if not target_entries:
+        return {}
+
+    by_doc = {c["document_id"]: c for c in candidates}
+    skills_wanted = ", ".join(s["name"] for s in plan["skills"])
+
+    trimmed = []
+    for e in target_entries:
+        c = by_doc.get(e["document_id"], {"document_id": e["document_id"]})
+        exp = get_field(
+            c, "work_experience",
+            fallback_question=f"List this candidate's key projects, the technologies/skills used in each, and how each relates to: {skills_wanted}.",
+            user_id=user_id,
+        )
+        trimmed.append({"document_id": e["document_id"], "work_experience": exp["value"]})
+
+    try:
+        result: ProjectHighlightBatch = call_llm(
+            system=PROJECT_HIGHLIGHT_SYSTEM,
+            user=f"Requester's original request:\n{task}\n\nCandidates:\n{trimmed}",
+            temperature=0.0,
+            call_type="agent_project_highlight",
+            response_model=ProjectHighlightBatch,
+            structured_max_retries=1,
+            user_id=user_id,
+        )
+        return {h.document_id: h.model_dump() for h in result.highlights}
+    except Exception as exc:
+        logger.warning("Project highlight extraction failed - continuing without it", error=str(exc))
+        return {}
+
+
 def finalize_response(run_id: str, state: dict) -> dict:
-    plan, ranked, task, user_id = (
-        state["plan"], state["ranked"], state["task"], state.get("_user_id", "system"),
+    plan, ranked, task, candidates, user_id = (
+        state["plan"], state["ranked"], state["task"], state["candidates"], state.get("_user_id", "system"),
     )
 
     ranked_sorted = sorted(ranked, key=lambda r: r["rank"])
     requested_count = plan.get("requested_count")
     top = ranked_sorted[:requested_count] if requested_count else ranked_sorted
 
+    # Honorable mentions: a small sample of candidates just outside the
+    # shortlist, so the requester can see who almost made it (only
+    # meaningful when a specific count was requested and more candidates
+    # exist beyond it).
+    honorable_mentions = []
+    if requested_count and len(ranked_sorted) > len(top):
+        honorable_mentions = ranked_sorted[len(top): len(top) + 3]
+
+    highlights = _get_project_highlights(candidates, top + honorable_mentions, plan, task, user_id=user_id)
+
+    def _enrich(entries: list[dict]) -> list[dict]:
+        out = []
+        for e in entries:
+            h = highlights.get(e["document_id"], {})
+            out.append({
+                **e,
+                "best_project": h.get("best_project", ""),
+                "technologies": h.get("technologies", []),
+                "skill_context": h.get("skill_context", ""),
+            })
+        return out
+
+    top_enriched = _enrich(top)
+    mentions_enriched = _enrich(honorable_mentions)
+
     try:
         summary = call_llm(
             system=FINALIZE_SUMMARY_SYSTEM,
-            user=f"Original request:\n{task}\n\nFinal ranking:\n{top}",
+            user=(
+                f"Original request:\n{task}\n\n"
+                f"Full ranking - ALL {len(ranked_sorted)} candidate(s) evaluated:\n{ranked_sorted}\n\n"
+                f"Shown to requester as the shortlist (top {len(top)}):\n{[{'candidate_name': e['candidate_name'], 'rank': e['rank']} for e in top]}"
+            ),
             temperature=0.3,
             call_type="agent_finalize_summary",
             user_id=user_id,
@@ -299,12 +385,26 @@ def finalize_response(run_id: str, state: dict) -> dict:
         logger.warning("Finalize summary call failed - using a plain fallback", run_id=run_id, error=str(exc))
         summary = f"Evaluated {len(ranked_sorted)} candidate(s); top {len(top)} shown below."
 
-    findings = [f"#{r['rank']} (document {r['document_id']}): {r['summary_reasoning']}" for r in top]
+    def _finding_line(e: dict) -> str:
+        line = f"#{e['rank']} {e['candidate_name']} (document {e['document_id']}, score {e['overall_score']}): {e['summary_reasoning']}"
+        if e.get("best_project"):
+            line += f" Best project: {e['best_project']}"
+            if e.get("technologies"):
+                line += f" — technologies: {', '.join(e['technologies'])}"
+            if e.get("skill_context"):
+                line += f" ({e['skill_context']})"
+        return line
+
+    findings = [_finding_line(e) for e in top_enriched]
+
+    data = [{"type": "table", "label": "Ranked candidates", "value": top_enriched}]
+    if mentions_enriched:
+        data.append({"type": "table", "label": "Honorable mentions (just outside the shortlist)", "value": mentions_enriched})
 
     result = {
         "summary": summary,
         "findings": findings,
-        "data": [{"type": "table", "label": "Ranked candidates", "value": top}],
+        "data": data,
         "extra": {"plan": plan, "criterion_scores": state.get("criterion_scores", {}), "all_ranked": ranked_sorted},
     }
 
