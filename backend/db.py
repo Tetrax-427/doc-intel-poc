@@ -7,9 +7,15 @@ Changes in this phase (Security + Org/Team):
   - get_all_documents()    now filters by visibility rules
   - insert_document()      now accepts org_id, team_id, visibility
   - delete_document_by_id() cascade order updated for lineage_logs
+
+Changes in Agents:
+  - Added agent_runs table helpers (create/get/update/mark_*/list) at the
+    bottom of this file - backs backend/agents/base.py's stage state
+    machine (pause/resume via status="needs_input", state, pending_questions)
 """
 
 import os
+import datetime as _dt
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -356,3 +362,109 @@ def get_api_key_by_id(key_id: str, user_id: str) -> dict | None:
         .execute()
     )
     return resp.data[0] if resp.data else None
+
+
+# ── Agent runs ────────────────────────────────────────────────────────────────
+#
+# Backs the plain-Python agent state machine in backend/agents/base.py:
+# create on invoke, update per stage, pause at needs_input, resume once the
+# caller supplies answers. See supabase/migrations/agent_runs.sql for the
+# table definition.
+
+def create_agent_run(
+    agent_name: str,
+    task: str,
+    input_data: dict | None = None,
+    user_id: str = "anonymous",
+) -> str:
+    result = get_supabase_admin().table("agent_runs").insert({
+        "agent_name":  agent_name,
+        "task":        task,
+        "input_data":  input_data or {},
+        "status":      "pending",
+        "state":       {},
+        "user_id":     user_id,
+    }).execute()
+    return result.data[0]["id"]
+
+
+def get_agent_run(run_id: str, user_id: str = "anonymous") -> dict | None:
+    """Returns the full row (including state/result/pending_questions), scoped to the owning user."""
+    result = (
+        get_supabase_admin().table("agent_runs")
+        .select("*")
+        .eq("id", run_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def update_agent_run(run_id: str, **fields) -> bool:
+    """
+    Generic partial update — pass any subset of:
+      status, current_stage, state, pending_questions, result, error,
+      started_at, completed_at
+    state/pending_questions/result are jsonb columns - pass plain dicts/lists,
+    not JSON strings. Returns True if a row was updated.
+    """
+    if not fields:
+        return False
+    result = (
+        get_supabase_admin().table("agent_runs")
+        .update(fields)
+        .eq("id", run_id)
+        .execute()
+    )
+    return bool(result.data)
+
+
+def mark_agent_run_started(run_id: str) -> bool:
+    return update_agent_run(
+        run_id, status="running",
+        started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+    )
+
+
+def mark_agent_run_needs_input(run_id: str, current_stage: str, state: dict, questions: list) -> bool:
+    return update_agent_run(
+        run_id, status="needs_input", current_stage=current_stage,
+        state=state, pending_questions=questions,
+    )
+
+
+def mark_agent_run_completed(run_id: str, state: dict, result: dict) -> bool:
+    return update_agent_run(
+        run_id, status="completed", state=state, result=result,
+        pending_questions=None,
+        completed_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+    )
+
+
+def mark_agent_run_failed(run_id: str, state: dict, error: str) -> bool:
+    return update_agent_run(
+        run_id, status="failed", state=state, error=error,
+        completed_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+    )
+
+
+def list_agent_runs(
+    user_id: str = "anonymous",
+    agent_name: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    query = (
+        get_supabase_admin().table("agent_runs")
+        .select("id, agent_name, task, status, current_stage, created_at, completed_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if agent_name:
+        query = query.eq("agent_name", agent_name)
+    if status:
+        query = query.eq("status", status)
+    result = query.execute()
+    return result.data or []
