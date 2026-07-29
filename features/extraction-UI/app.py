@@ -17,6 +17,7 @@ from pathlib import Path
 
 import html as html_lib
 import io
+import time
 
 import pandas as pd
 import streamlit as st
@@ -50,6 +51,9 @@ for key, default in [
     ("last_run_schema_name", None),
     ("nl_previewed_instruction", None),
     ("nl_preview_fields", []),
+    ("agent_run_id", None),
+    ("agent_run_status", None),        # last polled row: status/current_stage/pending_questions/result/error
+    ("agent_answers_form", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -332,6 +336,60 @@ def to_excel_bytes_merged(results: list, sheet_name: str = "Extraction Results")
     return buffer.getvalue()
 
 
+# ----------------------------------------------------------------------
+# Agents - polling + result rendering
+# ----------------------------------------------------------------------
+AGENT_TERMINAL_STATUSES = {"needs_input", "completed", "failed"}
+
+
+def poll_agent_run_until_terminal(client: DocIntelClient, run_id: str, poll_interval: float = 2.0, timeout: float = 600.0) -> dict:
+    """
+    Blocks (with a spinner) polling GET /agents/runs/{run_id} until status
+    reaches needs_input/completed/failed, or `timeout` seconds elapse.
+    Matches the existing blocking-with-spinner pattern used for batch
+    extraction runs - agent runs are similarly long (multiple LLM calls),
+    so this is consistent UX rather than a background-refresh model.
+    """
+    status_area = st.empty()
+    start = time.time()
+    run = client.get_agent_run(run_id)
+    while run.get("status") not in AGENT_TERMINAL_STATUSES:
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            run["status"] = "failed"
+            run["error"] = f"Timed out waiting for the agent after {int(timeout)}s (last stage: {run.get('current_stage')})."
+            break
+        status_area.write(f"⏳ {run.get('status', 'pending')} — stage: {run.get('current_stage') or 'starting'} ({int(elapsed)}s)")
+        time.sleep(poll_interval)
+        run = client.get_agent_run(run_id)
+    status_area.empty()
+    return run
+
+
+def render_agent_result(result: dict):
+    """Renders the fixed agent output contract: summary (prose), findings (bullets), data (tables/csv/json)."""
+    if result.get("summary"):
+        st.write(result["summary"])
+
+    findings = result.get("findings") or []
+    if findings:
+        st.markdown("\n".join(f"- {f}" for f in findings))
+
+    for item in result.get("data") or []:
+        label = item.get("label") or item.get("type", "Data")
+        item_type = item.get("type")
+        value = item.get("value")
+        st.caption(f"**{label}**")
+        if item_type == "table" and isinstance(value, list):
+            st.dataframe(pd.DataFrame(value), use_container_width=True)
+        elif item_type == "csv":
+            st.code(value if isinstance(value, str) else str(value), language="text")
+        elif item_type == "json":
+            st.json(value)
+        else:
+            st.write(value)
+
+
 def flatten_results_for_export(results: list) -> pd.DataFrame:
     """
     Denormalized flat export: scalar fields repeat across one row per
@@ -427,7 +485,7 @@ with st.expander("🔒 Change password"):
                 else:
                     st.error(f"Could not change password: {e}")
 
-tab_labels = ["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables"]
+tab_labels = ["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables", "4️⃣ Agents"]
 st.markdown(
     """
     <style>
@@ -446,7 +504,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-tab_schema, tab_run, tab_tables = st.tabs(tab_labels)
+tab_schema, tab_run, tab_tables, tab_agents = st.tabs(tab_labels)
 
 # ----------------------------------------------------------------------
 # TAB 1 - Schema builder
@@ -719,4 +777,112 @@ with tab_tables:
         with c2:
             if st.button("🗑️ Delete table"):
                 delete_table(selected_table)
+                st.rerun()
+
+
+# ----------------------------------------------------------------------
+# TAB 4 - Agents (invoke, poll, answer clarifying questions, view result)
+# ----------------------------------------------------------------------
+with tab_agents:
+    st.subheader("Run an agent over a batch of candidates")
+
+    tables = list_tables()
+    if not tables:
+        st.info("No saved tables yet. Run an extraction first (Tab 2) - agents work over an extracted CSV table.")
+    else:
+        source_table = st.selectbox("Source table (candidates)", tables, key="agent_source_table")
+        source_df = load_table(source_table)
+
+        if "document_id" not in source_df.columns:
+            st.warning(
+                "This table has no 'document_id' column - it was likely saved before document_id was "
+                "added to the CSV export. Re-run extraction on these documents to get a table agents can use."
+            )
+        elif source_df.empty:
+            st.info("This table has no rows.")
+        else:
+            st.caption(f"{len(source_df)} row(s) in '{source_table}'.")
+            select_all = st.checkbox("Include all rows", value=True)
+            if select_all:
+                subset_df = source_df
+            else:
+                display_col = "filename" if "filename" in source_df.columns else source_df.columns[0]
+                chosen = st.multiselect("Candidates to include", source_df[display_col].tolist())
+                subset_df = source_df[source_df[display_col].isin(chosen)]
+
+            valid_subset = subset_df[subset_df["document_id"].notna() & (subset_df["document_id"] != "")]
+            if len(valid_subset) < len(subset_df):
+                st.caption(f"⚠️ Skipping {len(subset_df) - len(valid_subset)} row(s) with no document_id.")
+
+            try:
+                available_agents = get_client().list_agents()
+            except ApiError:
+                available_agents = ["cv_processor"]  # fallback if the endpoint isn't reachable yet
+            agent_name = st.selectbox("Agent", available_agents or ["cv_processor"])
+
+            task_text = st.text_area(
+                "Task",
+                placeholder=(
+                    "Identify the best 5 candidates for this JD. Main skills to evaluate: Python (must-have), "
+                    "Docker (nice to have). Education is important - IIT/NIT preferred. ..."
+                ),
+                height=140,
+            )
+
+            invoke_disabled = valid_subset.empty or not task_text.strip() or st.session_state.agent_run_id is not None
+            if st.button("▶️ Run agent", type="primary", disabled=invoke_disabled):
+                document_ids = valid_subset["document_id"].tolist()
+                csv_data = valid_subset.where(pd.notnull(valid_subset), None).to_dict("records")
+                try:
+                    client = get_client()
+                    invoke_result = client.invoke_agent(agent_name, task_text.strip(), document_ids, csv_data)
+                    st.session_state.agent_run_id = invoke_result["run_id"]
+                    with st.spinner("Agent running..."):
+                        run = poll_agent_run_until_terminal(client, invoke_result["run_id"])
+                    st.session_state.agent_run_status = run
+                except ApiError as e:
+                    st.error(f"Could not start agent: {e}")
+
+    # ---- Render whatever the last known run status is ----
+    run = st.session_state.agent_run_status
+    if run:
+        status = run.get("status")
+        st.divider()
+
+        if status == "needs_input":
+            st.info("The agent needs a bit more information before continuing.")
+            questions = run.get("pending_questions") or []
+            with st.form("agent_answers_form"):
+                answers = {}
+                for q in questions:
+                    key, question, q_type, options = q["key"], q["question"], q.get("type", "text"), q.get("options") or []
+                    if q_type == "select" and options:
+                        answers[key] = st.selectbox(question, options, key=f"agent_q_{key}")
+                    else:
+                        answers[key] = st.text_input(question, key=f"agent_q_{key}")
+                submitted = st.form_submit_button("Submit answers and continue")
+            if submitted:
+                try:
+                    client = get_client()
+                    client.resume_agent_run(st.session_state.agent_run_id, answers)
+                    with st.spinner("Agent resuming..."):
+                        run = poll_agent_run_until_terminal(client, st.session_state.agent_run_id)
+                    st.session_state.agent_run_status = run
+                    st.rerun()
+                except ApiError as e:
+                    st.error(f"Could not resume agent: {e}")
+
+        elif status == "completed":
+            st.success("Agent finished.")
+            render_agent_result(run.get("result") or {})
+            if st.button("Start a new agent run"):
+                st.session_state.agent_run_id = None
+                st.session_state.agent_run_status = None
+                st.rerun()
+
+        elif status == "failed":
+            st.error(f"Agent run failed: {run.get('error', 'unknown error')}")
+            if st.button("Start a new agent run", key="retry_failed"):
+                st.session_state.agent_run_id = None
+                st.session_state.agent_run_status = None
                 st.rerun()

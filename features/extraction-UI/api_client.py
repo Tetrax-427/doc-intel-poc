@@ -171,6 +171,23 @@ class DocIntelClient:
         result = self._request("POST", "/extract/nl", op="light", json=payload, headers=self._headers())
         return result.get("schema", {}).get("fields", [])
 
+    # ---- Agents ----
+    def list_agents(self) -> list:
+        result = self._request("GET", "/agents", op="light", headers=self._headers(json_mode=False))
+        return result.get("agents", [])
+
+    def invoke_agent(self, agent_name: str, task: str, document_ids: list, csv_data: list | None = None, extra: dict | None = None) -> dict:
+        """Returns {"run_id": ..., "status": "pending"} immediately - the actual run happens in a backend worker thread."""
+        payload = {"task": task, "document_ids": document_ids, "csv_data": csv_data or [], "extra": extra or {}}
+        return self._request("POST", f"/agents/{agent_name}/invoke", op="light", json=payload, headers=self._headers())
+
+    def get_agent_run(self, run_id: str) -> dict:
+        """Full agent_runs row - status, current_stage, pending_questions, result, error."""
+        return self._request("GET", f"/agents/runs/{run_id}", op="light", headers=self._headers(json_mode=False))
+
+    def resume_agent_run(self, run_id: str, answers: dict) -> dict:
+        return self._request("POST", f"/agents/runs/{run_id}/resume", op="light", json={"answers": answers}, headers=self._headers())
+
 
 class AsyncDocIntelClient:
     """Async client used only by the parallel upload+extract pipeline (see batch_runner.py)."""
