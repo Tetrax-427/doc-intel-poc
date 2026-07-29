@@ -27,6 +27,7 @@ from routers.orgs import router as orgs_router
 from routers.usage import router as usage_router
 from routers.llm_observability import router as llm_observability_router
 from routers import comparison
+from routers.agents import router as agents_router
 
 
 load_dotenv()
@@ -124,6 +125,7 @@ app.include_router(orgs_router)
 app.include_router(usage_router)
 app.include_router(llm_observability_router)
 app.include_router(comparison.router)
+app.include_router(agents_router)
 # ── API Key endpoints ─────────────────────────────────────────────────────────
 
 class CreateApiKeyRequest(BaseModel):
