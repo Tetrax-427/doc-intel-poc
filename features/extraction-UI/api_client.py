@@ -188,6 +188,14 @@ class DocIntelClient:
     def resume_agent_run(self, run_id: str, answers: dict) -> dict:
         return self._request("POST", f"/agents/runs/{run_id}/resume", op="light", json={"answers": answers}, headers=self._headers())
 
+    def list_agent_runs(self, agent_name: str | None = None, status: str | None = None, limit: int = 50) -> list:
+        params = {"limit": limit}
+        if agent_name:
+            params["agent_name"] = agent_name
+        if status:
+            params["status"] = status
+        return self._request("GET", "/agents/runs", op="light", params=params, headers=self._headers(json_mode=False))
+
 
 class AsyncDocIntelClient:
     """Async client used only by the parallel upload+extract pipeline (see batch_runner.py)."""

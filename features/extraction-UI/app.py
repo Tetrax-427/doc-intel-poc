@@ -37,6 +37,10 @@ ALLOWED_EXTENSIONS = {".pdf", ".docx", ".csv", ".xlsx", ".txt", ".md", ".jpg", "
 FIELD_TYPES = ["string", "integer", "date", "list"]
 EMPTY_FIELD = {"name": "", "type": "string", "description": "", "properties": None}
 
+# import api_client
+# print(api_client.__file__)
+# print(hasattr(api_client.DocIntelClient, "list_agent_runs"))
+
 st.set_page_config(page_title="DocIntel Extraction Helper", layout="wide")
 
 # ----------------------------------------------------------------------
@@ -491,7 +495,7 @@ with st.expander("🔒 Change password"):
                 else:
                     st.error(f"Could not change password: {e}")
 
-tab_labels = ["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables", "4️⃣ Agents"]
+tab_labels = ["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables", "4️⃣ Agents", "5️⃣ Past Runs"]
 st.markdown(
     """
     <style>
@@ -510,7 +514,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-tab_schema, tab_run, tab_tables, tab_agents = st.tabs(tab_labels)
+tab_schema, tab_run, tab_tables, tab_agents, tab_past_runs = st.tabs(tab_labels)
 
 # ----------------------------------------------------------------------
 # TAB 1 - Schema builder
@@ -826,28 +830,33 @@ with tab_agents:
                 available_agents = ["cv_processor"]  # fallback if the endpoint isn't reachable yet
             agent_name = st.selectbox("Agent", available_agents or ["cv_processor"])
 
-            task_text = st.text_area(
-                "Task",
-                placeholder=(
-                    "Identify the best 5 candidates for this JD. Main skills to evaluate: Python (must-have), "
-                    "Docker (nice to have). Education is important - IIT/NIT preferred. ..."
-                ),
-                height=140,
-            )
+            with st.form("agent_invoke_form"):
+                task_text = st.text_area(
+                    "Task",
+                    placeholder=(
+                        "Identify the best 5 candidates for this JD. Main skills to evaluate: Python (must-have), "
+                        "Docker (nice to have). Education is important - IIT/NIT preferred. ..."
+                    ),
+                    height=140,
+                )
+                invoke_disabled = valid_subset.empty or st.session_state.agent_run_id is not None
+                invoke_submitted = st.form_submit_button("▶️ Run agent", type="primary", disabled=invoke_disabled)
 
-            invoke_disabled = valid_subset.empty or not task_text.strip() or st.session_state.agent_run_id is not None
-            if st.button("▶️ Run agent", type="primary", disabled=invoke_disabled):
-                document_ids = valid_subset["document_id"].drop_duplicates().tolist()
-                csv_data = _sanitize_records_for_json(valid_subset.to_dict("records"))
-                try:
-                    client = get_client()
-                    invoke_result = client.invoke_agent(agent_name, task_text.strip(), document_ids, csv_data)
-                    st.session_state.agent_run_id = invoke_result["run_id"]
-                    with st.spinner("Agent running..."):
-                        run = poll_agent_run_until_terminal(client, invoke_result["run_id"])
-                    st.session_state.agent_run_status = run
-                except ApiError as e:
-                    st.error(f"Could not start agent: {e}")
+            if invoke_submitted:
+                if not task_text.strip():
+                    st.error("Describe the task first.")
+                else:
+                    document_ids = valid_subset["document_id"].drop_duplicates().tolist()
+                    csv_data = _sanitize_records_for_json(valid_subset.to_dict("records"))
+                    try:
+                        client = get_client()
+                        invoke_result = client.invoke_agent(agent_name, task_text.strip(), document_ids, csv_data)
+                        st.session_state.agent_run_id = invoke_result["run_id"]
+                        with st.spinner("Agent running..."):
+                            run = poll_agent_run_until_terminal(client, invoke_result["run_id"])
+                        st.session_state.agent_run_status = run
+                    except ApiError as e:
+                        st.error(f"Could not start agent: {e}")
 
     # ---- Render whatever the last known run status is ----
     run = st.session_state.agent_run_status
@@ -856,18 +865,22 @@ with tab_agents:
         st.divider()
 
         if status == "needs_input":
-            st.info("The agent needs a bit more information before continuing.")
             questions = run.get("pending_questions") or []
-            with st.form("agent_answers_form"):
-                answers = {}
-                for q in questions:
-                    key, question, q_type, options = q["key"], q["question"], q.get("type", "text"), q.get("options") or []
-                    if q_type == "select" and options:
-                        answers[key] = st.selectbox(question, options, key=f"agent_q_{key}")
-                    else:
-                        answers[key] = st.text_input(question, key=f"agent_q_{key}")
-                submitted = st.form_submit_button("Submit answers and continue")
+            form_placeholder = st.empty()
+            with form_placeholder.container():
+                st.info("The agent needs a bit more information before continuing.")
+                with st.form("agent_answers_form"):
+                    answers = {}
+                    for q in questions:
+                        key, question, q_type, options = q["key"], q["question"], q.get("type", "text"), q.get("options") or []
+                        if q_type == "select" and options:
+                            answers[key] = st.selectbox(question, options, key=f"agent_q_{key}")
+                        else:
+                            answers[key] = st.text_input(question, key=f"agent_q_{key}")
+                    submitted = st.form_submit_button("Submit answers and continue")
+
             if submitted:
+                form_placeholder.empty()  # remove the form/questions UI immediately, before the blocking resume+poll below
                 try:
                     client = get_client()
                     client.resume_agent_run(st.session_state.agent_run_id, answers)
@@ -892,3 +905,43 @@ with tab_agents:
                 st.session_state.agent_run_id = None
                 st.session_state.agent_run_status = None
                 st.rerun()
+
+
+# ----------------------------------------------------------------------
+# TAB 5 - Past agent runs
+# ----------------------------------------------------------------------
+with tab_past_runs:
+    st.subheader("Past agent runs")
+    try:
+        client = get_client()
+        runs = client.list_agent_runs()
+    except ApiError as e:
+        runs = []
+        st.error(f"Could not load past runs: {e}")
+
+    if not runs:
+        st.info("No agent runs yet.")
+    else:
+        status_icon = {"completed": "✅", "failed": "❌", "needs_input": "⏸️", "running": "⏳", "pending": "⏳"}
+        for run_summary in runs:
+            icon = status_icon.get(run_summary.get("status"), "•")
+            label = f"{icon} {run_summary.get('agent_name')} — {run_summary.get('created_at', '')[:19]} — {run_summary.get('status')}"
+            with st.expander(label):
+                st.caption(run_summary.get("task", ""))
+                if st.button("View details", key=f"view_run_{run_summary['id']}"):
+                    try:
+                        full_run = get_client().get_agent_run(run_summary["id"])
+                        st.session_state[f"_past_run_detail_{run_summary['id']}"] = full_run
+                    except ApiError as e:
+                        st.error(f"Could not load run: {e}")
+
+                detail = st.session_state.get(f"_past_run_detail_{run_summary['id']}")
+                if detail:
+                    if detail.get("status") == "completed":
+                        render_agent_result(detail.get("result") or {})
+                    elif detail.get("status") == "failed":
+                        st.error(f"Failed: {detail.get('error', 'unknown error')}")
+                    elif detail.get("status") == "needs_input":
+                        st.warning("This run is waiting on clarifying questions — answer it from the Agents tab.")
+                    else:
+                        st.write(f"Status: {detail.get('status')} — stage: {detail.get('current_stage')}")
