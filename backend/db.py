@@ -468,3 +468,24 @@ def list_agent_runs(
         query = query.eq("status", status)
     result = query.execute()
     return result.data or []
+
+ 
+def save_agent_chat_message(run_id: str, role: str, content: str, user_id: str) -> None:
+    get_supabase_admin().table("agent_chat_messages").insert({
+        "run_id":  run_id,
+        "role":    role,
+        "content": content,
+        "user_id": user_id,
+    }).execute()
+ 
+ 
+def get_agent_chat_history(run_id: str, user_id: str) -> list[dict]:
+    result = (
+        get_supabase_admin().table("agent_chat_messages")
+        .select("role, content, created_at")
+        .eq("run_id", run_id)
+        .eq("user_id", user_id)
+        .order("created_at")
+        .execute()
+    )
+    return result.data or []
