@@ -343,6 +343,144 @@ def to_excel_bytes_merged(results: list, sheet_name: str = "Extraction Results")
 
 
 # ----------------------------------------------------------------------
+# Merged rendering from a flat (already-saved) DataFrame — results_store
+# has no schema/column metadata, so this reconstructs the "scalar merged /
+# list per-row" shape purely from the data: a column is treated as scalar
+# (rowspan-able) if it's only ever non-null on the first row of each
+# document's block of rows. That's exactly the pattern
+# flatten_results_for_export/build_document_rows already writes when a
+# table is first saved, so this stays correct across renames and appends
+# without needing any extra state alongside the CSV.
+# ----------------------------------------------------------------------
+def _consecutive_groups(df: pd.DataFrame, key_cols: list):
+    """Yields sub-DataFrames for runs of consecutive rows sharing the same key_cols values.
+    Deliberately not a groupby-by-key: if the same document appears twice non-adjacently
+    (e.g. two separate append runs), those stay as separate blocks rather than merging into
+    one, so table row order is never reshuffled."""
+    if df.empty:
+        return
+    keys = df[key_cols].astype(str).agg("||".join, axis=1).tolist()
+    start, n = 0, len(df)
+    for i in range(1, n + 1):
+        if i == n or keys[i] != keys[start]:
+            yield df.iloc[start:i]
+            start = i
+
+
+def compute_mergeable_columns(df: pd.DataFrame, key_cols: list) -> set:
+    """A column is mergeable (rowspan-able) if, in every block, it's non-null only
+    on the block's first row - i.e. it behaves like a scalar field everywhere."""
+    other_cols = [c for c in df.columns if c not in key_cols]
+    mergeable = set(other_cols)
+    for group in _consecutive_groups(df, key_cols):
+        if len(group) <= 1 or not mergeable:
+            continue
+        rest = group.iloc[1:]
+        for c in list(mergeable):
+            if rest[c].notna().any():
+                mergeable.discard(c)
+    return mergeable
+
+
+def render_merged_table_from_df(df: pd.DataFrame):
+    """Same visual layout as render_merged_results_table, but built from a flat saved table."""
+    if df.empty:
+        st.info("This table has no rows.")
+        return
+
+    key_cols = [c for c in ("filename", "document_id") if c in df.columns]
+    if not key_cols:
+        # No grouping key at all - nothing to merge on, fall back to a plain table.
+        st.dataframe(df, use_container_width=True)
+        return
+
+    mergeable = compute_mergeable_columns(df, key_cols) | set(key_cols)
+    columns = list(df.columns)
+
+    parts = [
+        "<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:0.85rem'>",
+        "<thead><tr>" + "".join(
+            f"<th style='padding:6px 8px;background:#262730;color:white;text-align:left;position:sticky;top:0'>{html_lib.escape(c)}</th>"
+            for c in columns
+        ) + "</tr></thead><tbody>",
+    ]
+    for group in _consecutive_groups(df, key_cols):
+        n = len(group)
+        for i in range(n):
+            row = group.iloc[i]
+            parts.append("<tr>")
+            for c in columns:
+                val = row[c]
+                disp = "" if pd.isna(val) else html_lib.escape(str(val))
+                if c in mergeable:
+                    if i == 0:
+                        parts.append(
+                            f"<td rowspan='{n}' style='padding:6px 8px;vertical-align:top;border:1px solid #444'>{disp}</td>"
+                        )
+                    # else: covered by rowspan above - emit nothing
+                else:
+                    parts.append(f"<td style='padding:6px 8px;border:1px solid #444'>{disp}</td>")
+            parts.append("</tr>")
+    parts.append("</tbody></table></div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def to_excel_bytes_merged_from_df(df: pd.DataFrame, sheet_name: str = "Table") -> bytes:
+    """xlsx version of render_merged_table_from_df, with real merged cells."""
+    columns = list(df.columns)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31] or "Sheet1"
+    ws.append(columns)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    if df.empty:
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    key_cols = [c for c in ("filename", "document_id") if c in df.columns]
+    if not key_cols:
+        for row in df.itertuples(index=False):
+            ws.append(list(row))
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    mergeable = compute_mergeable_columns(df, key_cols) | set(key_cols)
+    col_index = {c: idx + 1 for idx, c in enumerate(columns)}  # 1-based for openpyxl
+
+    current_row = 2
+    for group in _consecutive_groups(df, key_cols):
+        n = len(group)
+        start_row = current_row
+        for i in range(n):
+            row = group.iloc[i]
+            out_row = []
+            for c in columns:
+                if c in mergeable and i > 0:
+                    out_row.append(None)
+                else:
+                    val = row[c]
+                    out_row.append(None if pd.isna(val) else val)
+            ws.append(out_row)
+        end_row = start_row + n - 1
+        if n > 1:
+            for c in mergeable:
+                idx = col_index[c]
+                ws.merge_cells(start_row=start_row, start_column=idx, end_row=end_row, end_column=idx)
+        for r in range(start_row, end_row + 1):
+            for c in mergeable:
+                ws.cell(row=r, column=col_index[c]).alignment = Alignment(vertical="top")
+        current_row = end_row + 1
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+# ----------------------------------------------------------------------
 # Agents - polling + result rendering
 # ----------------------------------------------------------------------
 AGENT_TERMINAL_STATUSES = {"needs_input", "completed", "failed"}
@@ -757,7 +895,9 @@ if active_tab == TAB_NAMES[1]:
             )
 
 # ----------------------------------------------------------------------
-# TAB 3 - Saved tables (flattened - see caption above in Tab 2)
+# TAB 3 - Saved tables (rendered merged by default, like the run-results
+# view - reconstructed from the flat CSV via compute_mergeable_columns,
+# see the block above near render_merged_table_from_df for how/why).
 # ----------------------------------------------------------------------
 if active_tab == TAB_NAMES[2]:
     tables = list_tables()
@@ -767,7 +907,14 @@ if active_tab == TAB_NAMES[2]:
         selected_table = st.selectbox("Table", tables)
         df = load_table(selected_table)
         st.write(f"{len(df)} row(s)")
-        st.dataframe(df, use_container_width=True)
+
+        merged_view = st.toggle(
+            "Merged view (group rows by document)", value=True, key=f"merged_toggle_{selected_table}"
+        )
+        if merged_view:
+            render_merged_table_from_df(df)
+        else:
+            st.dataframe(df, use_container_width=True)
 
         with st.expander("✏️ Rename table"):
             new_name = st.text_input("New name", value=selected_table, key=f"rename_{selected_table}")
@@ -779,15 +926,24 @@ if active_tab == TAB_NAMES[2]:
                 except (FileNotFoundError, ValueError) as e:
                     st.error(str(e))
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
-                "⬇️ Download as Excel",
+                "⬇️ Download as Excel (flat)",
                 data=to_excel_bytes(df, sheet_name=selected_table),
                 file_name=f"{selected_table}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_flat_{selected_table}",
             )
         with c2:
+            st.download_button(
+                "⬇️ Download as Excel (merged cells)",
+                data=to_excel_bytes_merged_from_df(df, sheet_name=selected_table),
+                file_name=f"{selected_table}_merged.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_merged_{selected_table}",
+            )
+        with c3:
             if st.button("🗑️ Delete table"):
                 delete_table(selected_table)
                 st.rerun()
@@ -971,26 +1127,26 @@ if active_tab == TAB_NAMES[4]:
                         st.warning("This run is waiting on clarifying questions — answer it from the Agents tab.")
                     else:
                         st.write(f"Status: {detail.get('status')} — stage: {detail.get('current_stage')}")
-                        
+
 if active_tab == TAB_NAMES[5]:
     st.subheader("Chat about an agent run")
- 
+
     try:
         completed_runs = get_client().list_agent_runs(status="completed")
     except ApiError as e:
         completed_runs = []
         st.error(f"Could not load completed runs: {e}")
- 
+
     if not completed_runs:
         st.info("No completed agent runs yet — chat is only available once a run finishes.")
     else:
         def _run_label(r):
             display_name = r.get("name") or r["id"]
             return f"{display_name} — {r.get('agent_name', '')} ({r.get('created_at', '')[:19]})"
- 
+
         run_ids = [r["id"] for r in completed_runs]
         run_labels = {r["id"]: _run_label(r) for r in completed_runs}
- 
+
         default_id = st.session_state.chat_run_id if st.session_state.chat_run_id in run_ids else run_ids[0]
         selected_run_id = st.selectbox(
             "Agent run",
@@ -1000,23 +1156,23 @@ if active_tab == TAB_NAMES[5]:
             key="chat_run_selector",
         )
         st.session_state.chat_run_id = selected_run_id
- 
+
         st.divider()
- 
+
         try:
             history = get_client().get_agent_chat_history(selected_run_id)
         except ApiError as e:
             history = []
             st.error(f"Could not load chat history: {e}")
- 
+
         for msg in history:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
- 
-        
+
+
         if st.session_state.chat_send_error:
             st.error(st.session_state.chat_send_error)
- 
+
         user_msg = st.chat_input("Ask about this run's result...")
         if user_msg:
             try:
