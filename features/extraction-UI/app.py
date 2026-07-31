@@ -58,6 +58,8 @@ for key, default in [
     ("agent_run_id", None),
     ("agent_run_status", None),        # last polled row: status/current_stage/pending_questions/result/error
     ("agent_answers_form", {}),
+    ("chat_run_id", None),
+    ("chat_send_error", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -495,31 +497,32 @@ with st.expander("🔒 Change password"):
                 else:
                     st.error(f"Could not change password: {e}")
 
-tab_labels = ["1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables", "4️⃣ Agents", "5️⃣ Past Runs"]
+TAB_NAMES = [
+            "1️⃣ Build / Save Schema", "2️⃣ Run Extraction", "3️⃣ Saved Tables",
+            "4️⃣ Agents", "5️⃣ Past Runs", "6️⃣ Chat",
+        ]
+if st.session_state.get("active_tab") not in TAB_NAMES:
+    st.session_state.active_tab = TAB_NAMES[0]
 st.markdown(
     """
     <style>
-    .stTabs [data-baseweb="tab-list"] { gap: 32px; border-bottom: 2px solid #444; }
-    .stTabs [data-baseweb="tab"] {
-        padding: 10px 4px;
-        font-size: 1.05rem;
-        font-weight: 500;
-    }
-    .stTabs [aria-selected="true"] {
-        border-bottom: 3px solid #ff4b4b;
-        color: #ff4b4b;
-        font-weight: 700;
-    }
+    div[role="radiogroup"] { gap: 24px; border-bottom: 2px solid #444; padding-bottom: 8px; }
+    div[role="radiogroup"] label { font-size: 1.05rem; font-weight: 500; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-tab_schema, tab_run, tab_tables, tab_agents, tab_past_runs = st.tabs(tab_labels)
+st.session_state.active_tab = st.radio(
+    "Navigate", TAB_NAMES, horizontal=True,
+    index=TAB_NAMES.index(st.session_state.active_tab),
+    label_visibility="collapsed",
+)
+active_tab = st.session_state.active_tab
 
 # ----------------------------------------------------------------------
 # TAB 1 - Schema builder
 # ----------------------------------------------------------------------
-with tab_schema:
+if active_tab == TAB_NAMES[0]:
     left, right = st.columns([1, 1])
 
     with left:
@@ -656,7 +659,7 @@ with tab_schema:
 # ----------------------------------------------------------------------
 # TAB 2 - Run extraction (parallel, pipelined upload -> extract per file)
 # ----------------------------------------------------------------------
-with tab_run:
+if active_tab == TAB_NAMES[1]:
     schema_names = list_schema_names()
     if not schema_names:
         st.warning("No saved schemas yet. Create one in the 'Build / Save Schema' tab first.")
@@ -756,7 +759,7 @@ with tab_run:
 # ----------------------------------------------------------------------
 # TAB 3 - Saved tables (flattened - see caption above in Tab 2)
 # ----------------------------------------------------------------------
-with tab_tables:
+if active_tab == TAB_NAMES[2]:
     tables = list_tables()
     if not tables:
         st.info("No saved tables yet. Run an extraction to create one.")
@@ -793,7 +796,7 @@ with tab_tables:
 # ----------------------------------------------------------------------
 # TAB 4 - Agents (invoke, poll, answer clarifying questions, view result)
 # ----------------------------------------------------------------------
-with tab_agents:
+if active_tab == TAB_NAMES[3]:
     st.subheader("Run an agent over a batch of candidates")
 
     tables = list_tables()
@@ -831,6 +834,10 @@ with tab_agents:
             agent_name = st.selectbox("Agent", available_agents or ["cv_processor"])
 
             with st.form("agent_invoke_form"):
+                run_name = st.text_input(
+                    "Name this run (optional)",
+                    placeholder="e.g. Backend Engineer - July batch",
+                )
                 task_text = st.text_area(
                     "Task",
                     placeholder=(
@@ -850,7 +857,10 @@ with tab_agents:
                     csv_data = _sanitize_records_for_json(valid_subset.to_dict("records"))
                     try:
                         client = get_client()
-                        invoke_result = client.invoke_agent(agent_name, task_text.strip(), document_ids, csv_data)
+                        invoke_result = client.invoke_agent(
+                                agent_name, task_text.strip(), document_ids, csv_data,
+                                name=run_name.strip() or None,
+                            )
                         st.session_state.agent_run_id = invoke_result["run_id"]
                         with st.spinner("Agent running..."):
                             run = poll_agent_run_until_terminal(client, invoke_result["run_id"])
@@ -894,10 +904,17 @@ with tab_agents:
         elif status == "completed":
             st.success("Agent finished.")
             render_agent_result(run.get("result") or {})
-            if st.button("Start a new agent run"):
-                st.session_state.agent_run_id = None
-                st.session_state.agent_run_status = None
-                st.rerun()
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("💬 Chat about this run"):
+                    st.session_state.chat_run_id = run.get("id") or st.session_state.agent_run_id
+                    st.session_state.active_tab = TAB_NAMES[5]
+                    st.rerun()
+            with c2:
+                if st.button("Start a new agent run"):
+                    st.session_state.agent_run_id = None
+                    st.session_state.agent_run_status = None
+                    st.rerun()
 
         elif status == "failed":
             st.error(f"Agent run failed: {run.get('error', 'unknown error')}")
@@ -910,7 +927,7 @@ with tab_agents:
 # ----------------------------------------------------------------------
 # TAB 5 - Past agent runs
 # ----------------------------------------------------------------------
-with tab_past_runs:
+if active_tab == TAB_NAMES[4]:
     st.subheader("Past agent runs")
     try:
         client = get_client()
@@ -925,15 +942,24 @@ with tab_past_runs:
         status_icon = {"completed": "✅", "failed": "❌", "needs_input": "⏸️", "running": "⏳", "pending": "⏳"}
         for run_summary in runs:
             icon = status_icon.get(run_summary.get("status"), "•")
-            label = f"{icon} {run_summary.get('agent_name')} — {run_summary.get('created_at', '')[:19]} — {run_summary.get('status')}"
+            display_name = run_summary.get("name") or run_summary["id"]
+            label = f"{icon} {display_name} — {run_summary.get('agent_name')} — {run_summary.get('created_at', '')[:19]} — {run_summary.get('status')}"
             with st.expander(label):
                 st.caption(run_summary.get("task", ""))
-                if st.button("View details", key=f"view_run_{run_summary['id']}"):
-                    try:
-                        full_run = get_client().get_agent_run(run_summary["id"])
-                        st.session_state[f"_past_run_detail_{run_summary['id']}"] = full_run
-                    except ApiError as e:
-                        st.error(f"Could not load run: {e}")
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("View details", key=f"view_run_{run_summary['id']}"):
+                        try:
+                            full_run = get_client().get_agent_run(run_summary["id"])
+                            st.session_state[f"_past_run_detail_{run_summary['id']}"] = full_run
+                        except ApiError as e:
+                            st.error(f"Could not load run: {e}")
+                with b2:
+                    if run_summary.get("status") == "completed":
+                        if st.button("💬 Chat", key=f"chat_run_{run_summary['id']}"):
+                            st.session_state.chat_run_id = run_summary["id"]
+                            st.session_state.active_tab = TAB_NAMES[5]
+                            st.rerun()
 
                 detail = st.session_state.get(f"_past_run_detail_{run_summary['id']}")
                 if detail:
@@ -945,3 +971,62 @@ with tab_past_runs:
                         st.warning("This run is waiting on clarifying questions — answer it from the Agents tab.")
                     else:
                         st.write(f"Status: {detail.get('status')} — stage: {detail.get('current_stage')}")
+                        
+if active_tab == TAB_NAMES[5]:
+    st.subheader("Chat about an agent run")
+ 
+    try:
+        completed_runs = get_client().list_agent_runs(status="completed")
+    except ApiError as e:
+        completed_runs = []
+        st.error(f"Could not load completed runs: {e}")
+ 
+    if not completed_runs:
+        st.info("No completed agent runs yet — chat is only available once a run finishes.")
+    else:
+        def _run_label(r):
+            display_name = r.get("name") or r["id"]
+            return f"{display_name} — {r.get('agent_name', '')} ({r.get('created_at', '')[:19]})"
+ 
+        run_ids = [r["id"] for r in completed_runs]
+        run_labels = {r["id"]: _run_label(r) for r in completed_runs}
+ 
+        default_id = st.session_state.chat_run_id if st.session_state.chat_run_id in run_ids else run_ids[0]
+        selected_run_id = st.selectbox(
+            "Agent run",
+            run_ids,
+            index=run_ids.index(default_id),
+            format_func=lambda rid: run_labels[rid],
+            key="chat_run_selector",
+        )
+        st.session_state.chat_run_id = selected_run_id
+ 
+        st.divider()
+ 
+        try:
+            history = get_client().get_agent_chat_history(selected_run_id)
+        except ApiError as e:
+            history = []
+            st.error(f"Could not load chat history: {e}")
+ 
+        for msg in history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+ 
+        
+        if st.session_state.chat_send_error:
+            st.error(st.session_state.chat_send_error)
+ 
+        user_msg = st.chat_input("Ask about this run's result...")
+        if user_msg:
+            try:
+                with st.spinner("Thinking..."):
+                    get_client().send_chat_message(selected_run_id, user_msg)
+                st.session_state.chat_send_error = None
+            except ApiError as e:
+                # NOTE: st.chat_input always clears on rerun (no way to
+                # restore the typed text), so a failed send does mean
+                # re-typing the message - the error is at least now visible
+                # instead of flashing and disappearing.
+                st.session_state.chat_send_error = f"Could not send message: {e}"
+            st.rerun()

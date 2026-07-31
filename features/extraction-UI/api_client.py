@@ -176,9 +176,9 @@ class DocIntelClient:
         result = self._request("GET", "/agents", op="light", headers=self._headers(json_mode=False))
         return result.get("agents", [])
 
-    def invoke_agent(self, agent_name: str, task: str, document_ids: list, csv_data: list | None = None, extra: dict | None = None) -> dict:
+    def invoke_agent(self, agent_name: str, task: str, document_ids: list, csv_data: list | None = None, extra: dict | None = None, name: str | None = None) -> dict:
         """Returns {"run_id": ..., "status": "pending"} immediately - the actual run happens in a backend worker thread."""
-        payload = {"task": task, "document_ids": document_ids, "csv_data": csv_data or [], "extra": extra or {}}
+        payload = {"task": task, "document_ids": document_ids, "csv_data": csv_data or [], "extra": extra or {}, "name": name}
         return self._request("POST", f"/agents/{agent_name}/invoke", op="light", json=payload, headers=self._headers())
 
     def get_agent_run(self, run_id: str) -> dict:
@@ -195,6 +195,15 @@ class DocIntelClient:
         if status:
             params["status"] = status
         return self._request("GET", "/agents/runs", op="light", params=params, headers=self._headers(json_mode=False))
+    
+    def send_chat_message(self, run_id: str, message: str) -> dict:
+        """Returns {"role": "assistant", "content": ...}. 400s (ApiError) if the run isn't completed yet."""
+        return self._request("POST", f"/agents/runs/{run_id}/chat", op="light", json={"message": message}, headers=self._headers())
+ 
+    def get_agent_chat_history(self, run_id: str) -> list:
+        """Returns the full message list, oldest first: [{"role","content","created_at"}, ...]."""
+        result = self._request("GET", f"/agents/runs/{run_id}/chat", op="light", headers=self._headers(json_mode=False))
+        return result.get("messages", [])
 
 
 class AsyncDocIntelClient:
