@@ -32,7 +32,8 @@ class InvokeAgentRequest(BaseModel):
     document_ids: list[str]
     csv_data: list[dict] | None = None   # rows from the Extraction Helper's table, for these documents
     extra: dict | None = None            # room for agent-specific extra input beyond task/document_ids/csv_data
-
+    name: str | None = None
+    
     @field_validator("task")
     @classmethod
     def task_not_empty(cls, v):
@@ -93,7 +94,9 @@ def invoke_agent(
         "extra":        req.extra or {},
     }
 
-    run_id = agent_base.create_and_queue_run(agent_name, req.task, input_data, user_id=uid)
+    run_id = agent_base.create_and_queue_run(
+        agent_name, req.task, input_data, user_id=uid, name=req.name,
+    )
 
     task_queue.submit(
         f"agent:{agent_name}",

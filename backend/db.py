@@ -371,19 +371,20 @@ def get_api_key_by_id(key_id: str, user_id: str) -> dict | None:
 # caller supplies answers. See supabase/migrations/agent_runs.sql for the
 # table definition.
 
+
 def create_agent_run(
     agent_name: str,
     task: str,
     input_data: dict | None = None,
     user_id: str = "anonymous",
+    name: str | None = None,
 ) -> str:
     result = get_supabase_admin().table("agent_runs").insert({
-        "agent_name":  agent_name,
-        "task":        task,
-        "input_data":  input_data or {},
-        "status":      "pending",
-        "state":       {},
-        "user_id":     user_id,
+        "agent_name": agent_name,
+        "task": task,
+        "input_data": input_data or {},
+        "user_id": user_id,
+        "name": name,
     }).execute()
     return result.data[0]["id"]
 
@@ -457,7 +458,7 @@ def list_agent_runs(
 ) -> list[dict]:
     query = (
         get_supabase_admin().table("agent_runs")
-        .select("id, agent_name, task, status, current_stage, created_at, completed_at")
+        .select("id, name, agent_name, task, status, current_stage, created_at, completed_at")
         .eq("user_id", user_id)
         .order("created_at", desc=True)
         .limit(limit)

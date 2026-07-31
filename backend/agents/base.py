@@ -115,20 +115,25 @@ def _run_stage_loop(run_id: str, user_id: str, stages: dict[str, StageFn], start
         current_stage = next_stage
 
 
+
 def create_and_queue_run(
     agent_name: str,
     task: str,
     input_data: dict,
     user_id: str = "anonymous",
+    name: str | None = None,
 ) -> str:
     """
     Fast, synchronous step: creates the agent_runs row and returns run_id
     immediately. Does NOT execute any stages — callers (typically a router)
     are expected to hand execute_stages() to core.queue.task_queue.submit()
     right after this returns, so the HTTP response doesn't block on the run.
+ 
+    name: optional display name set at invoke time (see routers/agents.py
+    InvokeAgentRequest.name). Purely cosmetic — never read by the stage
+    machine itself. UI falls back to showing the run's id when this is None.
     """
-    return create_agent_run(agent_name, task, input_data, user_id=user_id)
-
+    return create_agent_run(agent_name, task, input_data, user_id=user_id, name=name)
 
 def execute_stages(run_id: str, stages: dict[str, StageFn], first_stage: str, user_id: str = "anonymous") -> dict:
     """
