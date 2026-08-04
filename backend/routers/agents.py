@@ -9,10 +9,18 @@ task_queue worker thread. The UI polls GET /agents/runs/{run_id} - not
 GET /tasks/{task_id} - since agent progress lives in agent_runs (status,
 current_stage, pending_questions, result), which is richer than task_queue's
 generic pending/running/done/failed and supports the pause/resume flow.
+
+CHANGED (resume reshape): ResumeAgentRequest now accepts EITHER `answers`
+(existing needs_input case) OR `new_input` (completed run + new data, e.g.
+a newly uploaded document folded into an already-finished run — the ITR
+"add another doc, recalculate" case, but generic to any agent). Exactly one
+must be given; which one determines which branch of
+agent_base.accept_resume_input() runs. See agents/base.py's module
+docstring for the full behaviour of each branch.
 """
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from core.auth import get_current_user_context, get_user_id, UserContext
 from core.responses import bad_request, not_found, internal_error
@@ -49,14 +57,24 @@ class InvokeAgentRequest(BaseModel):
         return v
 
 class ResumeAgentRequest(BaseModel):
-    answers: dict
+    """
+    Exactly one of `answers` / `new_input` must be given — which one is
+    valid depends on the run's current status (needs_input vs completed),
+    checked in resume_run() below against the live run row, not here
+    (this model doesn't have access to the run's status).
+    """
+    answers: dict | None = None
+    new_input: dict | None = None
 
-    @field_validator("answers")
-    @classmethod
-    def answers_not_empty(cls, v):
-        if not v:
-            raise ValueError("answers cannot be empty")
-        return v
+    @model_validator(mode="after")
+    def exactly_one_payload(self):
+        if bool(self.answers) == bool(self.new_input):
+            # covers both-empty and both-given — either is invalid
+            raise ValueError(
+                "Provide exactly one of 'answers' (to answer pending questions) "
+                "or 'new_input' (to add data to a completed run) — not both, not neither."
+            )
+        return self
 
 class ChatMessageRequest(BaseModel):
     message: str
@@ -131,15 +149,34 @@ def resume_run(
     req: ResumeAgentRequest,
     user: UserContext = Depends(get_current_user_context),
 ):
+    """
+    Handles both resume triggers:
+      - status == "needs_input", req.answers given -> answers pending
+        questions, re-enters at current_stage (unchanged from before).
+      - status == "completed", req.new_input given -> merges new data into
+        the run, planner picks the re-entry stage (see agents/base.py).
+    Any other status, or a payload that doesn't match the run's status
+    (e.g. new_input on a needs_input run), is rejected with 400.
+    """
     uid = get_user_id(user)
 
     run = get_agent_run(run_id, user_id=uid)
     if run is None:
         return not_found(f"Agent run '{run_id}'")
-    if run["status"] != "needs_input":
+    if run["status"] not in ("needs_input", "completed"):
         return bad_request(
-            f"Agent run '{run_id}' is not awaiting input (status={run['status']}).",
-            code="AGENT_RUN_NOT_PAUSED",
+            f"Agent run '{run_id}' cannot be resumed from status={run['status']}.",
+            code="AGENT_RUN_NOT_RESUMABLE",
+        )
+    if run["status"] == "needs_input" and not req.answers:
+        return bad_request(
+            f"Agent run '{run_id}' is awaiting input — 'answers' is required to resume it.",
+            code="AGENT_RESUME_ANSWERS_REQUIRED",
+        )
+    if run["status"] == "completed" and not req.new_input:
+        return bad_request(
+            f"Agent run '{run_id}' has already completed — 'new_input' is required to resume it.",
+            code="AGENT_RESUME_NEW_INPUT_REQUIRED",
         )
 
     agent_def = get_agent_def(run["agent_name"])
@@ -147,7 +184,13 @@ def resume_run(
         return internal_error(f"Agent '{run['agent_name']}' is no longer registered.")
 
     try:
-        agent_base.accept_resume_answers(run_id, req.answers, user_id=uid)
+        agent_base.accept_resume_input(
+            run_id,
+            user_id=uid,
+            answers=req.answers,
+            new_input=req.new_input,
+            stage_descriptions=agent_def.get("stage_descriptions", {}),
+        )
     except agent_base.AgentRunError as exc:
         return bad_request(str(exc), code="AGENT_RESUME_FAILED")
 
@@ -189,10 +232,23 @@ def send_chat_message(
     Returns 400 (AGENT_CHAT_UNAVAILABLE) if the run doesn't exist / isn't
     owned by this user, or isn't status == "completed" yet — chat is
     intentionally unavailable while a run is pending/running/needs_input/failed.
+
+    CHANGED (tool-calling chat): looks up the run's agent_def and passes its
+    registered chat_tools (if any) through to handle_chat_message(). Agents
+    that register none (e.g. cv_processor) get the exact same plain-chat
+    behaviour as before — this lookup is a no-op for them.
     """
     uid = get_user_id(user)
+
+    run = get_agent_run(run_id, user_id=uid)
+    if run is None:
+        return not_found(f"Agent run '{run_id}'")
+
+    agent_def = get_agent_def(run["agent_name"]) or {}
+    chat_tools = agent_def.get("chat_tools", [])
+
     try:
-        return agent_chat.handle_chat_message(run_id, req.message, user_id=uid)
+        return agent_chat.handle_chat_message(run_id, req.message, user_id=uid, chat_tools=chat_tools)
     except agent_chat.AgentChatError as exc:
         return bad_request(str(exc), code="AGENT_CHAT_UNAVAILABLE")
  
