@@ -523,3 +523,146 @@ def get_flags_for_run(run_id: str) -> list[dict]:
         .execute()
     )
     return result.data or []
+
+# ── Nested schema templates ──────────────────────────────────────────────────
+
+def create_schema_template(
+    name: str,
+    schema_spec: dict,
+    created_by: str,
+    description: str = "",
+    is_global: bool = False,
+    user_id: str | None = None,
+    team_id: str | None = None,
+    org_id: str | None = None,
+) -> str:
+    """
+    Insert a new template. Caller (router) is responsible for the
+    is_global admin-gate check before calling this — this function does
+    not re-verify org_admin status, same as e.g. insert_document() doesn't
+    re-verify document ownership rules beyond what it's told.
+    """
+    result = get_supabase_admin().table("nested_schema_templates").insert({
+        "name":        name,
+        "description": description,
+        "schema_spec": schema_spec,
+        "is_global":   is_global,
+        "user_id":     user_id,
+        "team_id":     team_id,
+        "org_id":      org_id,
+        "created_by":  created_by,
+    }).execute()
+    return result.data[0]["id"]
+
+
+def get_schema_template(
+    template_id: str,
+    user_id: str,
+    team_ids: list[str] | None = None,
+    org_ids: list[str] | None = None,
+) -> dict | None:
+    """
+    Fetch a single template by ID, then apply the same visibility check
+    RLS would (global / own / team / org) — team_ids/org_ids are the
+    caller's memberships, looked up by the router same way it already
+    does for other visibility-aware endpoints.
+    Returns None if not found OR not visible to this caller.
+    """
+    result = (
+        get_supabase_admin().table("nested_schema_templates")
+        .select("*")
+        .eq("id", template_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+
+    template = result.data[0]
+    if template.get("is_global"):
+        return template
+    if template.get("user_id") == user_id:
+        return template
+    if team_ids and template.get("team_id") in team_ids:
+        return template
+    if org_ids and template.get("org_id") in org_ids:
+        return template
+    return None
+
+
+def list_schema_templates(
+    user_id: str,
+    team_ids: list[str] | None = None,
+    org_ids: list[str] | None = None,
+) -> list[dict]:
+    """
+    Return every template visible to this caller: global + own + team +
+    org, matching nested_schema_templates' RLS SELECT policy.
+    team_ids/org_ids: the caller's active memberships (router already has
+    this from the user's auth context — same data used elsewhere for
+    document visibility).
+    """
+    or_parts = ["is_global.eq.true", f"user_id.eq.{user_id}"]
+    if team_ids:
+        or_parts.append(f"team_id.in.({','.join(team_ids)})")
+    if org_ids:
+        or_parts.append(f"org_id.in.({','.join(org_ids)})")
+
+    result = (
+        get_supabase_admin().table("nested_schema_templates")
+        .select("id, name, description, schema_spec, is_global, user_id, team_id, org_id, created_by, created_at")
+        .or_(",".join(or_parts))
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
+def update_schema_template(template_id: str, created_by: str, **fields) -> bool:
+    """
+    Partial update — pass any subset of name/description/schema_spec/
+    is_global/user_id/team_id/org_id. Creator-only, matching the UPDATE
+    RLS policy — scoped by created_by here as the Python-side backstop.
+    Returns True if a row was updated.
+    """
+    if not fields:
+        return False
+    result = (
+        get_supabase_admin().table("nested_schema_templates")
+        .update(fields)
+        .eq("id", template_id)
+        .eq("created_by", created_by)
+        .execute()
+    )
+    return bool(result.data)
+
+
+def delete_schema_template(template_id: str, created_by: str) -> bool:
+    """Creator-only delete, matching the DELETE RLS policy."""
+    result = (
+        get_supabase_admin().table("nested_schema_templates")
+        .delete()
+        .eq("id", template_id)
+        .eq("created_by", created_by)
+        .execute()
+    )
+    return bool(result.data)
+
+
+def get_global_schema_template_by_schema_name(schema_name: str) -> dict | None:
+    """
+    Returns the global template row whose schema_spec.schema_name matches,
+    or None if not found. Only searches is_global=true rows — callers that
+    need a user/team/org-scoped template should use get_schema_template()
+    with a known id instead, since schema_name isn't guaranteed unique
+    across scoped templates the way it is for the seeded global ones.
+    """
+    result = (
+        get_supabase_admin().table("nested_schema_templates")
+        .select("*")
+        .eq("is_global", True)
+        .eq("schema_spec->>schema_name", schema_name)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
