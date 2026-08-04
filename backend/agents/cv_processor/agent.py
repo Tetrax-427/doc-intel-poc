@@ -496,7 +496,8 @@ def finalize_response(run_id: str, state: dict) -> dict:
     )
     claim_verifications = state.get("claim_verifications", {})
     adjusted_scores = state.get("adjusted_scores", {})
-    
+    criterion_scores = state.get("criterion_scores", {})
+
     ranked_sorted = sorted(ranked, key=lambda r: r["rank"])
     requested_count = plan.get("requested_count")
     top = ranked_sorted[:requested_count] if requested_count else ranked_sorted
@@ -543,8 +544,30 @@ def finalize_response(run_id: str, state: dict) -> dict:
         logger.warning("Finalize summary call failed - using a plain fallback", run_id=run_id, error=str(exc))
         summary = f"Evaluated {len(ranked_sorted)} candidate(s); top {len(top)} shown below."
 
+    # ---------------------------------------------------------------
+    # Explainability: build findings with inline [n] citation markers,
+    # backed by a single global citations list (one running counter
+    # across the whole response, not reset per candidate). Citations
+    # are sourced only from per-criterion evidence_snippets - the
+    # judge's own comparative summary_reasoning stays uncited prose.
+    # ---------------------------------------------------------------
+    citations: list[dict] = []
+
     def _finding_line(e: dict) -> str:
         line = f"#{e['rank']} {e['candidate_name']} (document {e['document_id']}, score {e['overall_score']}): {e['summary_reasoning']}"
+
+        for crit_name, crit_scores in criterion_scores.items():
+            crit_entry = crit_scores.get(e["document_id"])
+            if not crit_entry or not crit_entry.get("evidence_snippet"):
+                continue
+            citations.append({
+                "number": len(citations) + 1,
+                "candidate_name": e["candidate_name"],
+                "criterion": crit_name,
+                "snippet": crit_entry["evidence_snippet"],
+            })
+            line += f" [{len(citations)}]"
+
         if e.get("best_project"):
             line += f" Best project: {e['best_project']}"
             if e.get("technologies"):
@@ -558,6 +581,9 @@ def finalize_response(run_id: str, state: dict) -> dict:
     data = [{"type": "table", "label": "Ranked candidates", "value": top_enriched}]
     if mentions_enriched:
         data.append({"type": "table", "label": "Honorable mentions (just outside the shortlist)", "value": mentions_enriched})
+
+    if citations:
+        data.append({"type": "table", "label": "Evidence citations", "value": citations})
 
     if claim_verifications:
         name_by_doc = {c["document_id"]: c.get("candidate_name") or c["document_id"] for c in ranked_sorted}
@@ -583,7 +609,6 @@ def finalize_response(run_id: str, state: dict) -> dict:
     }
 
     return {"state_update": {}, "next_stage": None, "result": result}
-
 
 # ---------------------------------------------------------------------------
 # Registry export
