@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from agents.base import StageOutcome
 from agents.itr_helper.helpers import extract_tagged_documents, stitch_taxpayer_profile
-
+from agents.itr_helper.calculator import compute_tax_comparison
 
 def extract_stage(run_id: str, state: dict) -> StageOutcome:
     """
@@ -48,4 +48,66 @@ def stitch_stage(run_id: str, state: dict) -> StageOutcome:
     return StageOutcome(
         state_update={"taxpayer_profile": profile},
         next_stage="validate",
+    )
+    
+
+def validate_stage(run_id: str, state: dict) -> StageOutcome:
+    """
+    Basic completeness check (per current decision: simple, not strict).
+    Auto-detects ITR1 vs ITR2 from the profile itself — ITR2 is required
+    if there are any capital gains (stock_transactions non-empty);
+    otherwise ITR1 suffices. This detection is informational (stored in
+    state, surfaced in the summary) — it does not gate anything in v1
+    since the calculator handles both cases identically.
+ 
+    Only hard requirement: at least one Form16 entry — there's no income
+    to compute tax on otherwise. FD/stocks are optional additions, not
+    required, per current decision. If a user already answered this via
+    user_answers (resume path), skip re-asking.
+    """
+    profile = state.get("taxpayer_profile", {})
+    form16_entries = profile.get("form16_entries", [])
+    stock_transactions = profile.get("stock_transactions", [])
+ 
+    itr_type = "ITR2" if stock_transactions else "ITR1"
+ 
+    if not form16_entries:
+        if state.get("user_answers", {}).get("form16_confirmed_absent"):
+            # User explicitly confirmed they have no salary income this year —
+            # proceed anyway rather than looping forever.
+            return StageOutcome(
+                state_update={"itr_type": itr_type},
+                next_stage="calculate",
+            )
+        return StageOutcome(
+            state_update={"itr_type": itr_type},
+            questions=[{
+                "key": "form16_confirmed_absent",
+                "question": (
+                    "No Form16 was found among the uploaded documents, so there's "
+                    "no salary income to calculate tax on. Upload a Form16, or "
+                    "confirm you have no salary income this year to proceed anyway."
+                ),
+                "type": "confirm",
+            }],
+        )
+ 
+    return StageOutcome(
+        state_update={"itr_type": itr_type},
+        next_stage="calculate",
+    )
+ 
+ 
+def calculate_stage(run_id: str, state: dict) -> StageOutcome:
+    """
+    Runs compute_tax_comparison() (pure Python, both regimes) over the
+    stitched profile. No LLM call here — see calculator.py's module
+    docstring for why every number must be grounded/computed.
+    """
+    profile = state.get("taxpayer_profile", {})
+    tax_calculation = compute_tax_comparison(profile)
+ 
+    return StageOutcome(
+        state_update={"tax_calculation": tax_calculation},
+        next_stage="summarize",
     )
