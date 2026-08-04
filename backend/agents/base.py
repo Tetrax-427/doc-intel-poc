@@ -70,6 +70,14 @@ entrypoint, accept_resume_input():
   precedence (case 1), since new_input in state["input_data"] simply gets
   merged in before the stage loop resumes and picked up whenever that
   stage next runs.
+
+CHANGED (output-contract validation guardrail): when a stage ends the run
+(next_stage is None), the returned `result` is now checked for the fixed
+output contract's required top-level keys (summary, findings, data, extra)
+before being persisted as completed. A stage that ends the run without one
+of these fails the run loudly (mark_agent_run_failed) instead of silently
+persisting a malformed result - this is agent-agnostic (lives here, not in
+any one agent), so every agent's output is held to the same contract.
 """
 from __future__ import annotations
 
@@ -90,6 +98,11 @@ from db import (
 )
 
 logger = get_logger("agents.base")
+
+# Every agent's finalize stage must return a result matching this shape -
+# checked generically here so no individual agent can accidentally (or via
+# a prompt-injected instruction) skip part of the fixed output contract.
+REQUIRED_RESULT_KEYS = {"summary", "findings", "data", "extra"}
 
 
 class StageOutcome(TypedDict, total=False):
@@ -147,6 +160,19 @@ def _run_stage_loop(run_id: str, user_id: str, stages: dict[str, StageFn], start
                     f"Stage '{current_stage}' ended the run (next_stage=None) without a 'result'.",
                 )
                 return
+
+            missing_keys = REQUIRED_RESULT_KEYS - result.keys()
+            if missing_keys:
+                logger.error(
+                    "Agent run result failed output-contract validation",
+                    run_id=run_id, final_stage=current_stage, missing_keys=list(missing_keys),
+                )
+                mark_agent_run_failed(
+                    run_id, state,
+                    f"Stage '{current_stage}' returned a result missing required keys: {sorted(missing_keys)}.",
+                )
+                return
+
             logger.info("Agent run completed", run_id=run_id, final_stage=current_stage)
             mark_agent_run_completed(run_id, state, result)
             return

@@ -10,10 +10,52 @@ same verification escape hatch for free.
 """
 from __future__ import annotations
 
+import re
+
 from core.logger import get_logger
 from retrieval import query_document
 
 logger = get_logger("agents.tools.candidate_data")
+
+
+# ---------------------------------------------------------------------------
+# Sanitization - strips hidden/invisible-character injection tricks (e.g.
+# zero-width unicode used to hide instructions in resume text) before any
+# candidate text reaches an LLM prompt.
+# ---------------------------------------------------------------------------
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def sanitize_text(text: str) -> tuple[str, bool]:
+    """Strips zero-width/control characters often used to hide injected text. Returns (cleaned, was_modified)."""
+    if not text:
+        return text, False
+    cleaned = _ZERO_WIDTH_RE.sub("", text)
+    cleaned = _CONTROL_CHARS_RE.sub("", cleaned)
+    return cleaned, cleaned != text
+
+
+def sanitize_candidate(candidate: dict) -> tuple[dict, list[str]]:
+    """Sanitizes every string field in a candidate dict. Returns (cleaned_candidate, list_of_modified_field_names)."""
+    modified_fields = []
+
+    def _clean_value(key, value):
+        if isinstance(value, str):
+            cleaned, changed = sanitize_text(value)
+            if changed:
+                modified_fields.append(key)
+            return cleaned
+        if isinstance(value, list):
+            return [
+                {k: _clean_value(f"{key}.{k}", v) for k, v in item.items()} if isinstance(item, dict) else _clean_value(key, item)
+                for item in value
+            ]
+        return value
+
+    sanitized = {k: _clean_value(k, v) for k, v in candidate.items()}
+    return sanitized, modified_fields
 
 
 def build_candidate_dataset(document_ids: list[str], csv_data: list[dict]) -> list[dict]:
@@ -35,6 +77,13 @@ def build_candidate_dataset(document_ids: list[str], csv_data: list[dict]) -> li
     for that prefix - those are the blank filler rows beyond that field's
     own count), and takes the first non-null value for any non-prefixed
     (scalar) column.
+
+    Every candidate is passed through sanitize_candidate() before being
+    added to the returned list - any field with invisible/hidden characters
+    stripped gets recorded under candidate["_sanitization_flag"] (a list of
+    field names) so the calling stage can log it to the audit trail. This
+    key is agent-internal bookkeeping - callers that dump candidate fields
+    into an LLM prompt should pop it off first.
     """
     rows_by_doc: dict[str, list[dict]] = {}
     for row in csv_data:
@@ -79,6 +128,9 @@ def build_candidate_dataset(document_ids: list[str], csv_data: list[dict]) -> li
             if items:
                 candidate[prefix] = items
 
+        candidate, modified_fields = sanitize_candidate(candidate)
+        if modified_fields:
+            candidate["_sanitization_flag"] = modified_fields
         dataset.append(candidate)
     return dataset
 

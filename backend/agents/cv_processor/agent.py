@@ -15,13 +15,16 @@ plan_evaluation is the only stage that can pause the run (status
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.logger import get_logger
 from llm.engine import call_llm
+from db import insert_agent_flag
 from agents.tools.candidate_data import build_candidate_dataset, get_field
 from agents.tools.scoring import score_candidates
+
 from agents.cv_processor.prompts import (
     PLAN_EVALUATION_SYSTEM,
+    VERIFY_CLAIMS_SYSTEM,
     JUDGE_MERGE_SYSTEM,
     FINALIZE_SUMMARY_SYSTEM,
     PROJECT_HIGHLIGHT_SYSTEM,
@@ -78,6 +81,17 @@ class ProjectHighlightBatch(BaseModel):
     highlights: list[ProjectHighlight]
 
 
+class SuspiciousClaim(BaseModel):
+    field: str = Field(description="Which field/claim this concerns, e.g. 'work_experience' or a specific skill mention")
+    claimed_text: str = Field(description="The specific text/claim that looks suspicious")
+    reasoning: str = Field(description="Why this looks inflated, inconsistent, or implausible")
+    confidence: str = Field(description="'low', 'medium', or 'high' confidence that this is inflated/false")
+    adjusted_text: str = Field(description="The same field's content with the suspicious claim removed/toned down, for a 'without this claim' comparison score")
+
+
+class ClaimVerification(BaseModel):
+    document_id: str
+    suspicious_claims: list[SuspiciousClaim] = Field(default_factory=list)
 # ---------------------------------------------------------------------------
 # Stage: plan_evaluation
 # ---------------------------------------------------------------------------
@@ -149,8 +163,71 @@ def plan_evaluation(run_id: str, state: dict) -> dict:
     input_data = state["input_data"]
     candidates = build_candidate_dataset(input_data["document_ids"], input_data.get("csv_data", []))
 
-    return {"state_update": {"plan": plan, "candidates": candidates}, "next_stage": "score_education"}
+    # Guardrail: flag any candidate whose resume text had hidden/invisible
+    # characters stripped during sanitization (build_candidate_dataset()
+    # marks these under "_sanitization_flag"). Popped off here so the raw
+    # list of field names never rides along into a later LLM prompt.
+    for c in candidates:
+        modified_fields = c.pop("_sanitization_flag", None)
+        if modified_fields:
+            insert_agent_flag(
+                run_id, "sanitization",
+                {"fields": modified_fields, "note": "Hidden/invisible characters stripped from resume text before evaluation."},
+                document_id=c["document_id"], severity="medium",
+            )
 
+    return {"state_update": {"plan": plan, "candidates": candidates}, "next_stage": "verify_claims"}
+# ---------------------------------------------------------------------------
+# Stage: verify_claims
+# ---------------------------------------------------------------------------
+
+def _verify_one_candidate(candidate: dict, user_id: str) -> "ClaimVerification | None":
+    """Runs one plausibility-check LLM call for a single candidate. Returns None on failure - skip, don't crash the batch."""
+    doc_id = candidate["document_id"]
+    try:
+        result: ClaimVerification = call_llm(
+            system=VERIFY_CLAIMS_SYSTEM,
+            user=f"Candidate document_id={doc_id}:\n{ {k: v for k, v in candidate.items() if k != 'document_id'} }",
+            temperature=0.0,
+            call_type="agent_verify_claims",
+            response_model=ClaimVerification,
+            structured_max_retries=1,
+            user_id=user_id,
+        )
+        return result
+    except Exception as exc:
+        logger.warning("Claim verification failed for a candidate - skipping", document_id=doc_id, error=str(exc))
+        return None
+
+
+def verify_claims(run_id: str, state: dict) -> dict:
+    candidates, user_id = state["candidates"], state.get("_user_id", "system")
+
+    claim_verifications: dict[str, list[dict]] = {}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_verify_one_candidate, c, user_id): c["document_id"] for c in candidates}
+        for future in as_completed(futures):
+            doc_id = futures[future]
+            result = future.result()
+            if result is None or not result.suspicious_claims:
+                continue
+
+            claims = [c.model_dump() for c in result.suspicious_claims]
+            claim_verifications[doc_id] = claims
+
+            for claim in claims:
+                insert_agent_flag(
+                    run_id, "suspicious_claim",
+                    {
+                        "field": claim["field"],
+                        "claimed_text": claim["claimed_text"],
+                        "reasoning": claim["reasoning"],
+                    },
+                    document_id=doc_id, severity=claim["confidence"],
+                )
+
+    return {"state_update": {"claim_verifications": claim_verifications}, "next_stage": "score_education"}
 
 # ---------------------------------------------------------------------------
 # Stage: score_education
@@ -175,6 +252,7 @@ def score_education(run_id: str, state: dict) -> dict:
     scores = score_candidates(
         trimmed, "education",
         f"Education preference stated by the requester: {preference}",
+        run_id,
         call_type="agent_score_education", user_id=user_id,
     )
 
@@ -214,6 +292,7 @@ def score_skills(run_id: str, state: dict) -> dict:
         scores = score_candidates(
             trimmed, f"skill: {skill_name}",
             f"Evaluate evidence of experience with '{skill_name}'. {weight_note}",
+            run_id,
             call_type="agent_score_skill", user_id=user_id,
         )
         criterion_scores[f"skill:{skill_name}"] = scores
@@ -241,6 +320,7 @@ def score_experience(run_id: str, state: dict) -> dict:
     scores = score_candidates(
         trimmed, "experience",
         f"General experience/seniority evaluation. Requester notes: {notes}",
+        run_id,
         call_type="agent_score_experience", user_id=user_id,
     )
 
@@ -288,7 +368,7 @@ def merge_scores(run_id: str, state: dict) -> dict:
         logger.error("Merge/judge call failed", run_id=run_id, error=str(exc))
         raise
 
-    return {"state_update": {"ranked": ranked}, "next_stage": "finalize_response"}
+    return {"state_update": {"ranked": ranked}, "next_stage": "compute_adjusted_scores"}
 
 
 # ---------------------------------------------------------------------------
@@ -335,11 +415,88 @@ def _get_project_highlights(candidates: list[dict], target_entries: list[dict], 
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Stage: compute_adjusted_scores (only runs for flagged candidates)
+# ---------------------------------------------------------------------------
+
+def _resolve_criterion_key(field: str, plan: dict) -> str | None:
+    """
+    Maps a suspicious-claim's free-text 'field' to an actual criterion_scores
+    key ("education", "experience", or "skill:<name>"). Best-effort substring
+    match against the plan's known skill names and the fixed education/
+    experience labels - returns None if nothing matches (claim is noted in
+    the flagged-claims table either way, it just won't shift the score).
+    """
+    field_lower = field.lower()
+    if "educat" in field_lower:
+        return "education"
+    if "experience" in field_lower:
+        return "experience"
+    for skill in plan["skills"]:
+        if skill["name"].lower() in field_lower:
+            return f"skill:{skill['name']}"
+    return None
+
+
+def compute_adjusted_scores(run_id: str, state: dict) -> dict:
+    plan, candidates, criterion_scores, claim_verifications, user_id = (
+        state["plan"], state["candidates"], state["criterion_scores"],
+        state.get("claim_verifications", {}), state.get("_user_id", "system"),
+    )
+
+    if not claim_verifications:
+        return {"state_update": {"adjusted_scores": {}}, "next_stage": "finalize_response"}
+
+    by_doc = {c["document_id"]: c for c in candidates}
+    n_criteria = 1 + len(plan["skills"])  # education + experience share one bucket here; kept simple - see note below
+    adjusted_scores: dict[str, dict] = {}
+
+    for doc_id, claims in claim_verifications.items():
+        candidate = by_doc.get(doc_id)
+        if candidate is None:
+            continue
+
+        total_delta = 0.0
+        for claim in claims:
+            criterion_key = _resolve_criterion_key(claim["field"], plan)
+            if criterion_key is None:
+                continue
+
+            original_score = criterion_scores.get(criterion_key, {}).get(doc_id, {}).get("score")
+            if original_score is None:
+                continue
+
+            # Re-score this one criterion for this one candidate using the
+            # adjusted (claim-removed) text instead of the original field value.
+            adjusted_candidate = {"document_id": doc_id, criterion_key: claim["adjusted_text"]}
+            adjusted_result = score_candidates(
+                [adjusted_candidate], criterion_key,
+                f"Re-scoring with a flagged claim removed: {claim['reasoning']}",
+                run_id, call_type="agent_score_adjusted", user_id=user_id,
+            )
+            adjusted_score = adjusted_result.get(doc_id, {}).get("score", original_score)
+            total_delta += (original_score - adjusted_score)
+
+        if total_delta > 0:
+            # Simple proportional shift: total criterion-count-weighted delta,
+            # applied against the candidate's overall (0-10) score. Not a
+            # full re-judge - see design note in the docstring above.
+            overall = next((r["overall_score"] for r in state.get("ranked", []) if r["document_id"] == doc_id), None)
+            if overall is not None:
+                adjusted_scores[doc_id] = {
+                    "score_without_flagged_claims": round(max(0.0, overall - (total_delta / max(n_criteria, 1))), 2),
+                    "claims": claims,
+                }
+
+    return {"state_update": {"adjusted_scores": adjusted_scores}, "next_stage": "finalize_response"}
+
 def finalize_response(run_id: str, state: dict) -> dict:
     plan, ranked, task, candidates, user_id = (
         state["plan"], state["ranked"], state["task"], state["candidates"], state.get("_user_id", "system"),
     )
-
+    claim_verifications = state.get("claim_verifications", {})
+    adjusted_scores = state.get("adjusted_scores", {})
+    
     ranked_sorted = sorted(ranked, key=lambda r: r["rank"])
     requested_count = plan.get("requested_count")
     top = ranked_sorted[:requested_count] if requested_count else ranked_sorted
@@ -363,6 +520,7 @@ def finalize_response(run_id: str, state: dict) -> dict:
                 "best_project": h.get("best_project", ""),
                 "technologies": h.get("technologies", []),
                 "skill_context": h.get("skill_context", ""),
+                "flagged": e["document_id"] in claim_verifications,
             })
         return out
 
@@ -401,6 +559,22 @@ def finalize_response(run_id: str, state: dict) -> dict:
     if mentions_enriched:
         data.append({"type": "table", "label": "Honorable mentions (just outside the shortlist)", "value": mentions_enriched})
 
+    if claim_verifications:
+        name_by_doc = {c["document_id"]: c.get("candidate_name") or c["document_id"] for c in ranked_sorted}
+        flagged_rows = []
+        for doc_id, claims in claim_verifications.items():
+            adjusted = adjusted_scores.get(doc_id, {})
+            flagged_rows.append({
+                "candidate_name": name_by_doc.get(doc_id, doc_id),
+                "document_id": doc_id,
+                "claims": [
+                    {"field": c["field"], "claimed_text": c["claimed_text"], "reasoning": c["reasoning"], "confidence": c["confidence"]}
+                    for c in claims
+                ],
+                "score_without_flagged_claims": adjusted.get("score_without_flagged_claims"),
+            })
+        data.append({"type": "table", "label": "Flagged claims (resume plausibility check)", "value": flagged_rows})
+
     result = {
         "summary": summary,
         "findings": findings,
@@ -414,13 +588,15 @@ def finalize_response(run_id: str, state: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Registry export
 # ---------------------------------------------------------------------------
-
 STAGES = {
     "plan_evaluation":  plan_evaluation,
+    "verify_claims":    verify_claims,
     "score_education":  score_education,
     "score_skills":     score_skills,
     "score_experience": score_experience,
     "merge_scores":      merge_scores,
+    "compute_adjusted_scores": compute_adjusted_scores,
     "finalize_response": finalize_response,
 }
+
 FIRST_STAGE = "plan_evaluation"

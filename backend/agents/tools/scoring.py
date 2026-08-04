@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from core.logger import get_logger
 from llm.engine import call_llm
+from agents.cv_processor.prompts import _FAIRNESS_CLAUSE, _SCOPE_CLAUSE
+from db import insert_agent_flag
 
 logger = get_logger("agents.tools.scoring")
 
@@ -37,6 +39,7 @@ def score_candidates(
     candidates: list[dict],
     criterion_name: str,
     criterion_instructions: str,
+    run_id: str,
     call_type: str = "agent_score",
     user_id: str = "system",
 ) -> dict[str, dict]:
@@ -73,6 +76,7 @@ def score_candidates(
         "Give a short, specific reasoning per candidate that cites what you actually saw in their data "
         "(not a generic statement). You MUST return exactly one score entry per candidate "
         "document_id given below, in the same order."
+        f"{_FAIRNESS_CLAUSE}{_SCOPE_CLAUSE}"
     )
 
     try:
@@ -93,7 +97,10 @@ def score_candidates(
         }
 
     scores = {s.document_id: {"score": s.score, "reasoning": s.reasoning} for s in result.scores}
-
+    insert_agent_flag(
+        run_id, "bias_check",
+        {"criterion": criterion_name, "n_candidates": len(candidates)},
+    )
     # Backfill any candidate the model silently dropped, rather than letting
     # a downstream KeyError surface deep inside merge_scores().
     for c in candidates:

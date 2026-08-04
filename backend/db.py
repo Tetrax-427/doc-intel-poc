@@ -490,3 +490,36 @@ def get_agent_chat_history(run_id: str, user_id: str) -> list[dict]:
         .execute()
     )
     return result.data or []
+
+# ── Agent run flags ────────────────────────────────────────────────────────────
+#
+# Audit trail for guardrail checks: bias-check confirmations, suspicious-claim
+# detections, sanitization events, cross-resume contradictions. One row per
+# flag, so a run can have zero, one, or many.
+
+def insert_agent_flag(
+    run_id: str,
+    flag_type: str,
+    detail: dict,
+    document_id: str | None = None,
+    severity: str | None = None,
+) -> str:
+    result = get_supabase_admin().table("agent_run_flags").insert({
+        "run_id": run_id,
+        "document_id": document_id,
+        "flag_type": flag_type,
+        "severity": severity,
+        "detail": detail,
+    }).execute()
+    return result.data[0]["id"]
+
+
+def get_flags_for_run(run_id: str) -> list[dict]:
+    result = (
+        get_supabase_admin().table("agent_run_flags")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("created_at")
+        .execute()
+    )
+    return result.data or []
