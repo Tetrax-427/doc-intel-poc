@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 from core.logger import get_logger
 from llm.engine import call_llm
-from agents.cv_processor.prompts import _FAIRNESS_CLAUSE, _SCOPE_CLAUSE
+from agents.cv_processor.prompts import _FAIRNESS_CLAUSE, _SCOPE_CLAUSE, _DEPTH_CLAUSE
 from db import insert_agent_flag
 
 logger = get_logger("agents.tools.scoring")
@@ -90,7 +90,7 @@ def score_candidates(
         "fact your score and reasoning are grounded in. Never invent an evidence_snippet - it must be "
         "traceable to something actually present in the candidate data given. You MUST return exactly one "
         "score entry per candidate document_id given below, in the same order."
-        f"{_FAIRNESS_CLAUSE}{_SCOPE_CLAUSE}"
+        f"{_FAIRNESS_CLAUSE}{_SCOPE_CLAUSE}{_DEPTH_CLAUSE}"
     )
 
     try:

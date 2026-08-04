@@ -24,8 +24,10 @@ from agents.tools.scoring import score_candidates
 
 from agents.cv_processor.prompts import (
     PLAN_EVALUATION_SYSTEM,
+    DETECT_DUPLICATES_SYSTEM,
     VERIFY_CLAIMS_SYSTEM,
     JUDGE_MERGE_SYSTEM,
+    REVIEW_RANKING_SYSTEM,
     FINALIZE_SUMMARY_SYSTEM,
     PROJECT_HIGHLIGHT_SYSTEM,
 )
@@ -92,6 +94,26 @@ class SuspiciousClaim(BaseModel):
 class ClaimVerification(BaseModel):
     document_id: str
     suspicious_claims: list[SuspiciousClaim] = Field(default_factory=list)
+    
+    
+class DuplicateGroup(BaseModel):
+    document_ids: list[str] = Field(description="Every document_id believed to be the same person")
+    reasoning: str = Field(description="Which specific signals (name, email, phone, education, work history) led to this conclusion")
+    contradictions: list[str] = Field(default_factory=list, description="Fields where the group's resumes actually disagree with each other, if any")
+
+
+class DuplicateDetectionResult(BaseModel):
+    groups: list[DuplicateGroup] = Field(default_factory=list)
+    
+class RankSwap(BaseModel):
+    document_id_higher: str = Field(description="document_id currently at the higher (better) of the two adjacent ranks being swapped")
+    document_id_lower: str = Field(description="document_id currently at the lower (worse) of the two adjacent ranks being swapped")
+    reasoning: str = Field(description="Specific per-criterion scores justifying why these two should swap")
+
+
+class RankingReview(BaseModel):
+    swaps: list[RankSwap] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list, description="Non-adjacent inconsistencies noticed but not fixed - out of scope for this pass")
 # ---------------------------------------------------------------------------
 # Stage: plan_evaluation
 # ---------------------------------------------------------------------------
@@ -176,7 +198,7 @@ def plan_evaluation(run_id: str, state: dict) -> dict:
                 document_id=c["document_id"], severity="medium",
             )
 
-    return {"state_update": {"plan": plan, "candidates": candidates}, "next_stage": "verify_claims"}
+    return {"state_update": {"plan": plan, "candidates": candidates}, "next_stage": "detect_duplicates_and_issues"}
 # ---------------------------------------------------------------------------
 # Stage: verify_claims
 # ---------------------------------------------------------------------------
@@ -198,6 +220,73 @@ def _verify_one_candidate(candidate: dict, user_id: str) -> "ClaimVerification |
     except Exception as exc:
         logger.warning("Claim verification failed for a candidate - skipping", document_id=doc_id, error=str(exc))
         return None
+
+# ---------------------------------------------------------------------------
+# Stage: detect_duplicates_and_issues
+# ---------------------------------------------------------------------------
+
+def detect_duplicates_and_issues(run_id: str, state: dict) -> dict:
+    candidates, user_id = state["candidates"], state.get("_user_id", "system")
+
+    identity_fields = []
+    for c in candidates:
+        identity_fields.append({
+            "document_id": c["document_id"],
+            "candidate_name": c.get("candidate_name"),
+            "email": c.get("email") or c.get("candidate_email"),
+            "phone": c.get("phone") or c.get("candidate_phone"),
+            "education": c.get("education") or c.get("candidate_education"),
+            "work_experience": c.get("work_experience") or c.get("candidate_work_experience"),
+        })
+
+    resume_issues: list[dict] = []
+
+    try:
+        result: DuplicateDetectionResult = call_llm(
+            system=DETECT_DUPLICATES_SYSTEM,
+            user=f"Candidates in this batch:\n{identity_fields}",
+            temperature=0.0,
+            call_type="agent_detect_duplicates",
+            response_model=DuplicateDetectionResult,
+            structured_max_retries=1,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        logger.warning("Duplicate detection failed - continuing without it", run_id=run_id, error=str(exc))
+        return {"state_update": {"resume_issues": resume_issues}, "next_stage": "verify_claims"}
+
+    name_by_doc = {c["document_id"]: c.get("candidate_name") or c["document_id"] for c in candidates}
+
+    for group in result.groups:
+        if len(group.document_ids) < 2:
+            continue
+
+        resume_issues.append({
+            "issue_type": "duplicate",
+            "document_ids": group.document_ids,
+            "candidate_names": [name_by_doc.get(d, d) for d in group.document_ids],
+            "detail": group.reasoning,
+        })
+        insert_agent_flag(
+            run_id, "duplicate_resume",
+            {"document_ids": group.document_ids, "reasoning": group.reasoning},
+            severity="medium",
+        )
+
+        for contradiction in group.contradictions:
+            resume_issues.append({
+                "issue_type": "contradiction",
+                "document_ids": group.document_ids,
+                "candidate_names": [name_by_doc.get(d, d) for d in group.document_ids],
+                "detail": contradiction,
+            })
+            insert_agent_flag(
+                run_id, "contradiction",
+                {"document_ids": group.document_ids, "detail": contradiction},
+                severity="medium",
+            )
+
+    return {"state_update": {"resume_issues": resume_issues}, "next_stage": "verify_claims"}
 
 
 def verify_claims(run_id: str, state: dict) -> dict:
@@ -488,7 +577,69 @@ def compute_adjusted_scores(run_id: str, state: dict) -> dict:
                     "claims": claims,
                 }
 
-    return {"state_update": {"adjusted_scores": adjusted_scores}, "next_stage": "finalize_response"}
+    return {"state_update": {"adjusted_scores": adjusted_scores}, "next_stage": "review_ranking"}
+
+
+# ---------------------------------------------------------------------------
+# Stage: review_ranking (consistency check, adjacent-swap corrections only)
+# ---------------------------------------------------------------------------
+
+def review_ranking(run_id: str, state: dict) -> dict:
+    ranked, criterion_scores, user_id = (
+        state["ranked"], state["criterion_scores"], state.get("_user_id", "system"),
+    )
+
+    ranked_sorted = sorted(ranked, key=lambda r: r["rank"])
+
+    try:
+        review: RankingReview = call_llm(
+            system=REVIEW_RANKING_SYSTEM,
+            user=f"Ranked list:\n{ranked_sorted}\n\nPer-criterion scores per candidate:\n{criterion_scores}",
+            temperature=0.0,
+            call_type="agent_review_ranking",
+            response_model=RankingReview,
+            structured_max_retries=1,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        logger.warning("Ranking review failed - keeping original ranking", run_id=run_id, error=str(exc))
+        return {"state_update": {}, "next_stage": "finalize_response"}
+
+    by_doc = {r["document_id"]: r for r in ranked_sorted}
+    applied_swaps = []
+
+    for swap in review.swaps:
+        higher = by_doc.get(swap.document_id_higher)
+        lower = by_doc.get(swap.document_id_lower)
+        if higher is None or lower is None:
+            continue
+        # Only apply if they're actually adjacent in the current ranking -
+        # protects against the model proposing a swap that isn't adjacent
+        # despite the prompt instruction, since this is a hard safety
+        # constraint, not just a request.
+        if abs(higher["rank"] - lower["rank"]) != 1:
+            logger.warning(
+                "Ranking review proposed a non-adjacent swap - ignoring",
+                run_id=run_id, higher=swap.document_id_higher, lower=swap.document_id_lower,
+            )
+            continue
+
+        higher["rank"], lower["rank"] = lower["rank"], higher["rank"]
+        applied_swaps.append({
+            "document_id_higher": swap.document_id_higher,
+            "document_id_lower": swap.document_id_lower,
+            "reasoning": swap.reasoning,
+        })
+
+    if applied_swaps or review.notes:
+        insert_agent_flag(
+            run_id, "ranking_review",
+            {"swaps_applied": applied_swaps, "notes": review.notes},
+        )
+
+    updated_ranked = sorted(by_doc.values(), key=lambda r: r["rank"])
+    return {"state_update": {"ranked": updated_ranked}, "next_stage": "finalize_response"}
+
 
 def finalize_response(run_id: str, state: dict) -> dict:
     plan, ranked, task, candidates, user_id = (
@@ -497,6 +648,7 @@ def finalize_response(run_id: str, state: dict) -> dict:
     claim_verifications = state.get("claim_verifications", {})
     adjusted_scores = state.get("adjusted_scores", {})
     criterion_scores = state.get("criterion_scores", {})
+    resume_issues = state.get("resume_issues", [])
 
     ranked_sorted = sorted(ranked, key=lambda r: r["rank"])
     requested_count = plan.get("requested_count")
@@ -585,22 +737,24 @@ def finalize_response(run_id: str, state: dict) -> dict:
     if citations:
         data.append({"type": "table", "label": "Evidence citations", "value": citations})
 
+    combined_issues = list(resume_issues)  # duplicates + contradictions, already built as issue rows
+
     if claim_verifications:
         name_by_doc = {c["document_id"]: c.get("candidate_name") or c["document_id"] for c in ranked_sorted}
-        flagged_rows = []
         for doc_id, claims in claim_verifications.items():
             adjusted = adjusted_scores.get(doc_id, {})
-            flagged_rows.append({
-                "candidate_name": name_by_doc.get(doc_id, doc_id),
-                "document_id": doc_id,
-                "claims": [
-                    {"field": c["field"], "claimed_text": c["claimed_text"], "reasoning": c["reasoning"], "confidence": c["confidence"]}
-                    for c in claims
-                ],
-                "score_without_flagged_claims": adjusted.get("score_without_flagged_claims"),
-            })
-        data.append({"type": "table", "label": "Flagged claims (resume plausibility check)", "value": flagged_rows})
+            for claim in claims:
+                combined_issues.append({
+                    "issue_type": "suspicious_claim",
+                    "document_ids": [doc_id],
+                    "candidate_names": [name_by_doc.get(doc_id, doc_id)],
+                    "detail": f"{claim['field']}: {claim['reasoning']} (confidence: {claim['confidence']})",
+                    "score_without_flagged_claims": adjusted.get("score_without_flagged_claims"),
+                })
 
+    if combined_issues:
+        data.append({"type": "table", "label": "Issues (duplicates, contradictions, suspicious claims)", "value": combined_issues})
+        
     result = {
         "summary": summary,
         "findings": findings,
@@ -615,12 +769,14 @@ def finalize_response(run_id: str, state: dict) -> dict:
 # ---------------------------------------------------------------------------
 STAGES = {
     "plan_evaluation":  plan_evaluation,
+    "detect_duplicates_and_issues": detect_duplicates_and_issues,
     "verify_claims":    verify_claims,
     "score_education":  score_education,
     "score_skills":     score_skills,
     "score_experience": score_experience,
     "merge_scores":      merge_scores,
     "compute_adjusted_scores": compute_adjusted_scores,
+    "review_ranking":    review_ranking,
     "finalize_response": finalize_response,
 }
 

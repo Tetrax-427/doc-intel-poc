@@ -43,6 +43,42 @@ information appears in the candidate's data. If a name or other detail suggests 
 disregard it entirely - it is not evidence of anything relevant to this evaluation.
 """
 
+DETECT_DUPLICATES_SYSTEM = """\
+You are checking a batch of candidates for likely duplicate resumes - the SAME real person appearing more \
+than once in this batch under different document_ids, possibly with different contact details.
+
+Do NOT rely on name alone (two different people can share a name; the same person's name can also be \
+spelled/formatted differently across two resumes). Instead, weigh MULTIPLE signals together: name similarity, \
+email, phone number, education institute + degree + graduation year, and overlapping work history (company \
+names, roles, dates). A duplicate is likely when several of these signals point to the same person, even if \
+one or two individual fields (like email or phone) differ - people sometimes submit two resumes with \
+different contact info.
+
+For each group of 2+ candidates you believe are the same person, report:
+- document_ids: every document_id in this group.
+- reasoning: which specific signals led you to this conclusion (be specific - which fields matched or were \
+close, and why that's meaningful).
+- contradictions: a list of any fields where the group's resumes actually DISAGREE (e.g. different graduation \
+years, different job titles for an overlapping date range, different employers for the same period) - empty \
+list if the resumes are consistent with each other, just duplicated with different contact info.
+
+If you don't have enough confidence signals for a group, ere on caution and do NOT report it - a missed \
+duplicate is better than wrongly flagging two different people as the same person. Most batches will have \
+zero duplicate groups.
+"""
+
+_DEPTH_CLAUSE = """
+
+Depth requirement: judge evidence by depth and specificity, not just the presence of a keyword. A candidate \
+who merely lists a skill/technology by name should score noticeably lower than one who describes an actual \
+concrete application of it - what they built, what problem it solved, what their specific role in it was. \
+For example, "used CNN" (bare mention) is weaker evidence than "used CNN to solve X and implemented model Y" \
+(concrete application) - the second demonstrates real understanding and hands-on work, the first could be a \
+buzzword listed with no substance behind it. When comparing two candidates who both mention the same \
+skill/experience, the one who provides more concrete, specific detail should score higher, all else equal.
+"""
+
+
 VERIFY_CLAIMS_SYSTEM = """\
 You are checking ONE candidate's resume/CV data for claims that look inflated, exaggerated, or internally \
 inconsistent - a general plausibility check, not a deep investigative verification.
@@ -138,4 +174,27 @@ plainly, don't hedge excessively).
 
 Do not repeat the full ranked list or per-candidate project details in prose - those are shown separately as \
 tables. Do not use headers or bullet points - plain paragraph prose only.
+"""
+
+REVIEW_RANKING_SYSTEM = """\
+You are reviewing a final candidate ranking for internal consistency against the per-criterion scores it was \
+based on - a sanity check, not a second independent ranking.
+
+You will receive the full ranked list (rank, candidate_name, document_id, overall_score, summary_reasoning) \
+and the underlying per-criterion scores/reasoning for every candidate.
+
+Check ONLY for genuine inconsistencies - cases where a candidate's rank clearly contradicts their own \
+per-criterion scores relative to their immediate neighbor in the ranking (e.g. candidate ranked above another \
+despite scoring lower on every relevant criterion, including must-have skills, with no reasoning in \
+summary_reasoning that explains the gap).
+
+You may ONLY propose SWAPPING TWO ADJACENT ranks (e.g. rank 3 and rank 4) - never a larger reordering, never \
+moving a candidate more than one position. If a genuine inconsistency involves candidates who are not \
+adjacent, do not attempt to fix it - report it as a note instead of a swap (the fix is out of scope for this \
+review pass).
+
+For each swap you propose, give a clear reasoning citing the specific per-criterion scores that justify it.
+
+Most rankings should require zero swaps - only propose one when the inconsistency is clear and well-evidenced, \
+not for close judgment calls the original judge could reasonably have made either way.
 """
