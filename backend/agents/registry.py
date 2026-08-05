@@ -14,19 +14,21 @@ docstring for why). Agents that never take new_input on a completed run
 that need it should read it defensively via
 agent_def.get("stage_descriptions", {}), not agent_def["stage_descriptions"].
 
-CHANGED (tool-calling chat): added an OPTIONAL fourth key, "chat_tools" —
-list[llm.tool_orchestrator.ToolSpec]. Used by routers/agents.py's chat
-route to decide whether a run's chat goes through the plain call_llm() path
-or llm.tool_orchestrator.run_tool_loop() (see agents/chat.py's module
-docstring). Agents that register none (cv_processor, so far) get identical
-chat behaviour to before this change — read defensively via
-agent_def.get("chat_tools", []), not agent_def["chat_tools"].
+CHANGED (tool-calling chat): added an OPTIONAL fourth key, "chat_tools_factory" —
+a callable(run_id, user_id) -> list[llm.tool_orchestrator.ToolSpec]. NOT a
+static list — chat tools that need to know which run they're operating on
+(e.g. ITR's recalculate_tax, scoped to one run's taxpayer_profile) can't be
+built once at import time. Called fresh by routers/agents.py's chat route
+right before each chat turn (see agents/chat.py's module docstring for how
+the resulting list is then used). Agents that register none (cv_processor,
+so far) get identical chat behaviour to before this change — read
+defensively via agent_def.get("chat_tools_factory"), not
+agent_def["chat_tools_factory"], and treat a missing/None factory as "no
+tools" (empty list), not an error.
 
 CHANGED (ITR agent): registered "itr_helper" — stages/first_stage/
-stage_descriptions from agents.itr_helper.agent. chat_tools not yet
-registered (empty) — added once agents/itr_helper/chat_tools.py exists;
-until then itr_helper's chat behaves like cv_processor's (plain call_llm(),
-no tool-calling).
+stage_descriptions from agents.itr_helper.agent, chat_tools_factory from
+agents.itr_helper.chat_tools.build_itr_chat_tools.
 
 NOTE: cv_processor.agent doesn't exist yet (next thing to build) - this
 import will fail until it does. Once agents/cv_processor/agent.py defines
@@ -38,6 +40,7 @@ from agents.itr_helper.agent import (
     FIRST_STAGE as ITR_FIRST_STAGE,
     STAGE_DESCRIPTIONS as ITR_STAGE_DESCRIPTIONS,
 )
+from agents.itr_helper.chat_tools import build_itr_chat_tools
 
 AGENT_REGISTRY: dict[str, dict] = {
     "cv_processor": {
@@ -50,8 +53,7 @@ AGENT_REGISTRY: dict[str, dict] = {
         "stages": ITR_STAGES,
         "first_stage": ITR_FIRST_STAGE,
         "stage_descriptions": ITR_STAGE_DESCRIPTIONS,
-        # chat_tools: [] (implicit, via .get() default) until
-        # agents/itr_helper/chat_tools.py is built.
+        "chat_tools_factory": build_itr_chat_tools,
     },
 }
 

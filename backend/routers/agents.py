@@ -233,10 +233,12 @@ def send_chat_message(
     owned by this user, or isn't status == "completed" yet — chat is
     intentionally unavailable while a run is pending/running/needs_input/failed.
 
-    CHANGED (tool-calling chat): looks up the run's agent_def and passes its
-    registered chat_tools (if any) through to handle_chat_message(). Agents
-    that register none (e.g. cv_processor) get the exact same plain-chat
-    behaviour as before — this lookup is a no-op for them.
+    CHANGED (tool-calling chat, factory correction): agent_def's chat tools
+    are now a chat_tools_factory(run_id, user_id) -> list[ToolSpec], NOT a
+    static list — ITR's tools need to know which run they're scoped to
+    (see agents/itr_helper/chat_tools.py). Called fresh here, per chat turn.
+    Agents with no factory registered (e.g. cv_processor) get chat_tools=[],
+    identical to the original plain-chat behaviour.
     """
     uid = get_user_id(user)
 
@@ -245,7 +247,8 @@ def send_chat_message(
         return not_found(f"Agent run '{run_id}'")
 
     agent_def = get_agent_def(run["agent_name"]) or {}
-    chat_tools = agent_def.get("chat_tools", [])
+    chat_tools_factory = agent_def.get("chat_tools_factory")
+    chat_tools = chat_tools_factory(run_id, uid) if chat_tools_factory else []
 
     try:
         return agent_chat.handle_chat_message(run_id, req.message, user_id=uid, chat_tools=chat_tools)
