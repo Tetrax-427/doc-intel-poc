@@ -510,6 +510,28 @@ def poll_agent_run_until_terminal(client: DocIntelClient, run_id: str, poll_inte
     return run
 
 
+def _prep_candidates_for_display(rows: list) -> pd.DataFrame:
+    """Converts flagged (bool) into a warning icon and joins list-valued columns (e.g. technologies) into readable strings, for the ranked-candidates/honorable-mentions tables."""
+    df = pd.DataFrame(rows)
+    if "flagged" in df.columns:
+        df["flagged"] = df["flagged"].apply(lambda v: "⚠️" if v else "")
+    for col in ("technologies",):
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: ", ".join(v) if isinstance(v, list) else v)
+    return df
+
+
+def _prep_issues_for_display(rows: list) -> pd.DataFrame:
+    """Joins document_ids/candidate_names list columns into readable strings for the combined Issues table."""
+    df = pd.DataFrame(rows)
+    for col in ("document_ids", "candidate_names"):
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: ", ".join(v) if isinstance(v, list) else v)
+    if "claims" in df.columns:
+        # Only present on suspicious_claim-derived rows if ever nested this way - defensive, not expected today.
+        df["claims"] = df["claims"].apply(lambda v: str(v) if isinstance(v, list) else v)
+    return df
+
 def render_agent_result(result: dict):
     """Renders the fixed agent output contract: summary (prose), findings (bullets), data (tables/csv/json)."""
     if result.get("summary"):
@@ -525,7 +547,12 @@ def render_agent_result(result: dict):
         value = item.get("value")
         st.caption(f"**{label}**")
         if item_type == "table" and isinstance(value, list):
-            st.dataframe(pd.DataFrame(value), use_container_width=True)
+            if label in ("Ranked candidates", "Honorable mentions (just outside the shortlist)"):
+                st.dataframe(_prep_candidates_for_display(value), use_container_width=True)
+            elif label.startswith("Issues"):
+                st.dataframe(_prep_issues_for_display(value), use_container_width=True)
+            else:
+                st.dataframe(pd.DataFrame(value), use_container_width=True)
         elif item_type == "csv":
             st.code(value if isinstance(value, str) else str(value), language="text")
         elif item_type == "json":

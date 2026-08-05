@@ -213,7 +213,7 @@ def load_config() -> Config:
     default_provider = os.getenv("LLM_PROVIDER", "groq")
     default_model    = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
-    raw_pool  = int(os.getenv("RETRIEVAL_CANDIDATE_POOL", "50"))
+    raw_pool  = int(os.getenv("RETRIEVAL_CANDIDATE_POOL", "500"))
     raw_top_n = int(os.getenv("RETRIEVAL_TOP_N", "5"))
     pool, top_n = _validated_pool_and_top_n(raw_pool, raw_top_n)
 
@@ -232,15 +232,15 @@ def load_config() -> Config:
     require_email_verification = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
 
     # Rate limits
-    rate_limit_login_per_minute  = int(os.getenv("RATE_LIMIT_LOGIN_PER_MINUTE",  "10"))
-    rate_limit_upload_per_minute = int(os.getenv("RATE_LIMIT_UPLOAD_PER_MINUTE", "20"))
-    rate_limit_query_per_minute  = int(os.getenv("RATE_LIMIT_QUERY_PER_MINUTE",  "60"))
+    rate_limit_login_per_minute  = int(os.getenv("RATE_LIMIT_LOGIN_PER_MINUTE",  "100"))
+    rate_limit_upload_per_minute = int(os.getenv("RATE_LIMIT_UPLOAD_PER_MINUTE", "200"))
+    rate_limit_query_per_minute  = int(os.getenv("RATE_LIMIT_QUERY_PER_MINUTE",  "6000"))
 
     # Quota defaults
-    default_max_documents      = int(os.getenv("DEFAULT_MAX_DOCUMENTS",       "500"))
-    default_max_uploads_per_day= int(os.getenv("DEFAULT_MAX_UPLOADS_PER_DAY", "20"))
-    default_max_llm_cost_month = float(os.getenv("DEFAULT_MAX_LLM_COST_MONTH","5.00"))
-    default_max_queries_per_day= int(os.getenv("DEFAULT_MAX_QUERIES_PER_DAY", "100"))
+    default_max_documents      = int(os.getenv("DEFAULT_MAX_DOCUMENTS",       "5000"))
+    default_max_uploads_per_day= int(os.getenv("DEFAULT_MAX_UPLOADS_PER_DAY", "2000"))
+    default_max_llm_cost_month = float(os.getenv("DEFAULT_MAX_LLM_COST_MONTH","5000.00"))
+    default_max_queries_per_day= int(os.getenv("DEFAULT_MAX_QUERIES_PER_DAY", "10000"))
 
     logging.info(f"[config] Retrieval — pool={pool}, top_n={top_n}")
     logging.info(f"[config] E1 Stage1 — enabled={stage1_enabled}, threshold={clf_threshold}")
