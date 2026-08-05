@@ -131,9 +131,9 @@ def create_template(
             )
         scoped_org = user.org_id_str
     elif is_global:
-        if not user.is_org_admin:
+        if not user.is_platform_admin:
             return error_response(
-                "Only org admins can create global schema templates.",
+                "Only platform admins can create global schema templates.",
                 code="SCHEMA_TEMPLATE_GLOBAL_FORBIDDEN",
                 status_code=403,
             )

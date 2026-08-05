@@ -6,6 +6,13 @@ Changes in this phase (Security + Org/Team):
   - UserContext extended with org_id, team_id, role, org_role, permissions
   - get_current_user_context() resolves org/team membership on every request
   - Dev mode returns a full UserContext with safe defaults
+
+CHANGED (platform admin): UserContext gains is_platform_admin, resolved via
+a lookup against the new platform_admins table — a real, extensible
+platform-level admin concept distinct from org_admin (which is scoped per-
+org; many people across many orgs can hold it). is_platform_admin is
+independent of org/team membership entirely. See
+supabase/migrations/2026_create_platform_admins.sql.
 """
 
 import os
@@ -41,6 +48,10 @@ class UserContext:
     # Permission toggles (resolved from org_members row)
     can_read_team_documents: bool = False
     can_read_all_usage:      bool = True
+
+    # Platform-level admin — independent of org/team membership. See
+    # platform_admins table. NOT the same as is_org_admin below.
+    is_platform_admin: bool = False
 
     # Computed helpers
     @property
@@ -189,10 +200,38 @@ def _resolve_org_context(user_id: str) -> dict:
         return defaults
 
 
+def _resolve_is_platform_admin(user_id: str) -> bool:
+    """
+    Looks up whether user_id has a row in platform_admins. Non-blocking —
+    any DB error resolves to False, same fail-safe pattern as
+    _resolve_org_context() (auth should never fail due to this lookup).
+    """
+    try:
+        url         = os.getenv("SUPABASE_URL", "").strip()
+        service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+        if not url or not service_key:
+            return False
+
+        sb = create_client(url, service_key)
+        resp = (
+            sb.table("platform_admins")
+            .select("user_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception:
+        return False
+
+
 def _build_user_context(base: UserContext) -> UserContext:
-    """Enrich a base UserContext with org/team fields."""
+    """Enrich a base UserContext with org/team fields and platform-admin status."""
     if base.is_dev:
-        # Dev mode — return with safe defaults, no DB lookup
+        # Dev mode — return with safe defaults, no DB lookup. Dev does NOT
+        # get is_platform_admin=True for free (unlike org_admin below) —
+        # platform admin is a real production concept gated on an actual
+        # platform_admins row, not a dev convenience.
         return UserContext(
             user_id="dev_user",
             email="dev@local",
@@ -203,9 +242,11 @@ def _build_user_context(base: UserContext) -> UserContext:
             team_role=None,
             can_read_team_documents=True,
             can_read_all_usage=True,
+            is_platform_admin=False,
         )
 
     ctx = _resolve_org_context(base.user_id)
+    is_platform_admin = _resolve_is_platform_admin(base.user_id)
     return UserContext(
         user_id=base.user_id,
         email=base.email,
@@ -216,6 +257,7 @@ def _build_user_context(base: UserContext) -> UserContext:
         team_role=ctx["team_role"],
         can_read_team_documents=ctx["can_read_team_documents"],
         can_read_all_usage=ctx["can_read_all_usage"],
+        is_platform_admin=is_platform_admin,
     )
 
 
