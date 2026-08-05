@@ -22,11 +22,22 @@ docstring). Agents that register none (cv_processor, so far) get identical
 chat behaviour to before this change — read defensively via
 agent_def.get("chat_tools", []), not agent_def["chat_tools"].
 
+CHANGED (ITR agent): registered "itr_helper" — stages/first_stage/
+stage_descriptions from agents.itr_helper.agent. chat_tools not yet
+registered (empty) — added once agents/itr_helper/chat_tools.py exists;
+until then itr_helper's chat behaves like cv_processor's (plain call_llm(),
+no tool-calling).
+
 NOTE: cv_processor.agent doesn't exist yet (next thing to build) - this
 import will fail until it does. Once agents/cv_processor/agent.py defines
 STAGES and FIRST_STAGE, this file works as-is with no further changes.
 """
 from agents.cv_processor.agent import STAGES as CV_PROCESSOR_STAGES, FIRST_STAGE as CV_PROCESSOR_FIRST_STAGE
+from agents.itr_helper.agent import (
+    STAGES as ITR_STAGES,
+    FIRST_STAGE as ITR_FIRST_STAGE,
+    STAGE_DESCRIPTIONS as ITR_STAGE_DESCRIPTIONS,
+)
 
 AGENT_REGISTRY: dict[str, dict] = {
     "cv_processor": {
@@ -35,11 +46,13 @@ AGENT_REGISTRY: dict[str, dict] = {
         # No stage_descriptions — cv_processor runs never take new_input on a
         # completed run, so plan_resume_stage() is never called for it.
     },
-    # "itr_helper": {
-    #     "stages": ITR_STAGES,
-    #     "first_stage": ITR_FIRST_STAGE,
-    #     "stage_descriptions": ITR_STAGE_DESCRIPTIONS,
-    # },  - added when built
+    "itr_helper": {
+        "stages": ITR_STAGES,
+        "first_stage": ITR_FIRST_STAGE,
+        "stage_descriptions": ITR_STAGE_DESCRIPTIONS,
+        # chat_tools: [] (implicit, via .get() default) until
+        # agents/itr_helper/chat_tools.py is built.
+    },
 }
 
 
