@@ -666,3 +666,27 @@ def get_global_schema_template_by_schema_name(schema_name: str) -> dict | None:
         .execute()
     )
     return result.data[0] if result.data else None
+
+
+# ── Admin: stuck running runs ─────────────────────────────────────────────────
+#
+# Cross-user query — every other agent_runs helper in this file is scoped to
+# one user_id, but recovering runs abandoned by a dead process/pod is
+# inherently an ops-level action across all users. Only used by the
+# platform-admin-gated restart endpoint in routers/agents.py.
+
+def get_running_agent_runs() -> list[dict]:
+    """
+    Returns every agent_runs row currently status='running', across all
+    users — for the manual "restart stuck runs after a crash" admin action.
+    Includes user_id so the caller can resume each run as its actual owner
+    (resume_stages()/get_agent_run() are user_id-scoped internally).
+    """
+    result = (
+        get_supabase_admin().table("agent_runs")
+        .select("id, agent_name, name, user_id, current_stage, created_at, started_at")
+        .eq("status", "running")
+        .order("started_at")
+        .execute()
+    )
+    return result.data or []

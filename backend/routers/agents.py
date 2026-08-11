@@ -23,9 +23,9 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, field_validator, model_validator
 
 from core.auth import get_current_user_context, get_user_id, UserContext
-from core.responses import bad_request, not_found, internal_error
+from core.responses import bad_request, not_found, internal_error, error_response
 from core.queue import task_queue
-from db import get_agent_run, list_agent_runs, get_agent_chat_history
+from db import get_agent_run, list_agent_runs, get_agent_chat_history, get_running_agent_runs
 from agents import chat as agent_chat 
 from agents.registry import get_agent_def
 from agents import base as agent_base
@@ -267,3 +267,64 @@ def get_chat_history(
     if run is None:
         return not_found(f"Agent run '{run_id}'")
     return {"messages": get_agent_chat_history(run_id, user_id=uid)}
+
+
+@router.post("/admin/restart-stuck-runs")
+def restart_stuck_runs(
+    user: UserContext = Depends(get_current_user_context),
+):
+    """
+    Manual recovery action for runs abandoned by a crashed/dead process —
+    e.g. after a pod restart. Platform-admin only (same gate as
+    routers/schema_templates.py's global-template creation).
+
+    Finds every agent_runs row with status='running' (across ALL users —
+    this is inherently an ops-level, cross-user action) and re-submits each
+    to the SAME resume_stages() the normal resume endpoint already uses,
+    re-entering at whatever current_stage was last persisted. No new
+    "restart" mechanism — this reuses the existing checkpoint/resume
+    machinery in agents/base.py, which already persists state after every
+    completed stage.
+
+    CAVEAT (deliberately not solved here, since this is a manual action):
+    if a DIFFERENT still-alive instance is actually processing one of these
+    "running" runs right now (e.g. multi-instance deployment, one pod
+    restarted but another didn't), triggering this will double-execute that
+    run. This is safe to call in the current single-instance deployment;
+    in a multi-instance future, only call it once you've confirmed the old
+    instance is actually dead, not just slow.
+
+    Skips (and reports) any run whose agent_name is no longer registered in
+    AGENT_REGISTRY, rather than failing the whole batch.
+    """
+    if not user.is_platform_admin:
+        return error_response(
+            "Only platform admins can restart stuck runs.",
+            code="RESTART_STUCK_RUNS_FORBIDDEN",
+            status_code=403,
+        )
+
+    running_runs = get_running_agent_runs()
+
+    restarted = []
+    skipped = []
+
+    for run in running_runs:
+        agent_def = get_agent_def(run["agent_name"])
+        if agent_def is None:
+            skipped.append({"run_id": run["id"], "reason": f"Agent '{run['agent_name']}' is no longer registered."})
+            continue
+
+        task_queue.submit(
+            f"agent:{run['agent_name']}:admin_restart",
+            agent_base.resume_stages,
+            run["id"], agent_def["stages"],
+            user_id=run["user_id"],
+        )
+        restarted.append(run["id"])
+
+    return {
+        "found": len(running_runs),
+        "restarted": restarted,
+        "skipped": skipped,
+    }
