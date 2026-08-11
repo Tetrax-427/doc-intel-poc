@@ -179,3 +179,7 @@ llama-index>=0.14.22
 llama-index-llms-openai>=0.7.0
 
 llama-index-embeddings-huggingface
+
+presidio-analyzer
+presidio-anonymizer
+https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.7.1/en_core_web_lg-3.7.1-py3-none-any.whl
