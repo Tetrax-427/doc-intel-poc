@@ -21,6 +21,9 @@ from llm.fallback import get_fallback_chain, build_client, build_override_chain
 from llm import tracer
 from llm import cache as llm_cache
 
+from pii_mapping import build_mapping
+from pii_masking import mask, unmask
+
 logger = get_logger("llm.engine")
 
 # ---------------------------------------------------------------------------
@@ -74,9 +77,21 @@ def call_llm(
     """
     Central LLM caller. All LLM calls in the app go through here.
 
+    PII masking: system+user text is scanned fresh on every non-streaming
+    call (regex + Presidio, see pii_mapping.build_mapping) and masked
+    before any provider sees it. The mapping is call-scoped only — never
+    persisted, discarded right after the result is unmasked. This works
+    correctly even for calls covering multiple documents in one prompt
+    (CV Processor batch scoring, ITR Helper), since there's no single
+    document_id to key a stored mapping on. If detection fails, logs a
+    warning and proceeds unmasked for that call (fails open).
+
+    NOTE: streaming calls (stream=True) are NOT currently masked — see
+    _call_stream. Known gap, parked for later.
+
     Args:
         system:         Static instruction text. Required.
-        user:           Per-call content (untrusted document content goes here,
+        user:           Per-call content (untrusted document content goes in,
                         sandboxed by llm/sanitizer.py before being passed in).
         temperature:    0.0 for deterministic, higher for creative.
         max_tokens:     Max response tokens.
@@ -113,6 +128,21 @@ def call_llm(
             org_id=org_id, team_id=team_id,
         )
 
+    # --- PII masking setup — built fresh for this call, discarded after ---
+    mapping_rows = []
+    try:
+        combined_text = f"{system}\n{user}"
+        mapping_rows = build_mapping(combined_text, user_id)
+    except Exception as exc:
+        logger.warning(
+            "PII detection failed — proceeding unmasked for this call",
+            call_type=call_type, error=str(exc),
+        )
+        mapping_rows = []
+
+    llm_system = mask(system, mapping_rows) if mapping_rows else system
+    llm_user   = mask(user, mapping_rows) if mapping_rows else user
+
     # --- Build chain ---
     if provider or model:
         if not (provider and model):
@@ -140,7 +170,8 @@ def call_llm(
         providers_tried.append((prov, mdl))
         used_fallback = (prov != primary_provider)
 
-        # --- Cache lookup ---
+        # --- Cache lookup (keyed on ORIGINAL system/user, not masked —
+        # cache entries and hits always reflect real content) ---
         if cacheable:
             cache_row = llm_cache.lookup(user_id, prov, mdl, system, user)
             if cache_row is not None:
@@ -171,18 +202,22 @@ def call_llm(
             with _trace as t:
                 result, usage = _call_single_provider(
                     provider=prov, model=mdl,
-                    system=system, user=user,
+                    system=llm_system, user=llm_user,
                     temperature=temperature, max_tokens=max_tokens,
                     call_type=call_type,
                     response_model=response_model,
                     json_mode=json_mode,
                     structured_max_retries=structured_max_retries,
                 )
+
+                # Unmask before this result goes anywhere — cache, trace, caller.
+                result = _unmask_result(result, mapping_rows, response_model)
+
                 response_text = _stringify_result(result)
                 if TRACING_ENABLED:
                     t.set_result(response_text=response_text, usage=usage)
 
-            # --- Store in cache ---
+            # --- Store in cache (real, unmasked text) ---
             if cacheable:
                 cost = None
                 try:
@@ -210,7 +245,6 @@ def call_llm(
                 raise LLMProviderOverrideError(prov, mdl, reason=str(exc)) from exc
 
     raise LLMFallbackExhaustedError(providers_tried)
-
 
 def call_llm_stream(
     system: str,
@@ -412,6 +446,38 @@ def _reconstruct_result(
 
     return response_text
 
+def _unmask_deep(value, mapping_rows):
+    """
+    Recursively unmask every string found inside a dict/list/BaseModel
+    result. Needed because json_mode and response_model calls return
+    structured data, not a flat string — a placeholder could be sitting
+    inside any field.
+    """
+    if isinstance(value, str):
+        return unmask(value, mapping_rows)
+    if isinstance(value, dict):
+        return {k: _unmask_deep(v, mapping_rows) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_unmask_deep(v, mapping_rows) for v in value]
+    return value
+
+
+def _unmask_result(result, mapping_rows, response_model):
+    """Unmask a call_llm() result, regardless of its shape."""
+    if not mapping_rows:
+        return result
+    if response_model is not None and isinstance(result, BaseModel):
+        unmasked_data = _unmask_deep(result.model_dump(), mapping_rows)
+        try:
+            return response_model.model_validate(unmasked_data)
+        except Exception:
+            logger.warning("Unmask produced invalid structured result — returning raw dict")
+            return unmasked_data
+    if isinstance(result, dict):
+        return _unmask_deep(result, mapping_rows)
+    if isinstance(result, str):
+        return unmask(result, mapping_rows)
+    return result
 
 # ---------------------------------------------------------------------------
 # Streaming
