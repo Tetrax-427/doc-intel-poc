@@ -2,16 +2,14 @@
 backend/pii_masking.py
 
 mask(text, mapping_rows) / unmask(text, mapping_rows) — the pair that
-wraps every call_llm() invocation (see llm/engine.py). mapping_rows is
-the list of pii_mappings rows for a document, fetched once and reused
-across the mask + unmask pair for a single LLM call.
+wraps every non-streaming call_llm() invocation (see llm/engine.py).
+mapping_rows is the list built fresh by pii_mapping.build_mapping() for
+that single call — never persisted, discarded right after unmask() runs.
 
 mask(): replaces every real surface form with its placeholder.
 unmask(): replaces every placeholder with its canonical (first) real value.
 
-Both are pure string functions — no DB access here. Fetching
-mapping_rows from Supabase (and building them via build_pii_mapping if
-they don't exist yet) is the caller's job (llm/engine.py / ingestion.py).
+Both are pure string functions — no DB access, no side effects.
 """
 
 import re
